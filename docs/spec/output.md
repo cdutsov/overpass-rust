@@ -16,7 +16,7 @@ Note on test fixtures: `osm-3s_testing/expected/osm3s_query_*` (CLI, XML) and `o
 * Constants:
   * `VERSION = "0.7.62"`, `HASH8 = "7c32a7d5"` (first 8 chars of source hash)
   * `GENERATOR = "Overpass API " + VERSION + " " + HASH8` → `Overpass API 0.7.62 7c32a7d5`
-  * The Rust server prints `Overpass API 0.7.62 compatible` in place of this generator: the one intended difference in the bytes of an answer. The examples below show the C++ value.
+  * The Rust server prints `Overpass API via overpass-rust v.<version>` in place of this generator: the one intended difference in the bytes of an answer. The examples below show the C++ value.
   * `COPYRIGHT = "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL."`
 * In this document `␤` is never used; literal blocks show exact bytes, an empty line in a block is an empty line in the output.
 

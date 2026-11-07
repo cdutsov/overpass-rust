@@ -4,7 +4,7 @@ use crate::model::*;
 use crate::ql::ast::{CsvSpec, OutFormat};
 use std::io::{self, Write};
 
-pub const GENERATOR: &str = "Overpass API 0.7.62 compatible";
+pub const GENERATOR: &str = concat!("Overpass API via overpass-rust v.", env!("CARGO_PKG_VERSION"));
 pub const COPYRIGHT: &str =
     "The data included in this document is from www.openstreetmap.org. The data is made available under ODbL.";
 
@@ -1018,7 +1018,7 @@ mod tests {
         let s = String::from_utf8(p.w).unwrap();
         assert_eq!(
             s,
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osm version=\"0.6\" generator=\"Overpass API 0.7.62 compatible\">\n<note>The data included in this document is from www.openstreetmap.org. The data is made available under ODbL.</note>\n<meta osm_base=\"mock-up-init\"/>\n\n  <node id=\"5\" lat=\"51.0125000\" lon=\"7.1125000\">\n    <tag k=\"node_key\" v=\"node_few\"/>\n  </node>\n  <node id=\"5\"/>\n\n</osm>\n"
+            format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osm version=\"0.6\" generator=\"{GENERATOR}\">\n<note>The data included in this document is from www.openstreetmap.org. The data is made available under ODbL.</note>\n<meta osm_base=\"mock-up-init\"/>\n\n  <node id=\"5\" lat=\"51.0125000\" lon=\"7.1125000\">\n    <tag k=\"node_key\" v=\"node_few\"/>\n  </node>\n  <node id=\"5\"/>\n\n</osm>\n")
         );
     }
 
