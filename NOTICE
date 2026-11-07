@@ -1,0 +1,34 @@
+overpass-rust
+Copyright 2026 Chavdar Dutsov
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. It comes without any warranty. See LICENSE for the full text.
+
+Based on Overpass API
+---------------------
+
+overpass-rust is a Rust reimplementation of Overpass API, which is
+Copyright 2008-2018 Roland Olbricht et al. and licensed under the GNU Affero
+General Public License, version 3 or later:
+https://github.com/drolbr/Overpass-API
+
+The authors of Overpass API did not write or endorse this program.
+
+Modified from Overpass API 0.7.62 from 30 October 2026 on:
+
+- Translated from C++ to Rust, in whole or in part:
+    src/exec/eval/rhr.rs     core/geometry.cc, core/four_field_index.cc
+    src/exec/areageom.rs     core/type_area.h, data/collect_members.cc,
+                             statements/make_area.cc
+    src/geo.rs               core/index_computations.h
+    src/exec/query.rs        statements/around.cc, statements/polygon_query.cc
+- docs/spec/ describes behaviour extracted from the C++ sources, and the rest
+  of the program follows those specs.
+
+Logo
+----
+
+The logo of https://overpass.ch (logo.png) is not part of the program and is
+not under the licence above. All rights reserved.
