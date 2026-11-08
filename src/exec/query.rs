@@ -4,9 +4,9 @@
 
 //! The query statement: candidate generation and filtering per element type.
 
-use super::fetch::{Fetch, ranges_for, tile_runs};
+use super::fetch::{Fetch, Source, ranges_for, tile_runs};
 use super::filter::TagFilter;
-use super::geom::{AroundSource, EGeom, Polygon, rel_geoms, rel_geoms_near, way_geoms};
+use super::geom::{AroundSource, EGeom, PolyTest, Polygon, RectPos, rel_geoms, rel_geoms_near, way_geoms};
 use super::set::Set;
 use super::{Abort, Engine};
 use crate::geo::{BBox, Cell, CodeRange, Rect, cell_in_ranges, tile_of};
@@ -449,9 +449,8 @@ impl<'s, W: Write> Engine<'s, W> {
             None => {
                 let rects = self.spatial_rects(plan, arounds, area_ctxs)?;
                 let ranges: Option<Vec<CodeRange>> = rects.as_ref().map(|r| ranges_for(kind, r));
-                let eq = self.most_selective_eq(kind, plan, ranges.as_deref())?;
-                if let Some(eq) = eq {
-                    let pairs = self.f.tag_candidates(kind, eq, ranges.as_deref())?;
+                if let Some(probe) = self.most_selective(kind, plan, ranges.as_deref())? {
+                    let pairs = self.f.tag_candidates(kind, probe, ranges.as_deref())?;
                     self.check()?;
                     self.f.at::<T>(pairs)?
                 } else if let Some(r) = &ranges {
@@ -461,7 +460,7 @@ impl<'s, W: Write> Engine<'s, W> {
                     // index entries of its prefixes in the region, unless
                     // that takes more steps than the region has chunks.
                     let indexed = plan.tags.iter().find(|t| matches!(t, TagFilter::HasKey(_) | TagFilter::Regex { neg: false, .. }));
-                    let anchored = plan.tags.iter().find(|t| matches!(t, TagFilter::Regex { neg: false, prefixes: Some(_), .. }));
+                    let anchored = plan.tags.iter().find(|t| anchored(t));
                     let pairs = match indexed {
                         Some(t) => {
                             let (region, total) = self.f.chunk_share(kind, r)?;
@@ -486,7 +485,7 @@ impl<'s, W: Write> Engine<'s, W> {
                         }
                         None => self.f.in_ranges::<T>(r, |e| plan.tags.iter().all(|t| t.matches(e.tags_of())))?,
                     }
-                } else if let Some(t) = plan.tags.iter().find(|t| t.is_positive()) {
+                } else if let Some(t) = plan.tags.iter().find(|t| anchored(t)).or_else(|| plan.tags.iter().find(|t| t.is_positive())) {
                     let pairs = self.f.tag_candidates(kind, t, None)?;
                     self.check()?;
                     self.f.at::<T>(pairs)?
@@ -650,7 +649,7 @@ impl<'s, W: Write> Engine<'s, W> {
                 Filter::Poly(pts) => {
                     let poly = Polygon { pts: pts.clone() };
                     let rects = poly.bbox().rects();
-                    (MemberTest::Poly(poly), rects)
+                    (MemberTest::Poly(poly.prepare()), rects)
                 }
                 _ => {
                     let (src, r) = next_around.next().expect("counted above");
@@ -692,14 +691,20 @@ impl<'s, W: Write> Engine<'s, W> {
                 }
                 Filter::Poly(pts) => {
                     let poly = Polygon { pts: pts.clone() };
+                    let test = poly.prepare();
                     let rects = poly.bbox().rects();
-                    let mut nodes = self.f.in_ranges::<Node>(&ranges_for(Kind::Node, &rects), |_| true)?;
-                    nodes.retain(|n| poly.contains_member(n.pos));
+                    let nodes = self.f.in_ranges::<Node>(&ranges_for(Kind::Node, &rects), |n| test.contains_member(n.pos))?;
                     let grow = |r: &Rect| Rect { y0: r.y0.saturating_sub(1), x0: r.x0.saturating_sub(1), y1: r.y1.saturating_add(1), x1: r.x1.saturating_add(1) };
-                    let mut ways = self.f.in_ranges::<Way>(&ranges_for(Kind::Way, &rects), |w| rects.iter().any(|r| grow(r).intersects(&w.bbox)))?;
+                    // ways apart from the polygon fail without their vertices
+                    let boxes = way_boxes_on();
+                    let mut ways = self.f.in_ranges::<Way>(&ranges_for(Kind::Way, &rects), |w| rects.iter().any(|r| grow(r).intersects(&w.bbox)) && !(boxes && test.rect_pos(&w.bbox) == RectPos::Apart))?;
                     self.check()?;
-                    let verts = super::geom::way_vertices(&self.f, &ways)?;
-                    ways.retain(|w| poly_member_way(&poly, &verts[&w.id]));
+                    let pass = poly_member_ways(&self.f, &test, &ways.iter().collect::<Vec<_>>())?;
+                    let mut i = 0;
+                    ways.retain(|_| {
+                        i += 1;
+                        pass[i - 1]
+                    });
                     members.nodes = nodes;
                     members.ways = ways;
                 }
@@ -734,12 +739,11 @@ impl<'s, W: Write> Engine<'s, W> {
     /// hundred relations. A bbox clause cheaper to read than the region
     /// (`region_cost`; a few km of a long river) takes the place of the
     /// region. The index is read for a `key=value` filter or an anchored
-    /// regex; for other tag filters, or when that scan takes too many
+    /// regex; without such a filter, or when that scan takes too many
     /// steps, the relations stored in the cells of the region are the
     /// candidates. The ids of the relations that pass every clause
-    /// (sorted), or None when there are no candidates to start from (no tag
-    /// filter and no bbox), too many, or their members would cost more than
-    /// the nodes of the region.
+    /// (sorted), or None when the candidates or their members would cost
+    /// more than the nodes of the region.
     fn rel_spatial_by_candidates(&mut self, filters: &[Filter], member_tests: &[(MemberTest, Vec<Rect>)]) -> Result<Option<Vec<Id>>> {
         const MAX_CANDIDATES: usize = 20_000;
         const NODES_PER_CHUNK: usize = 500;
@@ -754,15 +758,10 @@ impl<'s, W: Write> Engine<'s, W> {
         // An unanchored regex or a key filter would walk every value of its
         // key (every name on the planet): those are tested on the relations
         // stored in the cells of the region instead.
-        let probe = match self.most_selective_eq(Kind::Relation, &plan, Some(&ranges))? {
+        let probe = match self.most_selective(Kind::Relation, &plan, Some(&ranges))? {
             Some(eq) => Some(eq),
-            None => plan.tags.iter().find(|t| matches!(t, TagFilter::Regex { neg: false, prefixes: Some(_), .. })),
+            None => plan.tags.iter().find(|t| anchored(t)),
         };
-        if probe.is_none() && bbox.is_none() && !plan.tags.iter().any(|t| t.is_positive()) {
-            #[cfg(test)]
-            tests::CANDIDATES.set(Some("no_index_filter"));
-            return Ok(None);
-        }
         // Cost: a member is a lookup by id, a node of the region a part of
         // a chunk read in order (about 500 per chunk), and the region path
         // also reads its ways. Long routes near a small region (100 m) have
@@ -779,18 +778,11 @@ impl<'s, W: Write> Engine<'s, W> {
         };
         #[cfg(test)]
         tests::CANDIDATES_FROM.set(Some(if pairs.is_some() { "tags" } else if bbox.is_some() { "bbox" } else { "cells" }));
-        let mut cands: Vec<Relation> = match pairs {
-            Some(pairs) => {
-                if pairs.len() > cap {
-                    #[cfg(test)]
-                    tests::CANDIDATES.set(Some("too_many_candidates"));
-                    return Ok(None);
-                }
-                self.check()?;
-                self.f.at::<Relation>(pairs)?
-            }
-            None => self.f.in_ranges::<Relation>(&ranges, |r| plan.tags.iter().all(|t| t.matches(&r.tags)))?,
-        };
+        if pairs.as_ref().is_some_and(|p| p.len() > MAX_CANDIDATES) {
+            #[cfg(test)]
+            tests::CANDIDATES.set(Some("too_many_candidates"));
+            return Ok(None);
+        }
         // as the stored-bbox test of query_type: boxes wider than half the
         // world may cross the antimeridian and go to the geometry test
         let wide = |b: &Rect| b.x1 - b.x0 > 0x8000_0000;
@@ -803,25 +795,30 @@ impl<'s, W: Write> Engine<'s, W> {
                     MemberTest::Poly(_) => meets(b, rs),
                 }
         };
-        cands.sort_unstable_by_key(|r| r.id);
-        cands.dedup_by_key(|r| r.id);
-        cands.retain(|r| {
+        let keep = |r: &Relation| {
             r.spatial
                 && !r.bbox.is_empty()
                 && plan.tags.iter().all(|t| t.matches(&r.tags))
                 && member_tests.iter().all(|(test, rs)| near(&r.bbox, test, rs))
                 && bbox.as_ref().is_none_or(|rs| wide(&r.bbox) || meets(&r.bbox, rs))
-        });
-        // Counted before for a tag filter, here for the relations stored in
-        // the region: more than the estimate allows are kept when they have
-        // few members (the buildings of a city: 10^4 relations with 3 x
-        // 10^4 ways), a candidate costing as a member.
-        let costly = || (cands.len() + cands.iter().map(|r| r.members.len()).sum::<usize>()) * MEMBER_COST > region_nodes;
-        if cands.len() > MAX_CANDIDATES || (cands.len() > cap && costly()) {
+        };
+        // Up to the estimate the candidates are kept whatever their
+        // members. More are kept while they and their members cost less
+        // than the nodes of the region, a candidate costing as a member
+        // (the buildings or multipolygons of a city: 10^4 relations with a
+        // few ways each); the reading stops once they cost more (the
+        // thousands of routes near a city centre, 10^6 members).
+        let over = |n: usize, members: usize| n > MAX_CANDIDATES || (n > cap && (n + members) * MEMBER_COST > region_nodes);
+        let source = match pairs {
+            Some(pairs) => Source::At(pairs),
+            None => Source::Ranges(&ranges),
+        };
+        self.check()?;
+        let Some(cands) = self.f.bounded::<Relation>(source, keep, |r| r.members.len(), over)? else {
             #[cfg(test)]
             tests::CANDIDATES.set(Some("too_many_candidates"));
             return Ok(None);
-        }
+        };
         let (mut nids, mut wids) = (Vec::new(), Vec::new());
         for r in &cands {
             for m in &r.members {
@@ -858,13 +855,9 @@ impl<'s, W: Write> Engine<'s, W> {
                     // the tiles of the rectangles, ways whose box meets them
                     let tiles = ranges_for(Kind::Node, rs);
                     let nodes = positions.iter().filter(|(_, p)| cell_in_ranges(Cell::tile(tile_of(**p)), &tiles) && poly.contains_member(**p)).map(|(id, _)| *id).collect();
-                    // A way with its box strictly inside passes without
-                    // its vertices (the member ways of the buildings of a
-                    // city: 10^5 node lookups).
-                    let (inside, border): (Vec<&Way>, Vec<&Way>) = ways.iter().filter(|w| meets(&w.bbox, rs)).partition(|w| !w.missing && !w.nodes.is_empty() && poly.contains_rect(&w.bbox));
-                    let geoms = way_geoms(&self.f, &border)?;
-                    let pass = border.iter().zip(&geoms).filter(|(_, g)| matches!(g, EGeom::Line(v) if poly_member_way(poly, v))).map(|(w, _)| w.id);
-                    (nodes, inside.iter().map(|w| w.id).chain(pass).collect())
+                    let close: Vec<&Way> = ways.iter().filter(|w| meets(&w.bbox, rs)).collect();
+                    let pass = poly_member_ways(&self.f, poly, &close)?;
+                    (nodes, close.iter().zip(pass).filter(|(_, p)| *p).map(|(w, _)| w.id).collect())
                 }
             };
             self.check()?;
@@ -890,15 +883,20 @@ impl<'s, W: Write> Engine<'s, W> {
         Ok(Some(ids))
     }
 
-    /// The `key=value` filter with the fewest index entries. All tag
-    /// filters are checked on the candidates afterwards, so the choice only
-    /// changes the cost: `["leisure"="park"]["name"="X"]` reads one entry
-    /// instead of every park.
-    pub(super) fn most_selective_eq<'p>(&self, kind: Kind, plan: &'p Plan, ranges: Option<&[CodeRange]>) -> Result<Option<&'p TagFilter>> {
+    /// The filter to read the tag index for, when there is a `key=value`
+    /// filter: the `key=value` filter or anchored regex (`anchored`) with
+    /// the fewest index entries. All tag filters are checked on the
+    /// candidates afterwards, so the choice only changes the cost:
+    /// `["leisure"="park"]["name"="X"]` reads one entry instead of every
+    /// park, `["boundary"="administrative"]["name"~"^X$"]` the names
+    /// starting with X instead of every boundary. Counting stops past
+    /// 20,000 entries or steps (`tag_count_capped`); on equal counts the
+    /// earlier filter wins, a `key=value` filter before a regex.
+    pub(super) fn most_selective<'p>(&self, kind: Kind, plan: &'p Plan, ranges: Option<&[CodeRange]>) -> Result<Option<&'p TagFilter>> {
         const CAP: usize = 20_000;
         let mut eqs = plan.tags.iter().filter(|t| matches!(t, TagFilter::Eq(..)));
         let Some(first) = eqs.next() else { return Ok(None) };
-        let rest: Vec<&TagFilter> = eqs.collect();
+        let rest: Vec<&TagFilter> = eqs.chain(plan.tags.iter().filter(|t| anchored(t))).collect();
         if rest.is_empty() {
             return Ok(Some(first));
         }
@@ -912,6 +910,8 @@ impl<'s, W: Write> Engine<'s, W> {
                 best = (n, t);
             }
         }
+        #[cfg(test)]
+        tests::PROBE.set(Some(format!("{:?}", best.1)));
         Ok(Some(best.1))
     }
 
@@ -935,21 +935,60 @@ impl<'s, W: Write> Engine<'s, W> {
     }
 }
 
+/// A regex filter with literal prefixes (`^X`): the tag index has its
+/// candidates under the values with those prefixes.
+pub(super) fn anchored(t: &TagFilter) -> bool {
+    matches!(t, TagFilter::Regex { neg: false, prefixes: Some(_), .. })
+}
+
 /// A spatial clause of a relation statement as `rel_spatial_by_members`
 /// tests it on the member nodes and ways.
 enum MemberTest<'a> {
     Around(&'a AroundSource, f64),
-    Poly(Polygon),
+    Poly(PolyTest),
 }
 
 /// The member way test of `poly` on relations (C++ `add_border = false`);
 /// ways with a missing node never match.
-fn poly_member_way(poly: &Polygon, v: &[Option<crate::geo::Pt>]) -> bool {
+fn poly_member_way(poly: &PolyTest, v: &[Option<crate::geo::Pt>]) -> bool {
     if v.is_empty() || v.iter().any(|p| p.is_none()) {
         return false;
     }
     let pts: Vec<crate::geo::Pt> = v.iter().flatten().copied().collect();
     if pts.len() == 1 { poly.contains_pt(pts[0]) } else { poly.matches_line(&pts, false) }
+}
+
+/// `poly_member_way` for each of the ways. A way with its box strictly
+/// inside the polygon passes and one with its box apart from it fails
+/// without its vertices; only those of the others are looked up. In a city
+/// polygon most ways are inside or apart: the vertices of all would be
+/// 10^6 node lookups.
+fn poly_member_ways(f: &Fetch, poly: &PolyTest, ways: &[&Way]) -> Result<Vec<bool>> {
+    let mut pass = vec![false; ways.len()];
+    let mut border = Vec::new();
+    let boxes = way_boxes_on();
+    for (i, w) in ways.iter().enumerate() {
+        match if boxes { poly.rect_pos(&w.bbox) } else { RectPos::Border } {
+            RectPos::Inside if !w.missing && !w.nodes.is_empty() => pass[i] = true,
+            RectPos::Apart => {}
+            _ => border.push(i),
+        }
+    }
+    let refs: Vec<&Way> = border.iter().map(|&i| ways[i]).collect();
+    let verts = super::geom::way_vertices(f, &refs)?;
+    for i in border {
+        pass[i] = poly_member_way(poly, &verts[&ways[i].id]);
+    }
+    Ok(pass)
+}
+
+/// Whether the way tests of `poly` on relations decide by the box of a way
+/// where they can (`poly_member_ways`); off in tests to compare.
+fn way_boxes_on() -> bool {
+    #[cfg(test)]
+    return !tests::WAY_BOXES_OFF.get();
+    #[cfg(not(test))]
+    true
 }
 
 /// Whether relation geometry for the spatial tests may leave out member
@@ -1052,6 +1091,10 @@ mod tests {
         pub(super) static REGION: Cell<Option<&'static str>> = const { Cell::new(None) };
         /// Turns off the reduced relation geometry (`rel_geoms_near`).
         pub(super) static NEAR_GEOMS_OFF: Cell<bool> = const { Cell::new(false) };
+        /// The filter `most_selective` chose last, when it compared filters.
+        pub(super) static PROBE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+        /// Turns off the way box tests of `poly` on relations (`way_boxes_on`).
+        pub(super) static WAY_BOXES_OFF: Cell<bool> = const { Cell::new(false) };
         /// Whether the last element query with a region and without a
         /// `key=value` filter took its candidates from the tag index.
         pub(super) static INDEXED: Cell<bool> = const { Cell::new(false) };
@@ -1192,9 +1235,9 @@ mod tests {
             // 10 relations against a 100 m circle: either path
             ("node(466);relation[route](around:100);out ids;", None, Some(&["1", "3", "9", "11"])),
             ("relation[\"route\"=\"bus\"](around:0,48.85,2.35);out ids;", None, Some(&["1", "9", "11"])),
-            // no tag filter the index can use
-            ("relation(around:500,48.85,2.35);out ids;", Some("no_index_filter"), Some(&["1", "3", "8", "9", "11"])),
-            ("relation[!\"route\"](around:500,48.85,2.35);out ids;", Some("no_index_filter"), Some(&["8"])),
+            // no tag filter the index can use: the relations of the cells
+            ("relation(around:500,48.85,2.35);out ids;", Some("answered"), Some(&["1", "3", "8", "9", "11"])),
+            ("relation[!\"route\"](around:500,48.85,2.35);out ids;", Some("answered"), Some(&["8"])),
         ];
         for (q, what, ids) in cases {
             let q = format!("{c}{q}");
@@ -1217,17 +1260,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// More relations with the tag near a small region than its nodes would
-    /// cost: the member path answers.
+    /// More relations with the tag near a small region than the estimate of
+    /// 50 members each allows: they answer while they and their members
+    /// cost less than the nodes of the region, else the member path does.
     #[test]
     fn rel_around_many_candidates_use_member_path() {
         // nodes 466 (the centre) and 467 (147 m east), in one or two tiles
-        let rels: String = (0..40).map(|k| relation(100 + k, &[("node", 466 + k % 2)], &[("route", "bus")])).collect();
-        let (db, dir) = grid_db("many", &rels);
-        let (out, did) = both_ways(&db, "[out:csv(::id;false)];relation[\"route\"=\"bus\"](around:50,48.85,2.35);out ids;");
-        assert_eq!(did, Some("too_many_candidates"));
-        assert_eq!(out.len(), 20, "{out:?}");
-        let _ = std::fs::remove_dir_all(&dir);
+        let few: String = (0..40).map(|k| relation(100 + k, &[("node", 466 + k % 2)], &[("route", "bus")])).collect();
+        // and the 900 nodes of the grid each
+        let many: String = (0..40)
+            .map(|k| {
+                let mut members = vec![("node", 466 + k % 2)];
+                members.extend((1..=900).map(|n| ("node", n)));
+                relation(100 + k, &members, &[("route", "bus")])
+            })
+            .collect();
+        for (name, rels, what) in [("many-few", few, "answered"), ("many-members", many, "too_many_candidates")] {
+            let (db, dir) = grid_db(name, &rels);
+            let (out, did) = both_ways(&db, "[out:csv(::id;false)];relation[\"route\"=\"bus\"](around:50,48.85,2.35);out ids;");
+            assert_eq!((did, CANDIDATES_FROM.get()), (Some(what), Some("tags")), "{name}");
+            assert_eq!(out.len(), if name == "many-few" { 20 } else { 40 }, "{out:?}");
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     /// A relation with more members than the region has nodes (a long
@@ -1312,7 +1366,7 @@ mod tests {
             ("[bbox:48.845,2.321,48.855,2.327];way(1015)->.w;rel(around.w:0);out ids;".to_string(), "answered", Some("bbox"), Some(&["1", "2", "4", "7"])),
             (format!("rel(around.w:0){bbox}[name=Y];out ids;"), "answered", Some("tags"), Some(&[])),
             // the bbox has more tiles than the line
-            ("rel(around.w:0)(48.80,2.30,48.90,2.40);out ids;".to_string(), "no_index_filter", None, Some(&["1", "2", "3", "4", "6", "7"])),
+            ("rel(around.w:0)(48.80,2.30,48.90,2.40);out ids;".to_string(), "answered", Some("cells"), Some(&["1", "2", "3", "4", "6", "7"])),
         ];
         for (q, what, from, ids) in &cases {
             let q = if q.starts_with('[') { format!("[out:csv(::id;false)]{q}") } else { format!("{c}{q}") };
@@ -1630,8 +1684,53 @@ mod tests {
         let (one, s) = source("area[\"name\"~\"^Town 3\"][\"admin_level\"];out ids;");
         assert_eq!(one.lines().count(), 11, "{one}");
         assert!(s.is_some_and(|s| s.starts_with("Regex")), "{one}");
+        // An anchored regex with fewer entries than the key=value filter,
+        // in either order, or with a key filter: the regex.
+        for q in [
+            "area[\"name\"~\"^Town 7$\"][\"boundary\"=\"administrative\"];out ids;",
+            "area[\"boundary\"=\"administrative\"][\"name\"~\"^Town 7$\"];out ids;",
+            "area[\"admin_level\"][\"name\"~\"^Town 7$\"];out ids;",
+        ] {
+            let (one, s) = source(q);
+            assert_eq!(one, "area\t3600000017\n", "{q}");
+            assert!(s.is_some_and(|s| s.starts_with("Regex")), "{q}");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Node statements with a key=value filter and an anchored regex read
+    /// the index of the one with fewer entries, globally and in a region,
+    /// with the answers of testing the regex on the nodes of the key=value
+    /// filter.
+    #[test]
+    fn most_selective_takes_an_anchored_regex() {
+        let (db, dir) = tagged_grid("selective");
+        let c = "[out:csv(::type,::id;false)];";
+        // place=townland: 10 nodes named Alpha8, Alpha48, ..., Alpha368;
+        // names starting with Alpha12: 4, with Alpha: 100
+        let cases = [
+            ("[\"place\"=\"townland\"]", "[\"name\"~\"^Alpha12\"]", Some(true)),
+            ("[\"place\"=\"townland\"]", "[\"name\"~\"^(Alpha128|Beta)$\"]", None),
+            ("[\"place\"=\"townland\"]", "[\"name\"~\"^Alpha\"]", Some(false)),
+            ("[\"place\"=\"townland\"]", "[\"name\"~\"^ALPHA12\",i]", None),
+            ("[\"place\"=\"townland\"]", "[\"name\"~\"Alpha12\"]", Some(false)),
+        ];
+        for (eq, re, regex) in cases {
+            for region in ["", "(48.849,2.349,48.851,2.351)"] {
+                let reference = output(&db, &format!("{c}node{eq}{region}->.a;node.a{re};out ids;"));
+                for q in [format!("{c}node{eq}{re}{region};out ids;"), format!("{c}node{re}{eq}{region};out ids;")] {
+                    PROBE.set(None);
+                    assert_eq!(output(&db, &q), reference, "{q}");
+                    if let Some(regex) = regex {
+                        assert_eq!(PROBE.take().is_some_and(|p| p.starts_with("Regex")), regex, "{q}");
+                    }
+                }
+            }
+        }
+        assert_eq!(output(&db, &format!("{c}node[\"place\"=\"townland\"][\"name\"~\"^Alpha12\"];out ids;")), "node\t200129\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Where the candidate path of relation `around` starts: the index for
     /// a key=value filter or an anchored regex, the cells of the region for
     /// other tag filters (an unanchored regex would walk every value of its
@@ -1726,6 +1825,17 @@ mod tests {
             }
             both_ways(&db, &format!("relation[\"route\"]{p};out geom;"));
         }
+        // The way box tests change nothing: every way by its vertices.
+        for poly in polys {
+            for filters in ["relation", "relation[\"route\"]", "relation[\"building\"]"] {
+                let q = format!("{c}{filters}(poly:\"{poly}\");out ids;");
+                let with = (run_q(&db, &q, true).0, run_q(&db, &q, false).0);
+                WAY_BOXES_OFF.set(true);
+                let without = (run_q(&db, &q, true).0, run_q(&db, &q, false).0);
+                WAY_BOXES_OFF.set(false);
+                assert_eq!(with, without, "{q}");
+            }
+        }
         let ids = |q: &str| both_ways(&db, &format!("{c}{q}")).0;
         assert_eq!(ids(&format!("relation[building](poly:\"{}\");out ids;", polys[1])), ["6", "8", "10"]);
         assert_eq!(ids(&format!("relation[building](poly:\"{}\");out ids;", polys[2])), ["6"]);
@@ -1734,9 +1844,9 @@ mod tests {
     }
     /// The buildings of a city: more relations than the estimate of 50
     /// members each allows, with one small way each, inside a polygon or
-    /// across its border. The relations stored in the region are the
-    /// candidates; the answers are those of the member path. From the
-    /// index (key=value), the estimate holds.
+    /// across its border. The candidates come from the index (key=value) or
+    /// the cells of the region (a key filter, no filter); the answers are
+    /// those of the member path.
     #[test]
     fn rel_poly_many_small_relations() {
         let dense = |i: usize, j: usize| 100_000 + i * 200 + j;
@@ -1752,11 +1862,15 @@ mod tests {
         // the whole dense centre; a border through the 8th of 15 rows of
         // buildings (48.84555 to 48.84565)
         for (poly, n) in [("48.840 2.340 48.840 2.360 48.860 2.360 48.860 2.340", 300), ("48.840 2.340 48.8456 2.340 48.8456 2.360 48.840 2.360", 160)] {
-            for (f, what, from) in [("relation[\"building\"]", "answered", "cells"), ("relation[\"type\"=\"multipolygon\"]", "too_many_candidates", "tags")] {
+            for (f, what, from) in [("relation[\"building\"]", "answered", "cells"), ("relation[\"type\"=\"multipolygon\"]", "answered", "tags"), ("relation", "answered", "cells")] {
                 let q = format!("{c}{f}(poly:\"{poly}\");out ids;");
                 let (out, did) = both_ways(&db, &q);
                 assert_eq!((did, CANDIDATES_FROM.get()), (Some(what), Some(from)), "{q}");
                 assert_eq!(out.len(), n, "{q}");
+                WAY_BOXES_OFF.set(true);
+                let (without, _) = both_ways(&db, &q);
+                WAY_BOXES_OFF.set(false);
+                assert_eq!(out, without, "{q}");
             }
         }
         let _ = std::fs::remove_dir_all(&dir);

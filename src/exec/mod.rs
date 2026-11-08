@@ -168,20 +168,47 @@ pub fn set_threads(n: usize) {
     THREADS.store(n.max(1), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// Pool size: as set, else half the hardware threads, at most 8. Larger
-/// pools cost more in idle spinning of the workers between parallel
+/// Pool size: as set, else half the CPUs of this process, at most 8.
+/// Larger pools cost more in idle spinning of the workers between parallel
 /// sections than they gain (measured on 16 threads: 8 is fastest).
 fn threads() -> usize {
     match THREADS.load(std::sync::atomic::Ordering::Relaxed) {
-        0 => (std::thread::available_parallelism().map_or(1, |n| n.get()) / 2).clamp(1, 8),
+        0 => (cpus() / 2).clamp(1, 8),
         n => n,
     }
 }
 
-/// Whether the machine's run queue is at least half full (other processes,
-/// e.g. queries run as separate processes, keep the cores busy). Read from
-/// /proc/loadavg at most every 50 ms.
-fn system_busy(threads: usize) -> bool {
+/// CPUs this process may use: its affinity mask and the CPU quota of its
+/// cgroup (a container with `--cpus`), as `available_parallelism` reads
+/// them. Read once.
+fn cpus() -> usize {
+    static CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CPUS.get_or_init(|| std::thread::available_parallelism().map_or(1, |n| n.get()))
+}
+
+/// CPUs of the host, which the run queue of /proc/loadavg is spread over
+/// (inside a container too). Read once; `cpus()` if unknown.
+fn host_cpus() -> usize {
+    static HOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *HOST.get_or_init(|| std::fs::read_to_string("/sys/devices/system/cpu/online").ok().and_then(|s| count_cpus(&s)).unwrap_or_else(cpus).max(cpus()))
+}
+
+/// Number of CPUs in a list such as `0-23` or `0-3,8-11,16`.
+fn count_cpus(list: &str) -> Option<usize> {
+    let mut n = 0;
+    for part in list.trim().split(',') {
+        n += match part.split_once('-') {
+            Some((a, b)) => b.parse::<usize>().ok()?.checked_sub(a.parse::<usize>().ok()?)? + 1,
+            None => part.parse::<usize>().map(|_| 1).ok()?,
+        };
+    }
+    (n > 0).then_some(n)
+}
+
+/// Runnable threads on the host (this one included), the fourth field of
+/// /proc/loadavg (`runnable/total`). Read at most every 50 ms; 0 if
+/// unknown.
+fn runnable() -> usize {
     use std::sync::atomic::{AtomicU64, Ordering};
     static CHECKED: AtomicU64 = AtomicU64::new(0);
     static RUNNABLE: AtomicU64 = AtomicU64::new(0);
@@ -190,20 +217,52 @@ fn system_busy(threads: usize) -> bool {
     let last = CHECKED.load(Ordering::Relaxed);
     if last == 0 || now.saturating_sub(last) >= 50 {
         CHECKED.store(now, Ordering::Relaxed);
-        // Fourth field: runnable/total scheduling entities (this process included).
         let n = std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| s.split_whitespace().nth(3)?.split('/').next()?.parse().ok()).unwrap_or(0);
         RUNNABLE.store(n, Ordering::Relaxed);
     }
-    RUNNABLE.load(Ordering::Relaxed) as usize * 2 > threads
+    RUNNABLE.load(Ordering::Relaxed) as usize
 }
 
-/// Whether a query may spread work over the thread pool: not when other
-/// queries, in this process or others, already keep the cores busy (handing
-/// work to a saturated pool only adds waiting). Does not start the pool.
+/// What `spread` decides on.
+#[derive(Clone, Copy, Debug)]
+struct Load {
+    /// Threads of the pool.
+    threads: usize,
+    /// Queries running in this process, the asking one included.
+    active: usize,
+    /// CPUs this process may use (`cpus`).
+    cpus: usize,
+    /// CPUs of the host (`host_cpus`).
+    host_cpus: usize,
+    /// Runnable threads on the host, the asking one included (`runnable`).
+    runnable: usize,
+}
+
+/// Whether a query may hand a parallel section to the pool: the pool must
+/// find as many idle CPUs as it can use (its threads, at most the CPUs of
+/// this process) on the host, where other processes run (e.g. queries
+/// run as separate processes), and among the CPUs of this process, where
+/// its other queries keep one each; and at most half as many queries as
+/// the pool has threads may run in this process. The asking thread waits
+/// while the pool works, so it does not count. Handing work to a saturated
+/// machine only adds waiting; on a host with more CPUs than the pool, a
+/// few other runnable threads leave room for it.
+fn spread(l: Load) -> bool {
+    if l.threads < 2 || l.active * 2 > l.threads {
+        return false;
+    }
+    let need = l.threads.min(l.cpus);
+    let host_idle = l.host_cpus.saturating_sub(l.runnable.saturating_sub(1));
+    let own_idle = l.cpus.saturating_sub(l.active - 1);
+    host_idle >= need && own_idle >= need
+}
+
+/// Whether a query may spread work over the thread pool (`spread`). Does
+/// not start the pool.
 pub fn parallel_ok() -> bool {
     static POOL: std::sync::Once = std::sync::Once::new();
     let threads = threads();
-    let ok = threads > 1 && ACTIVE.load(std::sync::atomic::Ordering::Relaxed) * 2 <= threads && !system_busy(threads);
+    let ok = spread(Load { threads, active: ACTIVE.load(std::sync::atomic::Ordering::Relaxed), cpus: cpus(), host_cpus: host_cpus(), runnable: runnable() });
     if ok {
         // The pool starts on first use (fails harmlessly if already built).
         POOL.call_once(|| {
@@ -582,5 +641,88 @@ impl<'s, W: Write> Engine<'s, W> {
         self.set_rc(var, cur);
         self.pop_and_leak(None);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Load, count_cpus, spread};
+
+    /// A pool of 8 on a host of 24 CPUs without a quota, one query.
+    const HOST24: Load = Load { threads: 8, active: 1, cpus: 24, host_cpus: 24, runnable: 1 };
+
+    /// The pool goes to work while the host has as many idle CPUs as the
+    /// pool has threads: up to 17 runnable threads on 24 CPUs (16 others
+    /// and the asking one), where a run queue of 5 used to keep a query on
+    /// one thread.
+    #[test]
+    fn spread_while_the_host_has_room() {
+        for runnable in [0, 1, 3, 5, 9, 17] {
+            assert!(spread(Load { runnable, ..HOST24 }), "{runnable}");
+        }
+        for runnable in [18, 24, 100] {
+            assert!(!spread(Load { runnable, ..HOST24 }), "{runnable}");
+        }
+        // 16 CPUs: up to 9 runnable
+        assert!(spread(Load { host_cpus: 16, cpus: 16, runnable: 9, ..HOST24 }));
+        assert!(!spread(Load { host_cpus: 16, cpus: 16, runnable: 10, ..HOST24 }));
+        // a pool larger than the CPUs needs them all idle
+        assert!(spread(Load { host_cpus: 4, cpus: 4, runnable: 1, ..HOST24 }));
+        assert!(!spread(Load { host_cpus: 4, cpus: 4, runnable: 2, ..HOST24 }));
+        // 4 CPUs, a pool of 2 (the default): up to 3 runnable
+        let small = Load { threads: 2, active: 1, cpus: 4, host_cpus: 4, runnable: 3 };
+        assert!(spread(small));
+        assert!(!spread(Load { runnable: 4, ..small }));
+    }
+
+    /// Queries in this process: at most half as many as the pool has
+    /// threads, and each other one keeps one of the CPUs of the process.
+    #[test]
+    fn spread_with_other_queries() {
+        for active in 1..=4 {
+            assert!(spread(Load { active, runnable: active + 2, ..HOST24 }), "{active}");
+        }
+        assert!(!spread(Load { active: 5, ..HOST24 }));
+        // a quota of 8 CPUs (a container with --cpus 8) and a pool of 8:
+        // one query only; the host does not matter
+        let quota = Load { cpus: 8, ..HOST24 };
+        assert!(spread(quota));
+        assert!(!spread(Load { active: 2, ..quota }));
+        // the default pool of half the quota: up to 2 queries
+        let half = Load { threads: 4, ..quota };
+        assert!(spread(Load { active: 2, ..half }));
+        assert!(!spread(Load { active: 3, ..half }));
+        // a pool of one thread never spreads
+        assert!(!spread(Load { threads: 1, ..HOST24 }));
+    }
+
+    /// More runnable threads or queries never turn a refusal into a yes.
+    #[test]
+    fn spread_is_monotone() {
+        for host_cpus in [2, 4, 8, 16, 24, 64] {
+            for cpus in [1, 2, 4, 8, host_cpus] {
+                for threads in [1, 2, 4, 8] {
+                    for active in 1..6 {
+                        let mut was = true;
+                        for runnable in 0..80 {
+                            let now = spread(Load { threads, active, cpus, host_cpus, runnable });
+                            assert!(was || !now, "{threads} {active} {cpus} {host_cpus} {runnable}");
+                            was = now;
+                            assert!(!now || spread(Load { threads, active: active.max(2) - 1, cpus, host_cpus, runnable }));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cpu_lists() {
+        assert_eq!(count_cpus("0-23\n"), Some(24));
+        assert_eq!(count_cpus("0"), Some(1));
+        assert_eq!(count_cpus("0-3,8-11,16"), Some(9));
+        assert_eq!(count_cpus(""), None);
+        assert_eq!(count_cpus("3-1"), None);
+        assert_eq!(count_cpus("x"), None);
     }
 }

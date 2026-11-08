@@ -17,6 +17,13 @@ use std::cell::RefCell;
 /// Chunks below this count are decoded on the calling thread.
 const PAR_THRESHOLD: usize = 8;
 
+/// Where `Fetch::bounded` reads: the elements stored in cell ranges, or
+/// those at known (cell, id) positions.
+pub enum Source<'a> {
+    Ranges(&'a [CodeRange]),
+    At(Vec<(Cell, Id)>),
+}
+
 pub struct Fetch<'s> {
     pub snap: &'s Snapshot<'s>,
     pos_cache: RefCell<FxHashMap<Id, Option<Pt>>>,
@@ -413,6 +420,45 @@ impl<'s> Fetch<'s> {
         Ok(out)
     }
 
+    /// The elements of `src` that pass `keep` (as `in_ranges` and `at`), or
+    /// None as soon as those read so far are too many: after each chunk
+    /// `over` gets their number and the sum of their `weight`, and once it
+    /// holds no further chunk is decoded. `over` must not turn false again
+    /// as both grow. Lets a caller try a source whose cost only shows while
+    /// it is read (relations with their members), and lose about what it
+    /// allows. The pairs of `At` are read in one batch (see `at`).
+    pub fn bounded<T: Stored>(&self, src: Source<'_>, keep: impl Fn(&T) -> bool + Sync + Send, weight: impl Fn(&T) -> usize + Sync + Send, over: impl Fn(usize, usize) -> bool + Sync + Send) -> Result<Option<Vec<T>>> {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::Relaxed};
+        let (count, sum, stop) = (AtomicUsize::new(0), AtomicUsize::new(0), AtomicBool::new(false));
+        let take = |mut es: Vec<T>| {
+            es.retain(|e| keep(e));
+            es.shrink_to_fit();
+            let w: usize = es.iter().map(&weight).sum();
+            let n = count.fetch_add(es.len(), Relaxed) + es.len();
+            let s = sum.fetch_add(w, Relaxed) + w;
+            if over(n, s) {
+                stop.store(true, Relaxed);
+            }
+            es
+        };
+        let mut out = match src {
+            Source::Ranges(ranges) => {
+                let chunks = self.snap.chunks_in_ranges(T::KIND, ranges)?;
+                decode_chunks(&self.limits, &chunks, |v| *v, |v| if stop.load(Relaxed) { Ok(Vec::new()) } else { Ok(take(T::decode(v, Pick::Cells(ranges))?)) })?
+            }
+            Source::At(pairs) => {
+                let work = self.snap.chunks_at(T::KIND, pairs)?;
+                decode_chunks(&self.limits, &work, |(v, _)| *v, |(v, want)| if stop.load(Relaxed) { Ok(Vec::new()) } else { Ok(take(T::decode(v, Pick::Ids(want))?)) })?
+            }
+        };
+        if stop.load(Relaxed) {
+            return Ok(None);
+        }
+        out.sort_unstable_by_key(|e| e.id());
+        out.dedup_by_key(|e| e.id());
+        Ok(Some(out))
+    }
+
     /// Candidate (cell, id) pairs from the tag index. `ranges` optionally
     /// restricts the cells. Entries with truncated keys or values are always
     /// included; callers verify candidates against the element.
@@ -498,14 +544,22 @@ impl<'s> Fetch<'s> {
     }
 
     /// Number of tag index candidates for the filter, counting stops past
-    /// `cap` (to compare the selectivity of filters cheaply).
+    /// `cap` (to compare the selectivity of filters cheaply). A scan that
+    /// takes more than `cap` steps (values of the key and cell groups, as
+    /// `tag_candidates_bounded`) counts as `cap + 1`: a regex prefix shared
+    /// by many values that fail the regex would otherwise walk them all.
     pub fn tag_count_capped(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>, cap: usize) -> Result<usize> {
         let mut n = 0usize;
-        self.scan_candidates(kind, f, ranges, || true, |_, ids| {
+        let steps = std::cell::Cell::new(0usize);
+        let step = || {
+            steps.set(steps.get() + 1);
+            steps.get() <= cap
+        };
+        self.scan_candidates(kind, f, ranges, step, |_, ids| {
             n += ids.len();
-            Ok(if n > cap { Scan::Stop } else { Scan::Next })
+            Ok(if n > cap || !step() { Scan::Stop } else { Scan::Next })
         })?;
-        Ok(n)
+        Ok(if steps.get() > cap { n.max(cap + 1) } else { n })
     }
 
     /// Whether the tag index has any candidate for the filter.

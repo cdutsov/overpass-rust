@@ -547,53 +547,38 @@ impl Polygon {
         inside
     }
 
+    /// The edges computed once, for testing many points, lines and boxes.
+    pub fn prepare(&self) -> PolyTest {
+        let edges = self.edges();
+        let (mut lo, mut hi) = ((i64::MAX, i64::MAX), (i64::MIN, i64::MIN));
+        for p in edges.iter().flat_map(|(a, b)| [a, b]) {
+            lo = (lo.0.min(p.0), lo.1.min(p.1));
+            hi = (hi.0.max(p.0), hi.1.max(p.1));
+        }
+        PolyTest { edges, lo, hi }
+    }
+
     /// Whether the rectangle lies strictly inside the polygon, without
     /// shifts: its corners are inside and not on the border, and no edge
     /// meets it. Every point in it then passes the node and way tests
     /// (a way with all its vertices there is strictly inside).
     pub fn contains_rect(&self, r: &crate::geo::Rect) -> bool {
-        if r.is_empty() {
-            return false;
-        }
-        let edges = self.edges();
-        let (lo, hi) = (qp(Pt { y: r.y0, x: r.x0 }), qp(Pt { y: r.y1, x: r.x1 }));
-        let corners = [lo, (lo.0, hi.1), (hi.0, lo.1), hi];
-        if !corners.iter().all(|c| !Self::on_border(&edges, *c) && Self::inside2(&edges, (c.0 * 2, c.1 * 2))) {
-            return false;
-        }
-        // An edge meets the closed rectangle when their boxes overlap and
-        // the corners are not all on one side of the edge's line.
-        !edges.iter().any(|(a, b)| {
-            let overlap = a.0.min(b.0) <= hi.0 && a.0.max(b.0) >= lo.0 && a.1.min(b.1) <= hi.1 && a.1.max(b.1) >= lo.1;
-            overlap && {
-                let sides = corners.map(|c| orient(*a, *b, c).signum());
-                !(sides.iter().all(|s| *s > 0) || sides.iter().all(|s| *s < 0))
-            }
-        })
+        self.prepare().contains_rect(r)
     }
 
     /// Node test: the border counts as inside.
     pub fn contains_pt(&self, p: Pt) -> bool {
-        let edges = self.edges();
-        Self::shifts(qp(p)).into_iter().any(|ip| Self::on_border(&edges, ip) || Self::inside2(&edges, (ip.0 * 2, ip.1 * 2)))
+        self.prepare().contains_pt(p)
     }
 
     pub fn contains(&self, lat: f64, lon: f64) -> bool {
-        let edges = self.edges();
-        Self::shifts(q(lat, lon)).into_iter().any(|ip| Self::on_border(&edges, ip) || Self::inside2(&edges, (ip.0 * 2, ip.1 * 2)))
+        self.prepare().contains_ip(q(lat, lon))
     }
 
     /// Relation member node test (C++ `add_border = false`): a point on an
     /// edge counts, a point on a vertex shared by two edges cancels out.
     pub fn contains_member(&self, p: Pt) -> bool {
-        let edges = self.edges();
-        Self::shifts(qp(p)).into_iter().any(|ip| {
-            let hits = edges.iter().filter(|(a, b)| on_seg(ip, *a, *b)).count();
-            if hits == 0 {
-                return Self::inside2(&edges, (ip.0 * 2, ip.1 * 2));
-            }
-            hits % 2 == 1
-        })
+        self.prepare().contains_member(p)
     }
 
     pub fn bbox(&self) -> BBox {
@@ -622,12 +607,148 @@ impl Polygon {
         BBox { south: lat(s), north: lat(n), west, east }
     }
 
+    pub fn matches_line(&self, v: &[Pt], add_border: bool) -> bool {
+        self.prepare().matches_line(v, add_border)
+    }
+
+    /// Spatial test of an element (ways with missing nodes never match).
+    pub fn matches(&self, g: &EGeom) -> bool {
+        let t = self.prepare();
+        let line = |l: &Vec<Option<Pt>>, add_border: bool| -> bool {
+            if l.is_empty() || l.iter().any(|x| x.is_none()) {
+                return false;
+            }
+            let pts: Vec<Pt> = l.iter().flatten().copied().collect();
+            match pts.len() {
+                1 => t.contains_pt(pts[0]),
+                _ => t.matches_line(&pts, add_border),
+            }
+        };
+        match g {
+            EGeom::Point(p) => t.contains_pt(*p),
+            EGeom::Line(v) => line(v, true),
+            EGeom::Multi { points, lines } => points.iter().any(|p| t.contains_member(*p)) || lines.iter().any(|l| line(l, false)),
+            EGeom::Empty => false,
+        }
+    }
+}
+
+/// Where a rectangle lies against a polygon (`PolyTest::rect_pos`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RectPos {
+    /// Strictly inside, without shifts (`contains_rect`).
+    Inside,
+    /// No point of the closed rectangle, also shifted by 360 degrees, is
+    /// inside the polygon or on its border.
+    Apart,
+    /// Across the border, or not decided.
+    Border,
+}
+
+/// A polygon with its edges (unwrapped, see `Polygon`) and their box,
+/// computed once (`Polygon::prepare`). Points outside the box are neither
+/// inside nor on the border, so most shifted points cost one comparison.
+pub struct PolyTest {
+    edges: Vec<(IP, IP)>,
+    lo: IP,
+    hi: IP,
+}
+
+impl PolyTest {
+    fn in_box(&self, p: IP) -> bool {
+        p.0 >= self.lo.0 && p.0 <= self.hi.0 && p.1 >= self.lo.1 && p.1 <= self.hi.1
+    }
+
+    fn on_border(&self, p: IP) -> bool {
+        Polygon::on_border(&self.edges, p)
+    }
+
+    fn inside2(&self, p2: IP) -> bool {
+        Polygon::inside2(&self.edges, p2)
+    }
+
+    fn contains_ip(&self, p: IP) -> bool {
+        Polygon::shifts(p).into_iter().any(|ip| self.in_box(ip) && (self.on_border(ip) || self.inside2((ip.0 * 2, ip.1 * 2))))
+    }
+
+    /// Node test: the border counts as inside.
+    pub fn contains_pt(&self, p: Pt) -> bool {
+        self.contains_ip(qp(p))
+    }
+
+    /// Relation member node test (C++ `add_border = false`): a point on an
+    /// edge counts, a point on a vertex shared by two edges cancels out.
+    pub fn contains_member(&self, p: Pt) -> bool {
+        Polygon::shifts(qp(p)).into_iter().any(|ip| {
+            if !self.in_box(ip) {
+                return false;
+            }
+            let hits = self.edges.iter().filter(|(a, b)| on_seg(ip, *a, *b)).count();
+            if hits == 0 {
+                return self.inside2((ip.0 * 2, ip.1 * 2));
+            }
+            hits % 2 == 1
+        })
+    }
+
+    /// Whether an edge meets the closed rectangle `lo`..`hi`: their boxes
+    /// overlap and the corners are not all on one side of the edge's line.
+    fn edge_meets(&self, lo: IP, hi: IP) -> bool {
+        let corners = [lo, (lo.0, hi.1), (hi.0, lo.1), hi];
+        self.edges.iter().any(|(a, b)| {
+            let overlap = a.0.min(b.0) <= hi.0 && a.0.max(b.0) >= lo.0 && a.1.min(b.1) <= hi.1 && a.1.max(b.1) >= lo.1;
+            overlap && {
+                let sides = corners.map(|c| orient(*a, *b, c).signum());
+                !(sides.iter().all(|s| *s > 0) || sides.iter().all(|s| *s < 0))
+            }
+        })
+    }
+
+    /// See `Polygon::contains_rect`.
+    pub fn contains_rect(&self, r: &crate::geo::Rect) -> bool {
+        if r.is_empty() {
+            return false;
+        }
+        let (lo, hi) = (qp(Pt { y: r.y0, x: r.x0 }), qp(Pt { y: r.y1, x: r.x1 }));
+        let corners = [lo, (lo.0, hi.1), (hi.0, lo.1), hi];
+        corners.iter().all(|c| !self.on_border(*c) && self.inside2((c.0 * 2, c.1 * 2))) && !self.edge_meets(lo, hi)
+    }
+
+    /// Where the stored box of a way lies: `Inside`, every vertex strictly
+    /// inside, passes the way tests; `Apart`, every vertex and segment
+    /// outside at every shift, fails them. A connected rectangle that no
+    /// edge meets is on one side of the border, which one of its corners
+    /// tells. Boxes wider than half the world are `Border`: their way may
+    /// cross the antimeridian, where `matches_line` unwraps it.
+    pub fn rect_pos(&self, r: &crate::geo::Rect) -> RectPos {
+        if r.is_empty() {
+            return RectPos::Border;
+        }
+        if self.contains_rect(r) {
+            return RectPos::Inside;
+        }
+        if r.x1 - r.x0 > 0x8000_0000 {
+            return RectPos::Border;
+        }
+        let (lo, hi) = (qp(Pt { y: r.y0, x: r.x0 }), qp(Pt { y: r.y1, x: r.x1 }));
+        for shift in [0, FULL, -FULL] {
+            let (lo, hi) = ((lo.0, lo.1 + shift), (hi.0, hi.1 + shift));
+            if hi.0 < self.lo.0 || lo.0 > self.hi.0 || hi.1 < self.lo.1 || lo.1 > self.hi.1 {
+                continue;
+            }
+            if self.edge_meets(lo, hi) || self.inside2((lo.0 * 2, lo.1 * 2)) {
+                return RectPos::Border;
+            }
+        }
+        RectPos::Apart
+    }
+
     /// Way test: a vertex strictly inside, a proper crossing of the border,
     /// a segment midpoint strictly inside, or (`add_border`) a segment
     /// running along the border. Touching the border in a single point does
     /// not count.
     fn matches_line_edges(edges: &[(IP, IP)], pts: &[IP], add_border: bool) -> bool {
-        let strictly_inside = |p: IP| !Self::on_border(edges, p) && Self::inside2(edges, (p.0 * 2, p.1 * 2));
+        let strictly_inside = |p: IP| !Polygon::on_border(edges, p) && Polygon::inside2(edges, (p.0 * 2, p.1 * 2));
         if pts.iter().any(|p| strictly_inside(*p)) {
             return true;
         }
@@ -635,7 +756,7 @@ impl Polygon {
             let (a, b) = (w[0], w[1]);
             let mid2 = (a.0 + b.0, a.1 + b.1);
             let mid_on_border = edges.iter().any(|(c, d)| on_seg(mid2, (c.0 * 2, c.1 * 2), (d.0 * 2, d.1 * 2)));
-            if !mid_on_border && Self::inside2(edges, mid2) {
+            if !mid_on_border && Polygon::inside2(edges, mid2) {
                 return true;
             }
             for (c, d) in edges {
@@ -660,33 +781,12 @@ impl Polygon {
     }
 
     pub fn matches_line(&self, v: &[Pt], add_border: bool) -> bool {
-        let edges = self.edges();
         let raw: Vec<IP> = v.iter().map(|p| qp(*p)).collect();
         let pts = unwrap(&raw);
         [0, FULL, -FULL].into_iter().any(|shift| {
             let shifted: Vec<IP> = pts.iter().map(|p| (p.0, p.1 + shift)).collect();
-            Self::matches_line_edges(&edges, &shifted, add_border)
+            Self::matches_line_edges(&self.edges, &shifted, add_border)
         })
-    }
-
-    /// Spatial test of an element (ways with missing nodes never match).
-    pub fn matches(&self, g: &EGeom) -> bool {
-        let line = |l: &Vec<Option<Pt>>, add_border: bool| -> bool {
-            if l.is_empty() || l.iter().any(|x| x.is_none()) {
-                return false;
-            }
-            let pts: Vec<Pt> = l.iter().flatten().copied().collect();
-            match pts.len() {
-                1 => self.contains_pt(pts[0]),
-                _ => self.matches_line(&pts, add_border),
-            }
-        };
-        match g {
-            EGeom::Point(p) => self.contains_pt(*p),
-            EGeom::Line(v) => line(v, true),
-            EGeom::Multi { points, lines } => points.iter().any(|p| self.contains_member(*p)) || lines.iter().any(|l| line(l, false)),
-            EGeom::Empty => false,
-        }
     }
 }
 
@@ -786,6 +886,72 @@ mod tests {
             }
         }
         assert!(inside > 100 && outside > 100, "{inside} inside, {outside} outside");
+    }
+
+    /// rect_pos: points and lines in a rectangle it puts apart from the
+    /// polygon fail the node, member and way tests, those in one it puts
+    /// inside pass them; also for a polygon across the antimeridian, whose
+    /// rectangles on the other side are inside only shifted by 360 degrees.
+    #[test]
+    fn rect_apart_from_polygon() {
+        use super::{Polygon, RectPos};
+        use crate::geo::{Pt, Rect};
+        let u = Polygon { pts: vec![(0.0, 0.0), (0.0, 3.0), (3.0, 3.0), (3.0, 2.0), (1.0, 2.0), (1.0, 1.0), (3.0, 1.0), (3.0, 0.0)] };
+        let diamond = Polygon { pts: vec![(48.9, 2.35), (48.85, 2.42), (48.8, 2.35), (48.85, 2.28)] };
+        let across = Polygon { pts: vec![(10.0, 179.0), (10.0, -179.0), (12.0, -179.0), (12.0, 179.0)] };
+        let rect = |s: f64, w: f64, n: f64, e: f64| {
+            let (a, b) = (Pt::from_ll(s, w), Pt::from_ll(n, e));
+            Rect { y0: a.y, x0: a.x, y1: b.y, x1: b.x }
+        };
+        let pos = |p: &Polygon, r: Rect| p.prepare().rect_pos(&r);
+        assert_eq!(pos(&u, rect(1.2, 1.2, 2.8, 1.8)), RectPos::Apart, "in the notch");
+        assert_eq!(pos(&u, rect(1.0, 1.2, 2.8, 1.8)), RectPos::Border, "on the bottom of the notch");
+        assert_eq!(pos(&u, rect(0.5, 0.5, 2.5, 2.5)), RectPos::Border);
+        assert_eq!(pos(&u, rect(4.0, 4.0, 5.0, 5.0)), RectPos::Apart);
+        assert_eq!(pos(&across, rect(10.5, 179.5, 11.0, 179.9)), RectPos::Inside);
+        assert_eq!(pos(&across, rect(10.5, -179.9, 11.0, -179.5)), RectPos::Border, "inside shifted by 360");
+        assert_eq!(pos(&across, rect(10.5, -170.0, 11.0, -160.0)), RectPos::Apart);
+        assert_eq!(pos(&across, rect(10.5, 170.0, 11.0, 178.0)), RectPos::Apart);
+        assert_eq!(pos(&u, Rect::EMPTY), RectPos::Border);
+        let mut seed = 0x0fed_cba9_8765_4321u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut counts = [0usize; 3];
+        for (poly, (s, w, size)) in [(&u, (-0.5, -0.5, 4.0)), (&diamond, (48.79, 2.27, 0.16)), (&across, (9.5, 178.0, 3.0)), (&across, (9.5, -181.0, 3.0))] {
+            let test = poly.prepare();
+            for _ in 0..3000 {
+                let (la, lo) = (s + rnd() * size, w + rnd() * size);
+                let (dla, dlo) = (rnd() * size * 0.2, rnd() * size * 0.2);
+                let lo = if lo < -180.0 { lo + 360.0 } else { lo };
+                let r = rect(la, lo, la + dla, (lo + dlo).min(180.0));
+                let p = test.rect_pos(&r);
+                counts[p as usize] += 1;
+                let at = |fy: f64, fx: f64| Pt { y: r.y0 + ((r.y1 - r.y0) as f64 * fy) as u32, x: r.x0 + ((r.x1 - r.x0) as f64 * fx) as u32 };
+                let pts = [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0), (0.5, 0.5), (0.3, 0.9)].map(|(fy, fx)| at(fy, fx));
+                match p {
+                    RectPos::Apart => {
+                        for q in pts {
+                            assert!(!poly.contains_pt(q) && !poly.contains_member(q) && !poly.matches_line(&[q, q], true), "{r:?}");
+                        }
+                        for line in [[pts[0], pts[3]], [pts[1], pts[2]]] {
+                            assert!(!poly.matches_line(&line, true) && !poly.matches_line(&line, false), "{r:?}");
+                        }
+                    }
+                    RectPos::Inside => {
+                        for q in pts {
+                            assert!(poly.contains_pt(q) && poly.contains_member(q), "{r:?}");
+                        }
+                        assert!(poly.matches_line(&[pts[0], pts[3]], false), "{r:?}");
+                    }
+                    RectPos::Border => {}
+                }
+            }
+        }
+        assert!(counts.iter().all(|n| *n > 200), "{counts:?}");
     }
 
     // Every point within the radius lies in the box, both hemispheres.
