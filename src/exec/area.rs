@@ -4,7 +4,6 @@
 use super::Engine;
 use super::areageom::{self, Block, HIT, IC, INTERSECT, RelPos, TOGGLE_EAST, TOGGLE_WEST, Tilewise};
 use super::eval::{Cx, El, Evaluator};
-use super::filter::TagFilter;
 use super::query::Plan;
 use super::set::{Set, sort_dedup};
 use crate::geo::{MAX_LEVEL, Pt, Rect, ilat, ilon, level_ranges};
@@ -14,6 +13,13 @@ use anyhow::Result;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::collections::BTreeMap;
 use std::io::Write;
+
+#[cfg(test)]
+thread_local! {
+    /// The tag filter whose index entries gave the candidates of the last
+    /// `area` query.
+    pub(super) static AREA_SOURCE: std::cell::Cell<Option<super::filter::TagFilter>> = const { std::cell::Cell::new(None) };
+}
 
 /// Polygons of one `(area)` clause.
 pub struct AreaCtx {
@@ -251,7 +257,9 @@ impl<'s, W: Write> Engine<'s, W> {
             self.f.by_ids::<Area>(&ids)?
         } else if let Some(first) = plan.inputs.first() {
             self.get(first).areas.clone()
-        } else if let Some(t) = plan.tags.iter().find(|t| matches!(t, TagFilter::Eq(..))).or_else(|| plan.tags.iter().find(|t| t.is_positive())) {
+        } else if let Some(t) = self.most_selective_eq(Kind::Area, plan, None)?.or_else(|| plan.tags.iter().find(|t| t.is_positive())) {
+            #[cfg(test)]
+            AREA_SOURCE.set(Some(t.clone()));
             let pairs = self.f.tag_candidates(Kind::Area, t, None)?;
             self.f.at::<Area>(pairs)?
         } else {

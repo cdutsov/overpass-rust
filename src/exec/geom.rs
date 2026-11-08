@@ -547,6 +547,31 @@ impl Polygon {
         inside
     }
 
+    /// Whether the rectangle lies strictly inside the polygon, without
+    /// shifts: its corners are inside and not on the border, and no edge
+    /// meets it. Every point in it then passes the node and way tests
+    /// (a way with all its vertices there is strictly inside).
+    pub fn contains_rect(&self, r: &crate::geo::Rect) -> bool {
+        if r.is_empty() {
+            return false;
+        }
+        let edges = self.edges();
+        let (lo, hi) = (qp(Pt { y: r.y0, x: r.x0 }), qp(Pt { y: r.y1, x: r.x1 }));
+        let corners = [lo, (lo.0, hi.1), (hi.0, lo.1), hi];
+        if !corners.iter().all(|c| !Self::on_border(&edges, *c) && Self::inside2(&edges, (c.0 * 2, c.1 * 2))) {
+            return false;
+        }
+        // An edge meets the closed rectangle when their boxes overlap and
+        // the corners are not all on one side of the edge's line.
+        !edges.iter().any(|(a, b)| {
+            let overlap = a.0.min(b.0) <= hi.0 && a.0.max(b.0) >= lo.0 && a.1.min(b.1) <= hi.1 && a.1.max(b.1) >= lo.1;
+            overlap && {
+                let sides = corners.map(|c| orient(*a, *b, c).signum());
+                !(sides.iter().all(|s| *s > 0) || sides.iter().all(|s| *s < 0))
+            }
+        })
+    }
+
     /// Node test: the border counts as inside.
     pub fn contains_pt(&self, p: Pt) -> bool {
         let edges = self.edges();
@@ -710,6 +735,57 @@ mod tests {
         let p = destination(lat, lon, 95.0, 119_500.0);
         assert!(great_circle_dist(lat, lon, p.0, p.1) <= r);
         assert!(inside(lat, lon, r, p), "{p:?} outside {:?}", radius_box(lat, lat, lon, lon, r));
+    }
+
+    /// A rectangle that contains_rect accepts has every point strictly
+    /// inside: grid points pass the node test and are not on the border,
+    /// segments across it pass the way test. A U shape whose notch the
+    /// rectangle spans is not accepted, although its corners are inside.
+    #[test]
+    fn rect_strictly_inside_polygon() {
+        use super::Polygon;
+        use crate::geo::{Pt, Rect};
+        let u = Polygon { pts: vec![(0.0, 0.0), (0.0, 3.0), (3.0, 3.0), (3.0, 2.0), (1.0, 2.0), (1.0, 1.0), (3.0, 1.0), (3.0, 0.0)] };
+        let diamond = Polygon { pts: vec![(48.9, 2.35), (48.85, 2.42), (48.8, 2.35), (48.85, 2.28)] };
+        let rect = |s: f64, w: f64, n: f64, e: f64| {
+            let (a, b) = (Pt::from_ll(s, w), Pt::from_ll(n, e));
+            Rect { y0: a.y, x0: a.x, y1: b.y, x1: b.x }
+        };
+        // across the notch of the U, corners inside
+        assert!(!u.contains_rect(&rect(0.5, 0.5, 2.5, 2.5)));
+        assert!(u.contains_rect(&rect(0.2, 0.2, 0.8, 2.8)));
+        assert!(!u.contains_rect(&rect(0.0, 0.2, 0.8, 2.8)), "on the border");
+        assert!(!u.contains_rect(&rect(0.5, 1.2, 1.0, 1.8)), "corners on the bottom of the notch");
+        assert!(u.contains_rect(&rect(1.5, 0.2, 2.5, 0.8)));
+        assert!(!u.contains_rect(&Rect::EMPTY));
+        let mut seed = 0x1234_5678_9abc_def1u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let (mut inside, mut outside) = (0, 0);
+        for (poly, (s, w, size)) in [(&u, (-0.5, -0.5, 4.0)), (&diamond, (48.79, 2.27, 0.16))] {
+            for _ in 0..3000 {
+                let (la, lo) = (s + rnd() * size, w + rnd() * size);
+                let (dla, dlo) = (rnd() * size * 0.2, rnd() * size * 0.2);
+                let r = rect(la, lo, la + dla, lo + dlo);
+                if !poly.contains_rect(&r) {
+                    outside += 1;
+                    continue;
+                }
+                inside += 1;
+                let at = |fy: f64, fx: f64| Pt { y: r.y0 + ((r.y1 - r.y0) as f64 * fy) as u32, x: r.x0 + ((r.x1 - r.x0) as f64 * fx) as u32 };
+                for (fy, fx) in [(0.0, 0.0), (0.0, 1.0), (1.0, 0.0), (1.0, 1.0), (0.5, 0.5), (0.3, 0.9)] {
+                    let p = at(fy, fx);
+                    assert!(poly.contains_pt(p) && poly.contains_member(p), "{r:?}");
+                    assert!(poly.matches_line(&[p, p], false), "{r:?}");
+                }
+                assert!(poly.matches_line(&[at(0.0, 0.0), at(1.0, 1.0)], false));
+            }
+        }
+        assert!(inside > 100 && outside > 100, "{inside} inside, {outside} outside");
     }
 
     // Every point within the radius lies in the box, both hemispheres.

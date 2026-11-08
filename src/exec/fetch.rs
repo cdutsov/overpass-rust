@@ -419,7 +419,7 @@ impl<'s> Fetch<'s> {
     pub fn tag_candidates(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>) -> Result<Vec<(Cell, Id)>> {
         let mut out = Vec::new();
         let mut n = 0u32;
-        self.scan_candidates(kind, f, ranges, |cell, ids| {
+        self.scan_candidates(kind, f, ranges, || true, |cell, ids| {
             n = n.wrapping_add(1);
             if n % 4096 == 0 {
                 self.limits.check()?;
@@ -434,16 +434,46 @@ impl<'s> Fetch<'s> {
         Ok(out)
     }
 
-    /// Whether the cell ranges hold more than `share` of the chunks of a
-    /// kind, so that reading a tag index without ranges is cheaper than
-    /// decoding every chunk in them.
-    pub fn ranges_are_large(&self, kind: Kind, ranges: &[CodeRange], share: f64) -> Result<bool> {
+    /// `tag_candidates` that gives up: None once the scan has visited more
+    /// than `max_steps` values and cell groups of the index (a regex prefix
+    /// shared by many values, a common value). Lets a caller try the index
+    /// where another source may cost less, and lose at most `max_steps`
+    /// index steps.
+    pub fn tag_candidates_bounded(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>, max_steps: usize) -> Result<Option<Vec<(Cell, Id)>>> {
+        let mut out = Vec::new();
+        let steps = std::cell::Cell::new(0usize);
+        let step = || {
+            steps.set(steps.get() + 1);
+            steps.get() <= max_steps
+        };
+        let mut over = false;
+        self.scan_candidates(kind, f, ranges, step, |cell, ids| {
+            if !step() {
+                over = true;
+                return Ok(Scan::Stop);
+            }
+            if steps.get() % 4096 == 0 {
+                self.limits.check()?;
+            }
+            out.extend(ids.iter().map(|id| (cell, *id)));
+            Ok(Scan::Next)
+        })?;
+        if over || steps.get() > max_steps {
+            return Ok(None);
+        }
+        self.limits.check()?;
+        out.sort_unstable();
+        out.dedup();
+        Ok(Some(out))
+    }
+
+    /// Chunks of a kind in the cell ranges, and in all.
+    pub fn chunk_share(&self, kind: Kind, ranges: &[CodeRange]) -> Result<(usize, u64)> {
         let total = self.snap.chunk_count(kind)?;
         if total == 0 {
-            return Ok(false);
+            return Ok((0, 0));
         }
-        let limit = (total as f64 * share).ceil() as usize;
-        Ok(self.snap.chunks_in_ranges(kind, ranges)?.len() > limit)
+        Ok((self.snap.chunks_in_ranges(kind, ranges)?.len(), total))
     }
 
     /// Candidates from the tag index without ranges, kept when their cell
@@ -451,7 +481,7 @@ impl<'s> Fetch<'s> {
     pub fn tag_candidates_in(&self, kind: Kind, f: &TagFilter, ranges: &[CodeRange]) -> Result<Vec<(Cell, Id)>> {
         let mut out = Vec::new();
         let mut n = 0u32;
-        self.scan_candidates(kind, f, None, |cell, ids| {
+        self.scan_candidates(kind, f, None, || true, |cell, ids| {
             n = n.wrapping_add(1);
             if n % 4096 == 0 {
                 self.limits.check()?;
@@ -471,7 +501,7 @@ impl<'s> Fetch<'s> {
     /// `cap` (to compare the selectivity of filters cheaply).
     pub fn tag_count_capped(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>, cap: usize) -> Result<usize> {
         let mut n = 0usize;
-        self.scan_candidates(kind, f, ranges, |_, ids| {
+        self.scan_candidates(kind, f, ranges, || true, |_, ids| {
             n += ids.len();
             Ok(if n > cap { Scan::Stop } else { Scan::Next })
         })?;
@@ -481,7 +511,7 @@ impl<'s> Fetch<'s> {
     /// Whether the tag index has any candidate for the filter.
     pub fn tag_exists(&self, kind: Kind, f: &TagFilter) -> Result<bool> {
         let mut found = false;
-        self.scan_candidates(kind, f, None, |_, _| {
+        self.scan_candidates(kind, f, None, || true, |_, _| {
             found = true;
             Ok(Scan::Stop)
         })?;
@@ -489,16 +519,28 @@ impl<'s> Fetch<'s> {
     }
 
     /// Index entries (cell, encoded ids) that may match a positive filter.
-    fn scan_candidates(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>, mut push: impl FnMut(Cell, &[Id]) -> Result<Scan>) -> Result<()> {
+    /// `visit` is called for every value of the key the scan comes to
+    /// (not for `key=value`); false ends the scan.
+    fn scan_candidates(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>, mut visit: impl FnMut() -> bool, mut push: impl FnMut(Cell, &[Id]) -> Result<Scan>) -> Result<()> {
         // Value test for regexes: values failing it are skipped as a whole.
         let value_test = |re: &regex::Regex, val: &[u8]| val.contains(&1) || std::str::from_utf8(val).is_ok_and(|s| re.is_match(s));
+        let mut accept = |ok: bool| match (visit(), ok) {
+            (false, _) => Scan::Stop,
+            (true, true) => Scan::Next,
+            (true, false) => Scan::SkipValue,
+        };
         match f {
             TagFilter::Eq(k, v) => self.snap.scan_tags(kind, k, Some(v), ranges, |_, cell, ids| push(cell, ids)),
-            TagFilter::HasKey(k) => self.snap.scan_tags(kind, k, None, ranges, |_, cell, ids| push(cell, ids)),
+            TagFilter::HasKey(key) => {
+                let mut k = Vec::new();
+                crate::store::index_part(key, &mut k);
+                self.snap.scan_tags_matching(kind, &k, None, ranges, |_| accept(true), |_, cell, ids| push(cell, ids))?;
+                Ok(())
+            }
             TagFilter::Regex { key, re, neg: false, prefixes } => {
                 let mut k = Vec::new();
                 crate::store::index_part(key, &mut k);
-                self.snap.scan_tags_matching(kind, &k, prefixes.as_deref(), ranges, |val| value_test(re, val), |_, cell, ids| push(cell, ids))?;
+                self.snap.scan_tags_matching(kind, &k, prefixes.as_deref(), ranges, |val| accept(value_test(re, val)), |_, cell, ids| push(cell, ids))?;
                 Ok(())
             }
             TagFilter::KeyRegex { key, value, value_prefixes } => {
@@ -510,7 +552,7 @@ impl<'s> Fetch<'s> {
                         continue;
                     }
                     let prefixes = if truncated { None } else { value_prefixes.as_deref() };
-                    let r = self.snap.scan_tags_matching(kind, &k, prefixes, ranges, |val| truncated || value_test(value, val), |_, cell, ids| push(cell, ids))?;
+                    let r = self.snap.scan_tags_matching(kind, &k, prefixes, ranges, |val| accept(truncated || value_test(value, val)), |_, cell, ids| push(cell, ids))?;
                     if r == Scan::Stop {
                         break;
                     }

@@ -139,7 +139,8 @@ fn memchr0(b: &[u8]) -> Option<usize> {
     b.iter().position(|&c| c == 0)
 }
 
-/// What a tag index scan does after an entry.
+/// What a tag index scan does after an entry, or with a value it is
+/// about to read.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Scan {
     Next,
@@ -511,15 +512,16 @@ impl<'e> Snapshot<'e> {
             self.scan_value(db, kp.len(), &p, ranges, None, &mut f)?;
             return Ok(());
         }
-        self.scan_tag_values(kind, key, b"", ranges, |_| true, &mut f)?;
+        self.scan_tag_values(kind, key, b"", ranges, |_| Scan::Next, &mut f)?;
         Ok(())
     }
 
     /// Tag index entries of `key` (as stored, see `index_part`) whose value
-    /// starts with one of `prefixes` (all values if None) and passes
-    /// `accept`, which is asked once per value. As `scan_tags_raw` otherwise;
-    /// returns `Stop` if the callback stopped the scan.
-    pub fn scan_tags_matching(&self, kind: Kind, key: &[u8], prefixes: Option<&[Vec<u8>]>, ranges: Option<&[CodeRange]>, mut accept: impl FnMut(&[u8]) -> bool, mut f: impl FnMut(&[u8], Cell, &[Id]) -> Result<Scan>) -> Result<Scan> {
+    /// starts with one of `prefixes` (all values if None). `accept` is
+    /// asked once per value: `Next` reads its entries, `SkipValue` steps
+    /// over them, `Stop` ends the scan. As `scan_tags_raw` otherwise;
+    /// returns `Stop` if a callback stopped the scan.
+    pub fn scan_tags_matching(&self, kind: Kind, key: &[u8], prefixes: Option<&[Vec<u8>]>, ranges: Option<&[CodeRange]>, mut accept: impl FnMut(&[u8]) -> Scan, mut f: impl FnMut(&[u8], Cell, &[Id]) -> Result<Scan>) -> Result<Scan> {
         match prefixes {
             None => self.scan_tag_values(kind, key, b"", ranges, &mut accept, &mut f),
             Some(ps) => {
@@ -534,10 +536,11 @@ impl<'e> Snapshot<'e> {
     }
 
     /// Walk the values of `key` that start with `prefix` in one pass of a
-    /// cursor: each value is tested once with `accept`; the entries of
-    /// accepted values go to `f` (cells in `ranges` only), those of other
-    /// values are stepped over, or skipped with a seek when there are many.
-    fn scan_tag_values(&self, kind: Kind, key: &[u8], prefix: &[u8], ranges: Option<&[CodeRange]>, mut accept: impl FnMut(&[u8]) -> bool, f: &mut impl FnMut(&[u8], Cell, &[Id]) -> Result<Scan>) -> Result<Scan> {
+    /// cursor: each value is tested once with `accept` (see
+    /// `scan_tags_matching`); the entries of accepted values go to `f`
+    /// (cells in `ranges` only), those of other values are stepped over, or
+    /// skipped with a seek when there are many.
+    fn scan_tag_values(&self, kind: Kind, key: &[u8], prefix: &[u8], ranges: Option<&[CodeRange]>, mut accept: impl FnMut(&[u8]) -> Scan, f: &mut impl FnMut(&[u8], Cell, &[Id]) -> Result<Scan>) -> Result<Scan> {
         // Entries of one value read in turn before seeking past the rest
         // (rejected values) or reading the rest by range (accepted values
         // with `ranges`, see `scan_value`).
@@ -583,7 +586,11 @@ impl<'e> Snapshot<'e> {
                     }
                     cur.clear();
                     cur.extend_from_slice(p);
-                    wanted = accept(&p[vstart..p.len() - 1]);
+                    wanted = match accept(&p[vstart..p.len() - 1]) {
+                        Scan::Next => true,
+                        Scan::SkipValue => false,
+                        Scan::Stop => return Ok(Scan::Stop),
+                    };
                     seen = 0;
                 }
                 seen += 1;
