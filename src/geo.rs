@@ -618,11 +618,6 @@ impl Segment {
     }
 }
 
-/// C++ `Bbox_Double::contains` on doubles (handles boxes across the antimeridian).
-pub fn bbox_contains(b: &BBox, p: (f64, f64)) -> bool {
-    b.south <= p.0 && p.0 <= b.north && if b.east >= b.west { b.west <= p.1 && p.1 <= b.east } else { p.1 >= b.west || p.1 <= b.east }
-}
-
 /// C++ `Bbox_Double::intersects` for a segment, on unrounded doubles.
 /// Segments spanning more than 180 degrees of longitude are taken across
 /// the antimeridian.

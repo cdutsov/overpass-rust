@@ -205,6 +205,7 @@ pass = S <= node.ilat <= N && ((W <= node.ilon <= E) || (E < W && (node.ilon >= 
 **Ways** (`Bbox_Filter::matches`, `bbox_filter.cc:106-125`) — on decoded f64 coordinates and the **unrounded** f64 bbox (so a node exactly on an edge given with >7 decimals can be in for the node test and out for the way test):
 - empty geometry → false; one coordinate → `contains(p)`;
 - else true iff some consecutive segment satisfies `intersects(a, b)`. A way crossing the box with no node inside matches.
+- Rust: a way also passes when one of its nodes passes the integer node test above, checked before the segments. A node on an edge can decode 1e-14 outside the f64 box (`ilat/1e7 - 91.0`), and an edge given with more than 7 decimals rounds onto the node in the integer test; in both cases the way passes as its node does. The live C++ returns these ways as well. Member nodes of relations use the integer node test too.
 ```
 contains(p): s <= p.lat <= n && (if e >= w { w <= p.lon <= e } else { p.lon >= w || p.lon <= e })   // geometry.cc:48
 intersects(from, to):                                                                                 // geometry.cc:60-112

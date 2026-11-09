@@ -268,22 +268,32 @@ impl QElem for Relation {
 
 /// Integer node-in-bbox test (C++ `Bbox_Filter` for nodes).
 fn node_in_bbox(p: crate::geo::Pt, b: &BBox) -> bool {
+    node_test(b)(p)
+}
+
+/// `node_in_bbox` with the box converted once.
+fn node_test(b: &BBox) -> impl Fn(crate::geo::Pt) -> bool {
     use crate::geo::{ilat, ilon};
     let (s, n, w, e) = (ilat(b.south), ilat(b.north), ilon(b.west), ilon(b.east));
-    let la = p.y;
-    let lo = p.ilon();
-    s <= la && la <= n && ((w <= lo && lo <= e) || (e < w && (lo >= w || lo <= e)))
+    move |p| {
+        let (la, lo) = (p.y, p.ilon());
+        s <= la && la <= n && ((w <= lo && lo <= e) || (e < w && (lo >= w || lo <= e)))
+    }
 }
 
 /// Way test: ways with a missing node have no geometry and never match.
+/// A way passes when one of its nodes passes the node test, so a node on a
+/// box edge takes its way (the f64 latitude of such a node can lie 1e-14
+/// outside the edge), and otherwise when a segment crosses the box.
 fn line_in_bbox(v: &[Option<crate::geo::Pt>], b: &BBox) -> bool {
     if v.is_empty() || v.iter().any(|p| p.is_none()) {
         return false;
     }
-    let pts: Vec<(f64, f64)> = v.iter().flatten().map(|p| (p.lat(), p.lon())).collect();
-    if pts.len() == 1 {
-        return crate::geo::bbox_contains(b, pts[0]);
+    let inside = node_test(b);
+    if v.iter().flatten().any(|p| inside(*p)) {
+        return true;
     }
+    let pts: Vec<(f64, f64)> = v.iter().flatten().map(|p| (p.lat(), p.lon())).collect();
     pts.windows(2).any(|w| crate::geo::bbox_intersects(b, w[0], w[1]))
 }
 
@@ -293,7 +303,8 @@ fn geom_in_bbox(g: &EGeom, b: &BBox) -> bool {
         EGeom::Point(p) => node_in_bbox(*p, b),
         EGeom::Line(v) => line_in_bbox(v, b),
         EGeom::Multi { points, lines } => {
-            points.iter().any(|p| crate::geo::bbox_contains(b, (p.lat(), p.lon()))) || lines.iter().any(|l| line_in_bbox(l, b))
+            let inside = node_test(b);
+            points.iter().any(|p| inside(*p)) || lines.iter().any(|l| line_in_bbox(l, b))
         }
         EGeom::Empty => false,
     }
@@ -2231,5 +2242,33 @@ mod tests {
             }
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // A way whose only point in a box is a node on an edge passes, as the
+    // node does, on each of the four edges and in both directions.
+    #[test]
+    fn way_meets_a_box_at_a_node_on_its_edge() {
+        let b = BBox { south: 40.4168, west: 8.5417, north: 47.3769, east: 8.5517 };
+        let edges = [((47.3769, 8.545), (47.38, 8.545)), ((40.4168, 8.545), (40.41, 8.545)), ((45.0, 8.5417), (45.0, 8.54)), ((45.0, 8.5517), (45.0, 8.56))];
+        for (on, out) in edges {
+            let (p, q) = (Pt::from_ll(on.0, on.1), Pt::from_ll(out.0, out.1));
+            assert!(node_in_bbox(p, &b), "{on:?}");
+            assert!(line_in_bbox(&[Some(q), Some(p)], &b), "{on:?}");
+            assert!(line_in_bbox(&[Some(p), Some(q)], &b), "{on:?}");
+            assert!(geom_in_bbox(&EGeom::Multi { points: vec![p], lines: vec![] }, &b), "{on:?}");
+        }
+        // a way along the north edge, and one just outside it
+        let (a, c) = (Pt::from_ll(47.3769, 8.545), Pt::from_ll(47.3769, 8.55));
+        assert!(line_in_bbox(&[Some(a), Some(c)], &b));
+        let (a, c) = (Pt::from_ll(47.3769001, 8.545), Pt::from_ll(47.3769001, 8.55));
+        assert!(!line_in_bbox(&[Some(a), Some(c)], &b));
+        // an edge between two 7-digit values: the node test rounds it, the way follows
+        let b = BBox { north: 47.37689996, ..b };
+        let (p, q) = (Pt::from_ll(47.3769, 8.545), Pt::from_ll(47.38, 8.545));
+        assert!(node_in_bbox(p, &b) && line_in_bbox(&[Some(q), Some(p)], &b));
+        // a segment across the box without a node in it
+        let (p, q) = (Pt::from_ll(45.0, 8.53), Pt::from_ll(45.0, 8.56));
+        assert!(!node_in_bbox(p, &b) && !node_in_bbox(q, &b) && line_in_bbox(&[Some(p), Some(q)], &b));
+        assert!(!line_in_bbox(&[Some(p)], &b));
     }
 }
