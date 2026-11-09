@@ -374,9 +374,14 @@ impl<'s> Fetch<'s> {
 
     /// All elements stored in the given cell ranges that pass `keep`.
     pub fn in_ranges<T: Stored>(&self, ranges: &[CodeRange], keep: impl Fn(&T) -> bool + Sync + Send) -> Result<Vec<T>> {
+        self.in_ranges_by(ranges, T::decode, keep)
+    }
+
+    /// `in_ranges` with a decoder of its own (e.g. without tags).
+    pub fn in_ranges_by<T: Stored>(&self, ranges: &[CodeRange], decode: impl Fn(&[u8], Pick) -> Result<Vec<T>> + Sync + Send, keep: impl Fn(&T) -> bool + Sync + Send) -> Result<Vec<T>> {
         let chunks = self.snap.chunks_in_ranges(T::KIND, ranges)?;
         let mut out = decode_chunks(&self.limits, &chunks, |v| *v, |v| {
-            let mut es = T::decode(v, Pick::Cells(ranges))?;
+            let mut es = decode(v, Pick::Cells(ranges))?;
             es.retain(|e| keep(e));
             // retain keeps the capacity of the whole chunk; without this a
             // scan of many chunks holds memory for every element it decoded
@@ -405,6 +410,12 @@ impl<'s> Fetch<'s> {
 
     /// Elements at known (cell, id) positions.
     pub fn at<T: Stored>(&self, pairs: Vec<(Cell, Id)>) -> Result<Vec<T>> {
+        self.at_where(pairs, None)
+    }
+
+    /// `at` without the elements that fail `test`, which are not decoded
+    /// whole (`Stored::decode_where`).
+    pub fn at_where<T: Stored>(&self, pairs: Vec<(Cell, Id)>, test: Option<codec::TagTest>) -> Result<Vec<T>> {
         // In batches, so that a query with millions of candidates (a common
         // key over a country) sees its deadline while they are grouped by
         // chunk; a chunk on a batch border is read twice for disjoint ids.
@@ -413,7 +424,10 @@ impl<'s> Fetch<'s> {
         for part in pairs.chunks(BATCH) {
             self.limits.check()?;
             let work = self.snap.chunks_at(T::KIND, part.to_vec())?;
-            out.extend(decode_chunks(&self.limits, &work, |(v, _)| *v, |(v, want)| T::decode(v, Pick::Ids(want)))?);
+            out.extend(decode_chunks(&self.limits, &work, |(v, _)| *v, |(v, want)| match test {
+                Some(t) => T::decode_where(v, Pick::Ids(want), t),
+                None => T::decode(v, Pick::Ids(want)),
+            })?);
         }
         out.sort_unstable_by_key(|e| e.id());
         out.dedup_by_key(|e| e.id());
@@ -513,6 +527,44 @@ impl<'s> Fetch<'s> {
         Ok(Some(out))
     }
 
+    /// The pairs (sorted) that the tag index also lists for `f`, or None
+    /// once the scan has taken more than `max_steps` steps (as
+    /// `tag_candidates_bounded`). An element has its tag index entries in
+    /// its own cell, so a pair that one filter lists and another does not
+    /// is an element without one of the tags.
+    pub fn tag_intersect(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>, pairs: &[(Cell, Id)], max_steps: usize) -> Result<Option<Vec<(Cell, Id)>>> {
+        let mut hit = vec![false; pairs.len()];
+        let steps = std::cell::Cell::new(0usize);
+        let step = || {
+            steps.set(steps.get() + 1);
+            steps.get() <= max_steps
+        };
+        let mut over = false;
+        self.scan_candidates(kind, f, ranges, step, |cell, ids| {
+            if !step() {
+                over = true;
+                return Ok(Scan::Stop);
+            }
+            if steps.get() % 4096 == 0 {
+                self.limits.check()?;
+            }
+            let lo = pairs.partition_point(|p| p.0 < cell);
+            let run = &pairs[lo..lo + pairs[lo..].partition_point(|p| p.0 == cell)];
+            if !run.is_empty() {
+                for id in ids {
+                    if let Ok(i) = run.binary_search_by_key(id, |p| p.1) {
+                        hit[lo + i] = true;
+                    }
+                }
+            }
+            Ok(Scan::Next)
+        })?;
+        if over || steps.get() > max_steps {
+            return Ok(None);
+        }
+        Ok(Some(pairs.iter().zip(hit).filter(|(_, h)| *h).map(|(p, _)| *p).collect()))
+    }
+
     /// Chunks of a kind in the cell ranges, and in all.
     pub fn chunk_share(&self, kind: Kind, ranges: &[CodeRange]) -> Result<(usize, u64)> {
         let total = self.snap.chunk_count(kind)?;
@@ -591,7 +643,7 @@ impl<'s> Fetch<'s> {
                 self.snap.scan_tags_matching(kind, &k, None, ranges, |_| accept(true), |_, cell, ids| push(cell, ids))?;
                 Ok(())
             }
-            TagFilter::Regex { key, re, neg: false, prefixes } => {
+            TagFilter::Regex { key, re, neg: false, prefixes, .. } => {
                 let mut k = Vec::new();
                 crate::store::index_part(key, &mut k);
                 self.snap.scan_tags_matching(kind, &k, prefixes.as_deref(), ranges, |val| accept(value_test(re, val)), |_, cell, ids| push(cell, ids))?;

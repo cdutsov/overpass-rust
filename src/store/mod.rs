@@ -350,26 +350,60 @@ fn chunks_in_ranges<'t>(db: Database<Bytes, Bytes>, txn: &'t RoTxn, ranges: &[Co
 }
 
 /// Chunks holding the given (cell, id) positions (sorted), with the ids
-/// each holds (sorted).
+/// each holds (sorted). A chunk up to `STEPS` entries after the last one
+/// is reached by stepping a cursor, which costs less than a search from
+/// the root of the tree: the 1.4 x 10^6 ways tagged boundary=
+/// administrative lie in a ninth of the 3 x 10^6 way chunks.
 fn chunks_for_pairs<'t>(db: Database<Bytes, Bytes>, txn: &'t RoTxn, pairs: &[(Cell, Id)]) -> Result<Vec<(ChunkKey, &'t [u8], Vec<Id>)>> {
+    const STEPS: usize = 8;
+    fn entry<'t>(it: &mut impl Iterator<Item = heed::Result<(&'t [u8], &'t [u8])>>) -> Result<Option<(ChunkKey, &'t [u8])>> {
+        match it.next() {
+            Some(e) => {
+                let (k, v) = e?;
+                Ok(Some((to_chunk_key(k)?, v)))
+            }
+            None => Ok(None),
+        }
+    }
     let mut out: Vec<(ChunkKey, &[u8], Vec<Id>)> = Vec::new();
-    // Bounds of the last chunk: [start, next).
-    let mut cur: Option<(ChunkKey, Option<ChunkKey>)> = None;
+    // The entries after the last chunk of `out`: the first one, and a
+    // cursor at the following ones.
+    let mut next: Option<(ChunkKey, &[u8])> = None;
+    let mut cursor = None;
     for &(cell, id) in pairs {
         let k = chunk_key(cell, id);
-        if let Some((s, n)) = &cur {
-            if *s <= k && n.is_none_or(|n| k < n) {
-                out.last_mut().unwrap().2.push(id);
+        if let Some((s, _, ids)) = out.last_mut() {
+            if *s <= k && next.is_none_or(|(n, _)| k < n) {
+                ids.push(id);
                 continue;
             }
         }
-        let Some((sk, v)) = db.get_lower_than_or_equal_to(txn, &k)? else { continue };
-        let sk = to_chunk_key(sk)?;
-        let next = match db.get_greater_than(txn, &k)? {
-            Some((nk, _)) => Some(to_chunk_key(nk)?),
-            None => None,
+        // The chunk holding k: the last one starting at or before it.
+        let mut found = None;
+        if let Some(it) = cursor.as_mut() {
+            for _ in 0..STEPS {
+                let Some((nk, nv)) = next else { break };
+                if nk > k {
+                    break;
+                }
+                next = entry(it)?;
+                if next.is_none_or(|(n, _)| k < n) {
+                    found = Some((nk, nv));
+                    break;
+                }
+            }
+        }
+        let (sk, v) = match found {
+            Some(f) => f,
+            None => {
+                let Some((sk, v)) = db.get_lower_than_or_equal_to(txn, &k)? else { continue };
+                let sk = to_chunk_key(sk)?;
+                let mut it = db.range(txn, &(Bound::Excluded(&sk[..]), Bound::Unbounded))?;
+                next = entry(&mut it)?;
+                cursor = Some(it);
+                (sk, v)
+            }
         };
-        cur = Some((sk, next));
         out.push((sk, v, vec![id]));
     }
     for (_, _, ids) in out.iter_mut() {

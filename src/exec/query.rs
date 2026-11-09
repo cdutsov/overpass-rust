@@ -13,6 +13,7 @@ use crate::geo::{BBox, Cell, CodeRange, Rect, cell_in_ranges, tile_of};
 use crate::model::*;
 use crate::ql::ast::*;
 use crate::store::Kind;
+use crate::store::codec::{self, TagTest};
 use crate::update::Stored;
 use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
@@ -34,6 +35,9 @@ pub struct Plan {
     pub recurse_ops: Vec<RecurseOp>,
     pub areas: Vec<(String, Option<Id>)>,
     pub pivots: Vec<String>,
+    /// Elements already decoded that the other clauses narrow down (the
+    /// relations of `rel_spatial_by_candidates`); taken by the query.
+    pub given: std::sync::Mutex<Option<Set>>,
 }
 
 impl Plan {
@@ -53,6 +57,7 @@ impl Plan {
             recurse_ops: vec![],
             areas: vec![],
             pivots: vec![],
+            given: std::sync::Mutex::new(None),
         };
         for f in filters {
             if let Some(t) = TagFilter::from_ast(f)? {
@@ -147,6 +152,7 @@ pub fn standalone_name(types: &Types, filters: &[Filter]) -> Option<&'static str
 pub trait QElem: Stored {
     fn tags_of(&self) -> &Tags;
     fn from_set(s: &Set) -> &Vec<Self>;
+    fn from_set_mut(s: &mut Set) -> &mut Vec<Self>;
     fn etype() -> ElemType;
     fn geoms(f: &Fetch, elems: &[&Self]) -> Result<Vec<EGeom>>;
     /// Geometry sufficient for a test against one bbox only (`rects`).
@@ -179,6 +185,9 @@ impl QElem for Node {
     fn from_set(s: &Set) -> &Vec<Self> {
         &s.nodes
     }
+    fn from_set_mut(s: &mut Set) -> &mut Vec<Self> {
+        &mut s.nodes
+    }
     fn etype() -> ElemType {
         ElemType::Node
     }
@@ -198,6 +207,9 @@ impl QElem for Way {
     }
     fn from_set(s: &Set) -> &Vec<Self> {
         &s.ways
+    }
+    fn from_set_mut(s: &mut Set) -> &mut Vec<Self> {
+        &mut s.ways
     }
     fn etype() -> ElemType {
         ElemType::Way
@@ -224,6 +236,9 @@ impl QElem for Relation {
     }
     fn from_set(s: &Set) -> &Vec<Self> {
         &s.rels
+    }
+    fn from_set_mut(s: &mut Set) -> &mut Vec<Self> {
+        &mut s.rels
     }
     fn etype() -> ElemType {
         ElemType::Relation
@@ -377,6 +392,9 @@ impl<'s, W: Write> Engine<'s, W> {
     /// Candidate ids from all clauses that collect data directly.
     fn collected<T: QElem>(&mut self, plan: &Plan) -> Result<Option<Vec<T>>> {
         let mut sources: Vec<Vec<T>> = Vec::new();
+        if let Some(mut given) = plan.given.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            sources.push(std::mem::take(T::from_set_mut(&mut given)));
+        }
         if let Some(ids) = &plan.ids {
             let ids: Vec<Id> = if T::KIND == Kind::Node { ids.clone() } else { ids.iter().copied().filter(|i| *i <= u32::MAX as u64).collect() };
             sources.push(self.f.by_ids::<T>(&ids)?);
@@ -449,10 +467,9 @@ impl<'s, W: Write> Engine<'s, W> {
             None => {
                 let rects = self.spatial_rects(plan, arounds, area_ctxs)?;
                 let ranges: Option<Vec<CodeRange>> = rects.as_ref().map(|r| ranges_for(kind, r));
-                if let Some(probe) = self.most_selective(kind, plan, ranges.as_deref())? {
-                    let pairs = self.f.tag_candidates(kind, probe, ranges.as_deref())?;
+                if let Some((pairs, read)) = self.indexed_candidates(kind, plan, ranges.as_deref())? {
                     self.check()?;
-                    self.f.at::<T>(pairs)?
+                    self.at_tagged::<T>(plan, pairs, &read)?
                 } else if let Some(r) = &ranges {
                     // A key or value-regex filter over a large region (a
                     // country) reads its tag index instead of every chunk.
@@ -465,11 +482,11 @@ impl<'s, W: Write> Engine<'s, W> {
                         Some(t) => {
                             let (region, total) = self.f.chunk_share(kind, r)?;
                             if total > 0 && region > (total as f64 * 0.1).ceil() as usize {
-                                Some(self.f.tag_candidates_in(kind, t, r)?)
+                                Some((self.f.tag_candidates_in(kind, t, r)?, t))
                             } else if let Some(a) = anchored {
                                 #[cfg(test)]
                                 let region = tests::INDEX_STEPS.get().unwrap_or(region);
-                                self.f.tag_candidates_bounded(kind, a, Some(r), region)?
+                                self.f.tag_candidates_bounded(kind, a, Some(r), region)?.map(|p| (p, a))
                             } else {
                                 None
                             }
@@ -479,16 +496,16 @@ impl<'s, W: Write> Engine<'s, W> {
                     #[cfg(test)]
                     tests::INDEXED.set(pairs.is_some());
                     match pairs {
-                        Some(pairs) => {
+                        Some((pairs, t)) => {
                             self.check()?;
-                            self.f.at::<T>(pairs)?
+                            self.at_tagged::<T>(plan, pairs, &[t])?
                         }
                         None => self.f.in_ranges::<T>(r, |e| plan.tags.iter().all(|t| t.matches(e.tags_of())))?,
                     }
                 } else if let Some(t) = plan.tags.iter().find(|t| anchored(t)).or_else(|| plan.tags.iter().find(|t| t.is_positive())) {
                     let pairs = self.f.tag_candidates(kind, t, None)?;
                     self.check()?;
-                    self.f.at::<T>(pairs)?
+                    self.at_tagged::<T>(plan, pairs, &[t])?
                 } else {
                     if kind != Kind::Relation && !self.negated_tags_exist(kind, plan)? {
                         self.report("runtime error: Filters too weak in query statement: specify in addition a bbox, a tag filter, or similar.");
@@ -665,15 +682,12 @@ impl<'s, W: Write> Engine<'s, W> {
         #[cfg(test)]
         let try_candidates = !tests::CANDIDATES_OFF.get();
         if try_candidates {
-            if let Some(ids) = self.rel_spatial_by_candidates(filters, &member_tests)? {
+            if let Some(rels) = self.rel_spatial_by_candidates(filters, &member_tests)? {
                 #[cfg(test)]
                 tests::CANDIDATES.set(Some("answered"));
                 let rest: Vec<Filter> = filters.iter().filter(|f| !matches!(f, Filter::Around { .. } | Filter::Poly(_))).cloned().collect();
                 let mut plan = Plan::new(&rest)?;
-                plan.ids = Some(match plan.ids.take() {
-                    Some(prev) => prev.into_iter().filter(|i| ids.binary_search(i).is_ok()).collect(),
-                    None => ids,
-                });
+                plan.given = std::sync::Mutex::new(Some(Set { rels, ..Default::default() }));
                 return Ok(Some(plan));
             }
         }
@@ -693,11 +707,12 @@ impl<'s, W: Write> Engine<'s, W> {
                     let poly = Polygon { pts: pts.clone() };
                     let test = poly.prepare();
                     let rects = poly.bbox().rects();
-                    let nodes = self.f.in_ranges::<Node>(&ranges_for(Kind::Node, &rects), |n| test.contains_member(n.pos))?;
+                    // ids and positions only: the tags are not tested
+                    let nodes = self.f.in_ranges_by::<Node>(&ranges_for(Kind::Node, &rects), |v, p| codec::decode_nodes(v, p, false), |n| test.contains_member(n.pos))?;
                     let grow = |r: &Rect| Rect { y0: r.y0.saturating_sub(1), x0: r.x0.saturating_sub(1), y1: r.y1.saturating_add(1), x1: r.x1.saturating_add(1) };
                     // ways apart from the polygon fail without their vertices
                     let boxes = way_boxes_on();
-                    let mut ways = self.f.in_ranges::<Way>(&ranges_for(Kind::Way, &rects), |w| rects.iter().any(|r| grow(r).intersects(&w.bbox)) && !(boxes && test.rect_pos(&w.bbox) == RectPos::Apart))?;
+                    let mut ways = self.f.in_ranges_by::<Way>(&ranges_for(Kind::Way, &rects), |v, p| codec::decode_ways(v, p, false), |w| rects.iter().any(|r| grow(r).intersects(&w.bbox)) && !(boxes && test.rect_pos(&w.bbox) == RectPos::Apart))?;
                     self.check()?;
                     let pass = poly_member_ways(&self.f, &test, &ways.iter().collect::<Vec<_>>())?;
                     let mut i = 0;
@@ -710,9 +725,11 @@ impl<'s, W: Write> Engine<'s, W> {
                 }
                 _ => unreachable!(),
             }
-            let by_nodes = self.recurse_filter(RecurseFilter::Bn, &members, None, None, None, ElemType::Relation)?;
-            let by_ways = self.recurse_filter(RecurseFilter::Bw, &members, None, None, None, ElemType::Relation)?;
-            let mut v: Vec<Id> = by_nodes.rels.iter().chain(by_ways.rels.iter()).map(|r| r.id).collect();
+            // the relations are decoded once, by the plan below
+            let node_ids: Vec<Id> = members.nodes.iter().map(|n| n.id).collect();
+            let way_ids: Vec<Id> = members.ways.iter().map(|w| w.id).collect();
+            let mut v = self.f.snap.relations_with_members(ElemType::Node, &node_ids)?;
+            v.extend(self.f.snap.relations_with_members(ElemType::Way, &way_ids)?);
             v.sort_unstable();
             v.dedup();
             ids = Some(match ids {
@@ -741,10 +758,20 @@ impl<'s, W: Write> Engine<'s, W> {
     /// region. The index is read for a `key=value` filter or an anchored
     /// regex; without such a filter, or when that scan takes too many
     /// steps, the relations stored in the cells of the region are the
-    /// candidates. The ids of the relations that pass every clause
-    /// (sorted), or None when the candidates or their members would cost
-    /// more than the nodes of the region.
-    fn rel_spatial_by_candidates(&mut self, filters: &[Filter], member_tests: &[(MemberTest, Vec<Rect>)]) -> Result<Option<Vec<Id>>> {
+    /// candidates.
+    ///
+    /// A polygon decides a relation by its box where it can: the box holds
+    /// every member node and the box of every member way, so with the box
+    /// strictly inside a member node or a complete member way
+    /// (`Relation::spatial`) passes, and with the box apart from it none
+    /// does. Only the relations across a border need their members, which
+    /// are looked up by id when they cost less than the nodes of the
+    /// region, else picked out of the nodes and ways of the region (polygons
+    /// only). Of the 2 x 10^4 relations of a polygon over a city centre, 10^3
+    /// cross its border, with 4 x 10^5 members. The relations that pass
+    /// every clause (sorted by id), or None when the candidates or their
+    /// members would cost more than the member path.
+    fn rel_spatial_by_candidates(&mut self, filters: &[Filter], member_tests: &[(MemberTest, Vec<Rect>)]) -> Result<Option<Vec<Relation>>> {
         const MAX_CANDIDATES: usize = 20_000;
         const NODES_PER_CHUNK: usize = 500;
         const MEMBER_COST: usize = 4;
@@ -795,32 +822,50 @@ impl<'s, W: Write> Engine<'s, W> {
                     MemberTest::Poly(_) => meets(b, rs),
                 }
         };
+        // A clause the box of the relation decides: passed or failed.
+        let by_box = |r: &Relation, test: &MemberTest| -> Option<bool> {
+            match test {
+                MemberTest::Poly(p) if rel_boxes_on() && !wide(&r.bbox) => match p.rect_pos(&r.bbox) {
+                    RectPos::Inside => Some(true),
+                    RectPos::Apart => Some(false),
+                    RectPos::Border => None,
+                },
+                _ => None,
+            }
+        };
+        let open = |r: &Relation| member_tests.iter().any(|(test, _)| by_box(r, test).is_none());
         let keep = |r: &Relation| {
             r.spatial
                 && !r.bbox.is_empty()
                 && plan.tags.iter().all(|t| t.matches(&r.tags))
-                && member_tests.iter().all(|(test, rs)| near(&r.bbox, test, rs))
+                && member_tests.iter().all(|(test, rs)| near(&r.bbox, test, rs) && by_box(r, test) != Some(false))
                 && bbox.as_ref().is_none_or(|rs| wide(&r.bbox) || meets(&r.bbox, rs))
         };
         // Up to the estimate the candidates are kept whatever their
-        // members. More are kept while they and their members cost less
-        // than the nodes of the region, a candidate costing as a member
-        // (the buildings or multipolygons of a city: 10^4 relations with a
-        // few ways each); the reading stops once they cost more (the
-        // thousands of routes near a city centre, 10^6 members).
-        let over = |n: usize, members: usize| n > MAX_CANDIDATES || (n > cap && (n + members) * MEMBER_COST > region_nodes);
+        // members. More are kept while they and the members they need cost
+        // less than the nodes of the region, a candidate costing as a
+        // member (the buildings or multipolygons of a city: 10^4 relations
+        // with a few ways each); the reading stops once they cost more (the
+        // thousands of routes near a city centre, 10^6 members). With
+        // polygons only, members past that are picked out of the region,
+        // and the reading stops at twice as many members as the region has
+        // nodes: decoding a member costs a fraction of reading a node.
+        let scan_ok = member_tests.iter().all(|(test, _)| matches!(test, MemberTest::Poly(_)));
+        let over = |n: usize, members: usize| {
+            n > MAX_CANDIDATES || if scan_ok { members > 2 * region_nodes } else { n > cap && (n + members) * MEMBER_COST > region_nodes }
+        };
         let source = match pairs {
             Some(pairs) => Source::At(pairs),
             None => Source::Ranges(&ranges),
         };
         self.check()?;
-        let Some(cands) = self.f.bounded::<Relation>(source, keep, |r| r.members.len(), over)? else {
+        let Some(cands) = self.f.bounded::<Relation>(source, keep, |r| if open(r) { r.members.len() } else { 0 }, over)? else {
             #[cfg(test)]
             tests::CANDIDATES.set(Some("too_many_candidates"));
             return Ok(None);
         };
         let (mut nids, mut wids) = (Vec::new(), Vec::new());
-        for r in &cands {
+        for r in cands.iter().filter(|r| open(r)) {
             for m in &r.members {
                 match m.mtype {
                     ElemType::Node => nids.push(m.id),
@@ -833,16 +878,27 @@ impl<'s, W: Write> Engine<'s, W> {
         nids.dedup();
         wids.sort_unstable();
         wids.dedup();
-        if (nids.len() + wids.len()) * MEMBER_COST > region_nodes {
+        let lookups = (nids.len() + wids.len()) * MEMBER_COST <= region_nodes;
+        #[cfg(test)]
+        let lookups = lookups && !tests::MEMBER_SCAN.get();
+        if !lookups && !scan_ok {
             #[cfg(test)]
             tests::CANDIDATES.set(Some("too_many_members"));
             return Ok(None);
         }
-        let positions = self.f.node_positions(&nids)?;
-        let ways = self.f.ways_untagged(&wids)?;
+        #[cfg(test)]
+        tests::MEMBERS_FROM.set(if nids.is_empty() && wids.is_empty() { None } else if lookups { Some("ids") } else { Some("region") });
+        let (positions, ways) = if lookups && !(nids.is_empty() && wids.is_empty()) { (self.f.node_positions(&nids)?, self.f.ways_untagged(&wids)?) } else { Default::default() };
         self.check()?;
-        let mut ids: Option<Vec<Id>> = None;
+        let mut pass = vec![true; cands.len()];
         for (test, rs) in member_tests {
+            let decided: Vec<Option<bool>> = cands.iter().map(|r| by_box(r, test)).collect();
+            if decided.iter().all(|d| d.is_some()) {
+                for (p, d) in pass.iter_mut().zip(&decided) {
+                    *p &= d.unwrap();
+                }
+                continue;
+            }
             let (pass_nodes, pass_ways): (HashSet<Id>, HashSet<Id>) = match test {
                 MemberTest::Around(src, r) => {
                     let nodes = positions.iter().filter(|(_, p)| around_match(src, &EGeom::Point(**p), *r)).map(|(id, _)| *id).collect();
@@ -850,37 +906,45 @@ impl<'s, W: Write> Engine<'s, W> {
                     let geoms = way_geoms(&self.f, &close)?;
                     (nodes, close.iter().zip(&geoms).filter(|(_, g)| around_match(src, g, *r)).map(|(w, _)| w.id).collect())
                 }
-                MemberTest::Poly(poly) => {
-                    // the nodes and ways the member path reads: nodes in
-                    // the tiles of the rectangles, ways whose box meets them
+                // the nodes and ways the member path reads: nodes in the
+                // tiles of the rectangles, ways whose box meets them
+                MemberTest::Poly(poly) if lookups => {
                     let tiles = ranges_for(Kind::Node, rs);
                     let nodes = positions.iter().filter(|(_, p)| cell_in_ranges(Cell::tile(tile_of(**p)), &tiles) && poly.contains_member(**p)).map(|(id, _)| *id).collect();
                     let close: Vec<&Way> = ways.iter().filter(|w| meets(&w.bbox, rs)).collect();
                     let pass = poly_member_ways(&self.f, poly, &close)?;
                     (nodes, close.iter().zip(pass).filter(|(_, p)| *p).map(|(w, _)| w.id).collect())
                 }
+                MemberTest::Poly(poly) => {
+                    let want_nodes: HashSet<Id> = nids.iter().copied().collect();
+                    let want_ways: HashSet<Id> = wids.iter().copied().collect();
+                    let nodes = self.f.in_ranges_by::<Node>(&ranges_for(Kind::Node, rs), |v, p| codec::decode_nodes(v, p, false), |n| want_nodes.contains(&n.id) && poly.contains_member(n.pos))?;
+                    let close = self.f.in_ranges_by::<Way>(&ranges_for(Kind::Way, rs), |v, p| codec::decode_ways(v, p, false), |w| want_ways.contains(&w.id) && meets(&w.bbox, rs))?;
+                    self.check()?;
+                    let refs: Vec<&Way> = close.iter().collect();
+                    let pass = poly_member_ways(&self.f, poly, &refs)?;
+                    (nodes.iter().map(|n| n.id).collect(), close.iter().zip(pass).filter(|(_, p)| *p).map(|(w, _)| w.id).collect())
+                }
             };
             self.check()?;
-            let v: Vec<Id> = cands
-                .iter()
-                .filter(|rel| {
-                    rel.members.iter().any(|m| match m.mtype {
+            for ((p, rel), d) in pass.iter_mut().zip(&cands).zip(&decided) {
+                *p &= match d {
+                    Some(d) => *d,
+                    None => rel.members.iter().any(|m| match m.mtype {
                         ElemType::Node => pass_nodes.contains(&m.id),
                         ElemType::Way => pass_ways.contains(&m.id),
                         _ => false,
-                    })
-                })
-                .map(|rel| rel.id)
-                .collect();
-            ids = Some(match ids {
-                None => v,
-                Some(prev) => prev.into_iter().filter(|i| v.binary_search(i).is_ok()).collect(),
-            });
+                    }),
+                };
+            }
         }
-        let mut ids = ids.unwrap_or_default();
-        ids.sort_unstable();
-        ids.dedup();
-        Ok(Some(ids))
+        let mut i = 0;
+        let mut cands = cands;
+        cands.retain(|_| {
+            i += 1;
+            pass[i - 1]
+        });
+        Ok(Some(cands))
     }
 
     /// The filter to read the tag index for, when there is a `key=value`
@@ -893,26 +957,113 @@ impl<'s, W: Write> Engine<'s, W> {
     /// 20,000 entries or steps (`tag_count_capped`); on equal counts the
     /// earlier filter wins, a `key=value` filter before a regex.
     pub(super) fn most_selective<'p>(&self, kind: Kind, plan: &'p Plan, ranges: Option<&[CodeRange]>) -> Result<Option<&'p TagFilter>> {
-        const CAP: usize = 20_000;
+        Ok(self.most_selective_counted(kind, plan, ranges)?.map(|(t, _)| t))
+    }
+
+    /// `most_selective` with the count of its filter (`count_cap()` + 1:
+    /// more; 0 when there was nothing to compare).
+    fn most_selective_counted<'p>(&self, kind: Kind, plan: &'p Plan, ranges: Option<&[CodeRange]>) -> Result<Option<(&'p TagFilter, usize)>> {
+        let cap = count_cap();
         let mut eqs = plan.tags.iter().filter(|t| matches!(t, TagFilter::Eq(..)));
         let Some(first) = eqs.next() else { return Ok(None) };
         let rest: Vec<&TagFilter> = eqs.chain(plan.tags.iter().filter(|t| anchored(t))).collect();
         if rest.is_empty() {
-            return Ok(Some(first));
+            return Ok(Some((first, 0)));
         }
-        let mut best = (self.f.tag_count_capped(kind, first, ranges, CAP)?, first);
+        let mut best = (self.f.tag_count_capped(kind, first, ranges, cap)?, first);
         for t in rest {
             if best.0 == 0 {
                 break;
             }
-            let n = self.f.tag_count_capped(kind, t, ranges, best.0.min(CAP))?;
+            let n = self.f.tag_count_capped(kind, t, ranges, best.0.min(cap))?;
             if n < best.0 {
                 best = (n, t);
             }
         }
         #[cfg(test)]
         tests::PROBE.set(Some(format!("{:?}", best.1)));
-        Ok(Some(best.1))
+        Ok(Some((best.1, best.0)))
+    }
+
+    /// Candidates from the tag index when there is a `key=value` filter:
+    /// the entries of the filter `most_selective` chooses, and the filters
+    /// it read for them. Its counts stop at 20,000: when every filter has
+    /// more, they are read in turn with a budget of index steps that grows
+    /// eightfold from 160,000 to 1.3 x 10^6, and the first read to end
+    /// gives the candidates (`way["highway"="residential"]["name"~
+    /// "^Bahnhof"]`: the 4.6 x 10^4 names, not the 7 x 10^7 roads), else the
+    /// filter `most_selective` chose. When those are many (over `NARROW`),
+    /// each other `key=value` filter and anchored regex keeps only the
+    /// candidates it lists too (`tag_intersect`): `way["boundary"=
+    /// "administrative"]["name"~"^Z"]` reads 1.4 x 10^6 boundary ways and
+    /// 3.6 x 10^5 names from the index and decodes the 700 in both. A
+    /// filter is read while it takes at most `STEPS` index steps per
+    /// candidate: decoding a candidate costs more than that.
+    pub(super) fn indexed_candidates<'p>(&self, kind: Kind, plan: &'p Plan, ranges: Option<&[CodeRange]>) -> Result<Option<(Vec<(Cell, Id)>, Vec<&'p TagFilter>)>> {
+        const NARROW: usize = 20_000;
+        const STEPS: usize = 4;
+
+        #[cfg(not(test))]
+        let narrow = NARROW;
+        #[cfg(test)]
+        let narrow = tests::NARROW.get().unwrap_or(NARROW);
+        let Some((probe, count)) = self.most_selective_counted(kind, plan, ranges)? else { return Ok(None) };
+        let indexed: Vec<&TagFilter> = plan.tags.iter().filter(|t| matches!(t, TagFilter::Eq(..)) || anchored(t)).collect();
+        let mut first = None;
+        if count > count_cap() {
+            'budgets: for budget in [8 * count_cap(), 64 * count_cap()] {
+                for &t in std::iter::once(&probe).chain(indexed.iter().filter(|t| !std::ptr::eq(**t, probe))) {
+                    self.check()?;
+                    if let Some(pairs) = self.f.tag_candidates_bounded(kind, t, ranges, budget)? {
+                        first = Some((pairs, t));
+                        break 'budgets;
+                    }
+                }
+            }
+        }
+        let (mut pairs, probe) = match first {
+            Some(f) => f,
+            None => (self.f.tag_candidates(kind, probe, ranges)?, probe),
+        };
+        let mut read = vec![probe];
+        for &t in &indexed {
+            if pairs.len() <= narrow {
+                break;
+            }
+            if std::ptr::eq(t, probe) {
+                continue;
+            }
+            self.check()?;
+            if let Some(both) = self.f.tag_intersect(kind, t, ranges, &pairs, pairs.len().saturating_mul(STEPS))? {
+                pairs = both;
+                read.push(t);
+            }
+        }
+        #[cfg(test)]
+        tests::READ.set(tests::READ.get().max(read.len()));
+        #[cfg(test)]
+        tests::FIRST.set(Some(format!("{probe:?}")));
+        Ok(Some((pairs, read)))
+    }
+
+    /// The elements at candidate pairs from the tag index, which `read`
+    /// selected. The other tag filters of the plan are tested on the tags
+    /// before an element is decoded whole, and a chunk where a value they
+    /// need does not occur is not read further (`value_literals`):
+    /// `area["name"~"x"]["boundary"="administrative"]` decodes the closed
+    /// ways among 1.4 x 10^6 boundary ways only for the few with such a
+    /// name, and reads the tags only in the chunks with the name in them.
+    pub(super) fn at_tagged<T: Stored>(&self, plan: &Plan, pairs: Vec<(Cell, Id)>, read: &[&TagFilter]) -> Result<Vec<T>> {
+        let rest: Vec<&TagFilter> = plan.tags.iter().filter(|t| !read.iter().any(|r| std::ptr::eq(*r, *t))).collect();
+        #[cfg(test)]
+        tests::TESTED_FIRST.set(rest.len());
+        if rest.is_empty() {
+            return self.f.at::<T>(pairs);
+        }
+        let needs = rest.iter().filter_map(|t| t.value_literals()).map(|lits| literal_search(&lits)).collect::<Result<Vec<_>>>()?;
+        let chunk = |data: &[u8]| needs.iter().all(|re| re.is_match(data));
+        let keep = |tags: &Tags| rest.iter().all(|t| t.matches(tags));
+        self.f.at_where::<T>(pairs, Some(TagTest { chunk: &chunk, keep: &keep }))
     }
 
     fn negated_tags_exist(&self, kind: Kind, plan: &Plan) -> Result<bool> {
@@ -920,7 +1071,7 @@ impl<'s, W: Write> Engine<'s, W> {
             let probe = match t {
                 TagFilter::Ne(k, v) => TagFilter::Eq(k.clone(), v.clone()),
                 TagFilter::NotKey(k) => TagFilter::HasKey(k.clone()),
-                TagFilter::Regex { key, re, neg: true, prefixes } => TagFilter::Regex { key: key.clone(), re: re.clone(), neg: false, prefixes: prefixes.clone() },
+                TagFilter::Regex { key, re, neg: true, prefixes, literals } => TagFilter::Regex { key: key.clone(), re: re.clone(), neg: false, prefixes: prefixes.clone(), literals: literals.clone() },
                 _ => continue,
             };
             if self.f.tag_exists(kind, &probe)? {
@@ -933,6 +1084,21 @@ impl<'s, W: Write> Engine<'s, W> {
     pub fn abort(&self, msg: impl Into<String>) -> anyhow::Error {
         Abort(msg.into()).into()
     }
+}
+
+/// Where `most_selective` stops counting the entries of a filter: 20,000.
+fn count_cap() -> usize {
+    #[cfg(test)]
+    if let Some(c) = tests::COUNT_CAP.get() {
+        return c;
+    }
+    20_000
+}
+
+/// A search for any of the byte strings.
+fn literal_search(lits: &[&[u8]]) -> Result<regex::bytes::Regex> {
+    let alts: Vec<String> = lits.iter().map(|l| l.iter().map(|b| format!("\\x{b:02x}")).collect()).collect();
+    Ok(regex::bytes::RegexBuilder::new(&alts.join("|")).unicode(false).build()?)
 }
 
 /// A regex filter with literal prefixes (`^X`): the tag index has its
@@ -987,6 +1153,15 @@ fn poly_member_ways(f: &Fetch, poly: &PolyTest, ways: &[&Way]) -> Result<Vec<boo
 fn way_boxes_on() -> bool {
     #[cfg(test)]
     return !tests::WAY_BOXES_OFF.get();
+    #[cfg(not(test))]
+    true
+}
+
+/// Whether `rel_spatial_by_candidates` decides relations by their box
+/// where it can; off in tests to compare.
+fn rel_boxes_on() -> bool {
+    #[cfg(test)]
+    return !tests::REL_BOXES_OFF.get();
     #[cfg(not(test))]
     true
 }
@@ -1095,12 +1270,35 @@ mod tests {
         pub(super) static PROBE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
         /// Turns off the way box tests of `poly` on relations (`way_boxes_on`).
         pub(super) static WAY_BOXES_OFF: Cell<bool> = const { Cell::new(false) };
+        /// Turns off the relation box tests of `poly` (`rel_boxes_on`).
+        pub(super) static REL_BOXES_OFF: Cell<bool> = const { Cell::new(false) };
+        /// Makes the candidate path pick the members of polygon clauses
+        /// out of the region.
+        pub(super) static MEMBER_SCAN: Cell<bool> = const { Cell::new(false) };
+        /// Where the candidate path took the members it tested: "ids" or
+        /// "region"; None when the boxes decided every relation.
+        pub(super) static MEMBERS_FROM: Cell<Option<&'static str>> = const { Cell::new(None) };
         /// Whether the last element query with a region and without a
         /// `key=value` filter took its candidates from the tag index.
         pub(super) static INDEXED: Cell<bool> = const { Cell::new(false) };
         /// Index steps an anchored regex may take in a small region, in
         /// place of the chunk count of the region.
         pub(super) static INDEX_STEPS: Cell<Option<usize>> = const { Cell::new(None) };
+        /// The most filters that gave the candidates of an element query
+        /// with a `key=value` filter since it was last reset
+        /// (`indexed_candidates`).
+        pub(super) static READ: Cell<usize> = const { Cell::new(0) };
+        /// Candidates over which `indexed_candidates` reads the other
+        /// filters, in place of 20,000.
+        pub(super) static NARROW: Cell<Option<usize>> = const { Cell::new(None) };
+        /// Where `most_selective` stops counting, in place of 20,000.
+        pub(super) static COUNT_CAP: Cell<Option<usize>> = const { Cell::new(None) };
+        /// The filter whose candidates `indexed_candidates` read first,
+        /// last time.
+        pub(super) static FIRST: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+        /// How many tag filters the last decoding of index candidates
+        /// tested before decoding an element whole (`at_tagged`).
+        pub(super) static TESTED_FIRST: Cell<usize> = const { Cell::new(0) };
     }
 
     /// A 30 x 30 grid of nodes 0.002 degrees apart in Paris (node 466 at
@@ -1695,6 +1893,20 @@ mod tests {
             assert_eq!(one, "area\t3600000017\n", "{q}");
             assert!(s.is_some_and(|s| s.starts_with("Regex")), "{q}");
         }
+        // An unanchored regex is tested on the tags of the boundaries
+        // first, the chunks without its value skipped.
+        for (q, n) in [("area[\"boundary\"=\"administrative\"][\"name\"~\"own 7\"];out ids;", 1), ("area[\"name\"~\"Town\"][\"boundary\"=\"administrative\"];out ids;", 40), ("area[\"name\"~\"Zürich\"][\"boundary\"=\"administrative\"];out ids;", 0)] {
+            TESTED_FIRST.set(0);
+            let (out, s) = source(q);
+            assert_eq!((out.lines().count(), s.as_deref()), (n, Some("Eq(\"boundary\", \"administrative\")")), "{q}");
+            assert_eq!(TESTED_FIRST.get(), 1, "{q}");
+        }
+        // NARROW 0: the areas of both filters
+        NARROW.set(Some(0));
+        READ.set(0);
+        let (both, _) = source("area[\"boundary\"=\"administrative\"][\"name\"=\"Town 7\"];out ids;");
+        NARROW.set(None);
+        assert_eq!((both.as_str(), READ.get()), ("area\t3600000017\n", 2));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1728,6 +1940,132 @@ mod tests {
             }
         }
         assert_eq!(output(&db, &format!("{c}node[\"place\"=\"townland\"][\"name\"~\"^Alpha12\"];out ids;")), "node\t200129\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other `key=value` filters and anchored regexes keep the
+    /// candidates they list too, when their index reads take few enough
+    /// steps: the answers of testing the filters on the elements.
+    #[test]
+    fn index_candidates_intersect() {
+        let (db, dir) = tagged_grid("intersect");
+        let c = "[out:csv(::type,::id;false)];";
+        let cases = [
+            ("node", "[\"place\"=\"townland\"]", "[\"name\"~\"^Alpha\"]"),
+            ("node", "[\"place\"=\"town\"]", "[\"name\"~\"^(alpha|Beta)\"]"),
+            ("node", "[\"place\"=\"village\"]", "[\"name\"=\"Alpha9\"]"),
+            ("node", "[\"place\"=\"village\"]", "[\"name\"~\"^Alpha\"][\"place\"=\"village\"]"),
+            ("way", "[\"highway\"=\"primary\"]", "[\"name\"=\"Way 3\"]"),
+            ("way", "[\"highway\"=\"primary\"]", "[\"name\"~\"^Way 1\"]"),
+            ("way", "[\"highway\"=\"service\"]", "[\"name\"=\"Way 3\"]"),
+        ];
+        let mut both = 0;
+        for (t, a, b) in cases {
+            for region in ["", "(48.849,2.349,48.851,2.351)"] {
+                let reference = output(&db, &format!("{c}{t}{a}{region}->.a;{t}.a{b};out ids;"));
+                for q in [format!("{c}{t}{a}{b}{region};out ids;"), format!("{c}{t}{b}{a}{region};out ids;")] {
+                    for narrow in [None, Some(0)] {
+                        NARROW.set(narrow);
+                        READ.set(0);
+                        assert_eq!(output(&db, &q), reference, "{q} {narrow:?}");
+                        if narrow.is_none() {
+                            assert!(READ.get() < 2, "{q}");
+                        }
+                        both += (READ.get() >= 2) as usize;
+                    }
+                    NARROW.set(None);
+                }
+            }
+        }
+        assert!(both >= 10, "{both}");
+        NARROW.set(Some(0));
+        READ.set(0);
+        assert_eq!(output(&db, &format!("{c}way[\"highway\"=\"primary\"][\"name\"=\"Way 3\"];out ids;")), "way\t4003\n");
+        assert_eq!(READ.get(), 2);
+        // 10 townland nodes allow 40 steps: the names of the 100 Alpha
+        // nodes take more, and only the townland nodes are read
+        READ.set(0);
+        assert_eq!(output(&db, &format!("{c}node[\"place\"=\"townland\"][\"name\"~\"^Alpha\"];out ids;")).lines().count(), 10);
+        assert_eq!(READ.get(), 1);
+        NARROW.set(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Filters with more entries than `most_selective` counts: the first
+    /// whose index read ends within the budget gives the candidates, here
+    /// a regex over 30 nodes of one tile before a `key=value` filter over
+    /// 300 tiles.
+    #[test]
+    fn index_candidates_from_the_first_read_to_end() {
+        let m = "{m}";
+        let mut nodes = String::new();
+        for k in 0..300 {
+            let rare = if k < 30 { format!("<tag k=\"name\" v=\"Rare {k}\"/>") } else { String::new() };
+            nodes += &format!("<node id=\"{}\" lat=\"{:.4}\" lon=\"{:.4}\" {m}><tag k=\"kind\" v=\"common\"/>{rare}</node>\n", 300_000 + k, 10.0 + (k / 20) as f64 * 0.01, 10.0 + (k % 20) as f64 * 0.01);
+        }
+        for k in 0..30 {
+            nodes += &format!("<node id=\"{}\" lat=\"20.0001\" lon=\"{:.5}\" {m}><tag k=\"kind\" v=\"common\"/><tag k=\"name\" v=\"Rare tile {k}\"/></node>\n", 310_000 + k, 20.0 + k as f64 * 0.00001);
+        }
+        let (db, dir) = osm_db("first-read", &grid_osm_with(&nodes, "", ""));
+        let c = "[out:csv(::type,::id;false)];";
+        // counting stops at 10: both filters have more entries. The
+        // budgets are 80 and 640 steps: `^Rare tile` takes 60 (30 values,
+        // one cell each), the key=value filter 301 (its cells), `^Rare` 120.
+        COUNT_CAP.set(Some(10));
+        for (re, n, first) in [("^Rare tile", 30, "Regex"), ("^Rare", 60, "Eq")] {
+            let reference = output(&db, &format!("{c}node[\"kind\"=\"common\"]->.a;node.a[\"name\"~\"{re}\"];out ids;"));
+            assert_eq!(reference.lines().count(), n);
+            for q in [format!("node[\"kind\"=\"common\"][\"name\"~\"{re}\"]"), format!("node[\"name\"~\"{re}\"][\"kind\"=\"common\"]")] {
+                FIRST.set(None);
+                assert_eq!(output(&db, &format!("{c}{q};out ids;")), reference, "{q}");
+                assert!(FIRST.take().is_some_and(|f| f.starts_with(first)), "{q}");
+            }
+        }
+        COUNT_CAP.set(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Candidates from the tag index with further tag filters: the
+    /// elements that pass all of them, whether or not the chunks hold the
+    /// values these need (`at_tagged`).
+    #[test]
+    fn index_candidates_tested_on_their_tags_first() {
+        let (db, dir) = tagged_grid("tags-first");
+        let c = "[out:csv(::type,::id;false)];";
+        let cases = [
+            ("node", "[\"place\"=\"town\"]", "[\"name\"~\"lpha\"]"),
+            ("node", "[\"place\"=\"town\"]", "[\"name\"~\"Zürich\"]"),
+            ("node", "[\"place\"=\"village\"]", "[\"name\"~\"(alpha|Beta)\"]"),
+            ("node", "[\"place\"]", "[\"name\"~\"AMMA1\",i]"),
+            ("node", "[\"place\"]", "[\"name\"!~\"^Alpha\"]"),
+            ("node", "[\"name\"~\"^Alpha\"]", "[!\"place\"]"),
+            ("node", "[\"name\"~\"^Alpha\"]", "[\"place\"!=\"town\"]"),
+            ("node", "[\"note\"~\"^far away\"]", "[\"note\"~\"number 1999\"]"),
+            ("node", "[\"note\"~\"^far away\"]", "[\"note\"~\".*1999$\"]"),
+            ("way", "[\"highway\"=\"secondary\"]", "[\"name\"~\"y 1\"]"),
+            ("way", "[\"highway\"]", "[\"name\"~\"Way\"][\"highway\"!=\"service\"]"),
+            ("way", "[\"highway\"=\"primary\"]", "[~\"^na\"~\"^Way\"]"),
+            ("way", "[\"highway\"=\"primary\"]", "[\"name\"]"),
+        ];
+        for (t, a, b) in cases {
+            for region in ["", "(48.849,2.349,48.851,2.351)", "(48.0,2.0,49.0,3.0)"] {
+                let reference = output(&db, &format!("{c}{t}{a}{region}->.a;{t}.a{b};out ids;"));
+                let q = format!("{c}{t}{a}{b}{region};out ids;");
+                TESTED_FIRST.set(0);
+                assert_eq!(output(&db, &q), reference, "{q}");
+                // in the small region a key filter alone has the region decoded
+                assert!(TESTED_FIRST.get() > 0 || !region.is_empty(), "{q}");
+            }
+        }
+        // place=town: the 10 nodes named Gamma7, Gamma47, ..., Gamma367;
+        // village: alpha9, alpha49, ...; townland: Alpha8, Alpha48, ...
+        let count = |q: &str| output(&db, &format!("{c}{q};out ids;")).lines().count();
+        assert_eq!(count("node[\"place\"=\"town\"][\"name\"~\"lpha\"]"), 0);
+        assert_eq!(count("node[\"place\"=\"village\"][\"name\"~\"(alpha|Beta)\"]"), 10);
+        assert_eq!(count("node[\"place\"][\"name\"~\"AMMA1\",i]"), 2);
+        assert_eq!(count("node[\"note\"~\"^far away\"][\"note\"~\".*1999$\"]"), 2);
+        assert_eq!(count("way[\"highway\"=\"secondary\"][\"name\"~\"y 1\"]"), 5);
+        assert_eq!(output(&db, &format!("{c}node[\"note\"~\"^far away\"][\"note\"~\"number 1999$\"];out ids;")), "node\t301999\n");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1836,6 +2174,22 @@ mod tests {
                 assert_eq!(with, without, "{q}");
             }
         }
+        // Nor do the relation box tests, or members picked out of the
+        // region in place of lookups by id.
+        for poly in polys {
+            for filters in ["relation", "relation[\"route\"]", "relation[\"building\"]", "relation[\"route\"](around:300,48.85,2.35)"] {
+                let q = format!("{c}{filters}(poly:\"{poly}\");out ids;");
+                let plain = both_ways(&db, &q).0;
+                for (boxes_off, scan) in [(true, false), (false, true), (true, true)] {
+                    REL_BOXES_OFF.set(boxes_off);
+                    MEMBER_SCAN.set(scan);
+                    let (out, _) = both_ways(&db, &q);
+                    REL_BOXES_OFF.set(false);
+                    MEMBER_SCAN.set(false);
+                    assert_eq!(out, plain, "{q} {boxes_off} {scan}");
+                }
+            }
+        }
         let ids = |q: &str| both_ways(&db, &format!("{c}{q}")).0;
         assert_eq!(ids(&format!("relation[building](poly:\"{}\");out ids;", polys[1])), ["6", "8", "10"]);
         assert_eq!(ids(&format!("relation[building](poly:\"{}\");out ids;", polys[2])), ["6"]);
@@ -1861,11 +2215,14 @@ mod tests {
         let c = "[out:csv(::id;false)];";
         // the whole dense centre; a border through the 8th of 15 rows of
         // buildings (48.84555 to 48.84565)
-        for (poly, n) in [("48.840 2.340 48.840 2.360 48.860 2.360 48.860 2.340", 300), ("48.840 2.340 48.8456 2.340 48.8456 2.360 48.840 2.360", 160)] {
+        // the boxes decide all relations of the first polygon, those of
+        // the 8th row need their members
+        for (poly, n, members) in [("48.840 2.340 48.840 2.360 48.860 2.360 48.860 2.340", 300, None), ("48.840 2.340 48.8456 2.340 48.8456 2.360 48.840 2.360", 160, Some("ids"))] {
             for (f, what, from) in [("relation[\"building\"]", "answered", "cells"), ("relation[\"type\"=\"multipolygon\"]", "answered", "tags"), ("relation", "answered", "cells")] {
                 let q = format!("{c}{f}(poly:\"{poly}\");out ids;");
+                MEMBERS_FROM.set(None);
                 let (out, did) = both_ways(&db, &q);
-                assert_eq!((did, CANDIDATES_FROM.get()), (Some(what), Some(from)), "{q}");
+                assert_eq!((did, CANDIDATES_FROM.get(), MEMBERS_FROM.get()), (Some(what), Some(from), members), "{q}");
                 assert_eq!(out.len(), n, "{q}");
                 WAY_BOXES_OFF.set(true);
                 let (without, _) = both_ways(&db, &q);

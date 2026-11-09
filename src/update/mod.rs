@@ -50,10 +50,13 @@ pub trait Stored: Chunked + crate::exec::fetch::MemSize {
     fn id(&self) -> Id;
     fn cell(&self) -> Cell;
     fn tags(&self) -> &Tags;
+    /// `decode` of the elements that pass `test`; the others need not be
+    /// decoded whole (see `codec::TagTest`).
+    fn decode_where(value: &[u8], pick: Pick, test: codec::TagTest) -> Result<Vec<Self>>;
 }
 
 macro_rules! stored {
-    ($t:ty, $kind:expr, $enc:expr, $dec:expr) => {
+    ($t:ty, $kind:expr, $enc:expr, $dec:expr, $dec_where:expr) => {
         impl Chunked for $t {
             fn key(&self) -> (Cell, Id) {
                 (<$t>::cell(self), self.id)
@@ -76,14 +79,17 @@ macro_rules! stored {
             fn tags(&self) -> &Tags {
                 &self.tags
             }
+            fn decode_where(value: &[u8], pick: Pick, test: codec::TagTest) -> Result<Vec<Self>> {
+                $dec_where(value, pick, test)
+            }
         }
     };
 }
 
-stored!(Node, Kind::Node, codec::encode_nodes, |v, p| codec::decode_nodes(v, p, true));
-stored!(Way, Kind::Way, codec::encode_ways, |v, p| codec::decode_ways(v, p, true));
-stored!(Relation, Kind::Relation, codec::encode_relations, |v, p| codec::decode_relations(v, p, true));
-stored!(Area, Kind::Area, codec::encode_areas, codec::decode_areas);
+stored!(Node, Kind::Node, codec::encode_nodes, |v, p| codec::decode_nodes(v, p, true), codec::decode_nodes_where);
+stored!(Way, Kind::Way, codec::encode_ways, |v, p| codec::decode_ways(v, p, true), codec::decode_ways_where);
+stored!(Relation, Kind::Relation, codec::encode_relations, |v, p| codec::decode_relations(v, p, true), codec::decode_relations_where);
+stored!(Area, Kind::Area, codec::encode_areas, codec::decode_areas, codec::decode_areas_where);
 
 impl Chunked for MetaRec {
     fn key(&self) -> (Cell, Id) {

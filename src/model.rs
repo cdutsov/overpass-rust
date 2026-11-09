@@ -98,6 +98,12 @@ impl Tags {
         self.ends.len()
     }
 
+    /// Remove all tags, keeping the memory.
+    pub fn clear(&mut self) {
+        self.data.clear();
+        self.ends.clear();
+    }
+
     pub fn is_empty(&self) -> bool {
         self.ends.is_empty()
     }

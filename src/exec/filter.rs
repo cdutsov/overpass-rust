@@ -137,6 +137,28 @@ pub fn anchored_prefixes(re: &str, ci: bool) -> Option<Vec<Vec<u8>>> {
     Some(out)
 }
 
+/// Byte strings one of which every value matched by `re` (a translated
+/// pattern, see `compile_regex`) contains: the literals every match starts
+/// or ends with, e.g. `Zürich` for `Zürich` or `(Bahnhof|Station)`. None
+/// when there are more than 16 or one is shorter than 3 bytes, which
+/// would not tell much.
+pub fn required_literals(re: &str, ci: bool) -> Option<Vec<Vec<u8>>> {
+    use regex_syntax::hir::literal::{ExtractKind, Extractor};
+    let hir = regex_syntax::ParserBuilder::new().case_insensitive(ci).dot_matches_new_line(true).build().parse(re).ok()?;
+    for kind in [ExtractKind::Prefix, ExtractKind::Suffix] {
+        let seq = Extractor::new().kind(kind).extract(&hir);
+        if let Some(lits) = seq.literals() {
+            if !lits.is_empty() && lits.len() <= 16 && lits.iter().all(|l| l.as_bytes().len() >= 3) {
+                let mut out: Vec<Vec<u8>> = lits.iter().map(|l| l.as_bytes().to_vec()).collect();
+                out.sort();
+                out.dedup();
+                return Some(out);
+            }
+        }
+    }
+    None
+}
+
 /// A tag filter ready to match.
 #[derive(Clone, Debug)]
 pub enum TagFilter {
@@ -144,8 +166,9 @@ pub enum TagFilter {
     NotKey(String),
     Eq(String, String),
     Ne(String, String),
-    /// `prefixes`: see `anchored_prefixes` (for the tag index).
-    Regex { key: String, re: Regex, neg: bool, prefixes: Option<Vec<Vec<u8>>> },
+    /// `prefixes`: see `anchored_prefixes` (for the tag index);
+    /// `literals`: see `required_literals`.
+    Regex { key: String, re: Regex, neg: bool, prefixes: Option<Vec<Vec<u8>>>, literals: Option<Vec<Vec<u8>>> },
     KeyRegex { key: Regex, value: Regex, value_prefixes: Option<Vec<Vec<u8>>> },
 }
 
@@ -163,7 +186,8 @@ impl TagFilter {
             Filter::Regex { key, re, ci, neg } => {
                 let re = compile_regex(re, *ci)?;
                 let prefixes = anchored_prefixes(re.as_str(), *ci);
-                TagFilter::Regex { key: key.clone(), re, neg: *neg, prefixes }
+                let literals = required_literals(re.as_str(), *ci);
+                TagFilter::Regex { key: key.clone(), re, neg: *neg, prefixes, literals }
             }
             Filter::KeyRegex { key, value, ci } => {
                 let value = compile_regex(value, *ci)?;
@@ -185,6 +209,16 @@ impl TagFilter {
                 m != *neg
             }
             TagFilter::KeyRegex { key, value, .. } => tags.iter().any(|(k, v)| key.is_match(k) && value.is_match(v)),
+        }
+    }
+
+    /// Byte strings one of which the value of every element that passes
+    /// the filter contains (at least 3 bytes each), or None.
+    pub fn value_literals(&self) -> Option<Vec<&[u8]>> {
+        match self {
+            TagFilter::Eq(_, v) if v.len() >= 3 => Some(vec![v.as_bytes()]),
+            TagFilter::Regex { neg: false, literals: Some(l), .. } => Some(l.iter().map(|l| l.as_slice()).collect()),
+            _ => None,
         }
     }
 

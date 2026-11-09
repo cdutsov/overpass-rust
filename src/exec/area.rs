@@ -257,11 +257,15 @@ impl<'s, W: Write> Engine<'s, W> {
             self.f.by_ids::<Area>(&ids)?
         } else if let Some(first) = plan.inputs.first() {
             self.get(first).areas.clone()
-        } else if let Some(t) = self.most_selective(Kind::Area, plan, None)?.or_else(|| plan.tags.iter().find(|t| super::query::anchored(t))).or_else(|| plan.tags.iter().find(|t| t.is_positive())) {
+        } else if let Some((pairs, read)) = self.indexed_candidates(Kind::Area, plan, None)? {
+            #[cfg(test)]
+            AREA_SOURCE.set(Some(read[0].clone()));
+            self.at_tagged::<Area>(plan, pairs, &read)?
+        } else if let Some(t) = plan.tags.iter().find(|t| super::query::anchored(t)).or_else(|| plan.tags.iter().find(|t| t.is_positive())) {
             #[cfg(test)]
             AREA_SOURCE.set(Some(t.clone()));
             let pairs = self.f.tag_candidates(Kind::Area, t, None)?;
-            self.f.at::<Area>(pairs)?
+            self.at_tagged::<Area>(plan, pairs, &[t])?
         } else {
             self.f.all::<Area>(|_| true)?
         };
