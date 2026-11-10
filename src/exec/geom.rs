@@ -1,11 +1,18 @@
 //! Element geometry: resolving coordinates and spatial predicates.
 
 use super::fetch::Fetch;
-use crate::geo::{BBox, Pt, Segment};
+use crate::geo::{BBox, Cell, Pt, Rect, Segment};
+use crate::store::Kind;
 use crate::model::*;
 use anyhow::Result;
 use std::borrow::Borrow;
 use rustc_hash::FxHashMap as HashMap;
+
+#[cfg(test)]
+thread_local! {
+    /// Member ways the last `rel_geoms_near` decoded.
+    pub(super) static NEAR_WAYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 /// Resolved geometry of an element for spatial tests.
 #[derive(Clone, Debug)]
@@ -113,22 +120,33 @@ pub fn rel_geoms<R: Borrow<Relation>>(f: &Fetch, rels: &[R]) -> Result<Vec<EGeom
 }
 
 /// Relation geometry for spatial tests that pass when one member passes
-/// (bbox, around): way members whose stored box `near` rejects pass none of
-/// them and are left out without loading their nodes, as are ways with a
-/// missing node or without nodes, which never pass. Long routes and large
-/// boundaries near a small region need only a few of their ways.
-pub fn rel_geoms_near<R: Borrow<Relation>>(f: &Fetch, rels: &[R], near: impl Fn(&crate::geo::Rect) -> bool) -> Result<Vec<EGeom>> {
-    let mut way_ids = Vec::new();
-    for r in rels {
-        way_ids.extend(r.borrow().members.iter().filter(|m| m.mtype == ElemType::Way).map(|m| m.id));
-    }
-    way_ids.sort_unstable();
-    way_ids.dedup();
-    let mut ways = f.ways_untagged(&way_ids)?;
+/// (bbox, around, poly): way members whose stored box `near` rejects pass
+/// none of them and are left out without loading their nodes, as are ways
+/// with a missing node or without nodes, which never pass. Members stored
+/// in a cell whose rectangle (`Cell::loose_rect`, which holds the box of
+/// every element of the cell) `near_cell` rejects are not read: it accepts
+/// every rectangle that holds a box `near` accepts or a point that may
+/// pass. The cells come from the id index. Long routes and large
+/// boundaries near a small region need only a few of their members.
+pub fn rel_geoms_near<R: Borrow<Relation>>(f: &Fetch, rels: &[R], near: impl Fn(&Rect) -> bool, near_cell: impl Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
+    let members = |t: ElemType| -> Vec<Id> {
+        let mut v: Vec<Id> = rels.iter().flat_map(|r| r.borrow().members.iter().filter(|m| m.mtype == t).map(|m| m.id)).collect();
+        v.sort_unstable();
+        v.dedup();
+        v
+    };
+    // the test of each cell once
+    let mut tested: HashMap<Cell, bool> = HashMap::default();
+    let mut stored_near = |kind: Kind, ids: &[Id]| -> Result<Vec<(Cell, Id)>> {
+        Ok(f.snap.cells_of(kind, ids)?.into_iter().filter(|(_, c)| *tested.entry(*c).or_insert_with(|| near_cell(&c.loose_rect()))).map(|(id, c)| (c, id)).collect())
+    };
+    let mut ways = f.ways_untagged_at(stored_near(Kind::Way, &members(ElemType::Way))?)?;
+    #[cfg(test)]
+    NEAR_WAYS_READ.set(ways.len());
     // boxes wider than half the world may cross the antimeridian: kept
     ways.retain(|w| !w.missing && !w.bbox.is_empty() && (w.bbox.x1 - w.bbox.x0 > 0x8000_0000 || near(&w.bbox)));
     let wv = way_vertices(f, &ways)?;
-    let node_ids: Vec<Id> = rels.iter().flat_map(|r| r.borrow().members.iter().filter(|m| m.mtype == ElemType::Node).map(|m| m.id)).collect();
+    let node_ids: Vec<Id> = stored_near(Kind::Node, &members(ElemType::Node))?.into_iter().map(|(_, id)| id).collect();
     let npos = f.node_positions(&node_ids)?;
     Ok(rels
         .iter()

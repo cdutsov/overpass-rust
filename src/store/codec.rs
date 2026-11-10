@@ -1157,6 +1157,54 @@ pub fn encode_id_bucket(entries: &[(u16, Cell)]) -> Vec<u8> {
     w.buf
 }
 
+/// The cells of some entries of an id bucket: `wanted` holds low bits in
+/// ascending order, and `found` gets the place in `wanted` and the cell of
+/// each one the bucket holds. The same cells as `decode_id_bucket`, with
+/// the tile coordinates kept apart between the entries and put together
+/// only for those found, and the reading stopped after the last one
+/// wanted: a lookup of the members of long routes wants about three ids of
+/// a bucket of 512.
+pub fn pick_id_bucket(value: &[u8], wanted: &[u16], mut found: impl FnMut(usize, Cell)) -> Result<()> {
+    let mut r = Reader::new(value);
+    let unzz = |z: u32| ((z >> 1) as i64) ^ -((z & 1) as i64);
+    // from the cell the entries start at, as in `decode_id_bucket`
+    let start = Cell::tile(0);
+    let (mut plo, mut level) = (0u64, start.level);
+    let (y0, x0) = unmorton(start.code);
+    let (mut y, mut x) = (y0 as i64, x0 as i64);
+    let mut j = 0;
+    while j < wanted.len() && !r.at_end() {
+        let h = r.varint()?;
+        plo += h >> 2;
+        match h & 3 {
+            0 => {}
+            t @ (1 | 2) => {
+                if t == 2 {
+                    level = r.byte()?;
+                }
+                let step = r.varint()?;
+                y += unzz(compact32(step >> 1));
+                x += unzz(compact32(step));
+                if !(0..=0xffff).contains(&y) || !(0..=0xffff).contains(&x) {
+                    bail!("corrupt cell step");
+                }
+            }
+            _ => bail!("corrupt id bucket"),
+        }
+        if plo >= 1 << ID_BUCKET_BITS {
+            bail!("corrupt id bucket");
+        }
+        while j < wanted.len() && (wanted[j] as u64) < plo {
+            j += 1;
+        }
+        if j < wanted.len() && wanted[j] as u64 == plo {
+            found(j, Cell { level, code: morton(y as u32, x as u32) });
+            j += 1;
+        }
+    }
+    Ok(())
+}
+
 pub fn decode_id_bucket(value: &[u8]) -> Result<Vec<(u16, Cell)>> {
     let mut r = Reader::new(value);
     let mut out = Vec::with_capacity(value.len());
@@ -1355,6 +1403,41 @@ mod tests {
         assert_eq!(decode_tag_entry(Cell::tile(8), &encode_tag_entry(Cell::tile(8), &g)).unwrap(), g);
         let mb = vec![(0u8, 9u64), (0, 12), (200, 3)];
         assert_eq!(decode_member_bucket(&encode_member_bucket(&mb)).unwrap(), mb);
+    }
+
+    /// `pick_id_bucket` finds the cells `decode_id_bucket` gives, for any
+    /// wanted entries: buckets of cells at random levels and steps, with
+    /// runs of one cell, and wanted low bits present, absent and past the
+    /// last entry.
+    #[test]
+    fn pick_id_bucket_matches_decode() {
+        let mut r = Rnd(0x2545_f491_4f6c_dd1d);
+        for _ in 0..2000 {
+            let mut entries: Vec<(u16, Cell)> = Vec::new();
+            let mut lo = r.n(4) as u16;
+            let mut cell = Cell::tile(r.n(1 << 32) as u32);
+            while lo < 512 {
+                if r.n(3) > 0 {
+                    let level = if r.n(4) == 0 || cell.level > 16 { r.n(17) as u8 } else { cell.level };
+                    let code = if level == 0 { 0 } else { ((r.n(1 << 32) as u32) >> (32 - 2 * level as u32)) << (32 - 2 * level as u32) };
+                    cell = if r.n(50) == 0 { Cell::NONE } else { Cell { level, code } };
+                }
+                entries.push((lo, cell));
+                let gap = if r.n(2) == 0 { 2 } else { 40 };
+                lo += 1 + r.n(gap) as u16;
+            }
+            let enc = encode_id_bucket(&entries);
+            let all = decode_id_bucket(&enc).unwrap();
+            assert_eq!(all, entries);
+            let k = r.n(12);
+            let mut wanted: Vec<u16> = (0..k).map(|_| r.n(520) as u16).collect();
+            wanted.sort_unstable();
+            wanted.dedup();
+            let mut got = Vec::new();
+            pick_id_bucket(&enc, &wanted, |j, c| got.push((wanted[j], c))).unwrap();
+            let expect: Vec<(u16, Cell)> = wanted.iter().filter_map(|w| all.binary_search_by_key(w, |e| e.0).ok().map(|p| (*w, all[p].1))).collect();
+            assert_eq!(got, expect);
+        }
     }
 
     /// xorshift numbers.

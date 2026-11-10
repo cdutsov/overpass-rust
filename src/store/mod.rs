@@ -416,19 +416,17 @@ fn chunks_for_pairs<'t>(db: Database<Bytes, Bytes>, txn: &'t RoTxn, pairs: &[(Ce
 /// (id, cell) of the ids found in the id index (ids sorted and unique).
 fn lookup_cells(db: Database<Bytes, Bytes>, txn: &RoTxn, sorted: &[Id]) -> Result<Vec<(Id, Cell)>> {
     let mut out = Vec::with_capacity(sorted.len());
+    let mut wanted = Vec::new();
     let mut i = 0;
     while i < sorted.len() {
-        let bucket = sorted[i] >> codec::ID_BUCKET_BITS;
-        let entries = match db.get(txn, &bucket.to_be_bytes())? {
-            Some(v) => codec::decode_id_bucket(v)?,
-            None => Vec::new(),
-        };
+        let (start, bucket) = (i, sorted[i] >> codec::ID_BUCKET_BITS);
+        wanted.clear();
         while i < sorted.len() && sorted[i] >> codec::ID_BUCKET_BITS == bucket {
-            let lo = (sorted[i] & ((1 << codec::ID_BUCKET_BITS) - 1)) as u16;
-            if let Ok(p) = entries.binary_search_by_key(&lo, |e| e.0) {
-                out.push((sorted[i], entries[p].1));
-            }
+            wanted.push((sorted[i] & ((1 << codec::ID_BUCKET_BITS) - 1)) as u16);
             i += 1;
+        }
+        if let Some(v) = db.get(txn, &bucket.to_be_bytes())? {
+            codec::pick_id_bucket(v, &wanted, |j, c| out.push((sorted[start + j], c)))?;
         }
     }
     Ok(out)

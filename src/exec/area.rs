@@ -6,11 +6,12 @@ use super::areageom::{self, Block, HIT, IC, INTERSECT, RelPos, TOGGLE_EAST, TOGG
 use super::eval::{Cx, El, Evaluator};
 use super::query::Plan;
 use super::set::{Set, sort_dedup};
-use crate::geo::{MAX_LEVEL, Pt, Rect, ilat, ilon, level_ranges};
+use super::fetch::ranges_for;
+use crate::geo::{Cell, CodeRange, MAX_LEVEL, Pt, Rect, cell_in_ranges, ilat, ilon, level_ranges, merge_ranges};
 use crate::model::*;
 use crate::store::Kind;
 use anyhow::Result;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashSet;
 use std::collections::BTreeMap;
 use std::io::Write;
 
@@ -19,6 +20,10 @@ thread_local! {
     /// The tag filter whose index entries gave the candidates of the last
     /// `area` query.
     pub(super) static AREA_SOURCE: std::cell::Cell<Option<super::filter::TagFilter>> = const { std::cell::Cell::new(None) };
+    /// Makes the relation test read every member, wherever it is stored.
+    pub(super) static MEMBERS_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Member ways the last relation test decoded.
+    pub(super) static MEMBER_WAYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Polygons of one `(area)` clause.
@@ -27,6 +32,8 @@ pub struct AreaCtx {
     tiles: BTreeMap<u32, Vec<(u32, Vec<Block>)>>,
     /// Closed ways of the input set.
     implicit: Tilewise,
+    /// Rectangles around the closed ways of the input set (`bulge_rect`).
+    implicit_rects: Vec<Rect>,
     /// Bounding rectangles for candidate selection.
     pub rects: Vec<Rect>,
 }
@@ -53,6 +60,23 @@ fn bulge_rect(g: &[IC]) -> Rect {
     r
 }
 
+/// Bound on how far, in units of 10^-7 degrees, a great-circle edge whose
+/// ends lie at most `width` units apart in longitude reaches north or south
+/// of its ends (the way test of implicit areas follows such edges). From
+/// 180 degrees on, the edge may pass a pole or cross the antimeridian, and
+/// the bound is the whole range.
+fn arc_bulge(width: u64) -> u32 {
+    if width >= 1_800_000_000 {
+        return u32::MAX;
+    }
+    // Between ends at latitudes up to p, tan(lat) <= tan(p) / cos(width / 2)
+    // = tan(p) / c; atan(tan(p) / c) - p is largest at tan(p) = sqrt(c).
+    let c = (width as f64 / 2e7).to_radians().cos().sqrt();
+    let d = ((1.0 / c).atan() - c.atan()).to_degrees();
+    // plus 10^-4 degrees for rounding, as in `bulge_rect`
+    (d * 1e7).ceil() as u32 + 1_000
+}
+
 fn tile_rect(tile: u32) -> Rect {
     let (s, w) = areageom::tile_sw(tile);
     let p = Pt::from_ilat_ilon(s, w);
@@ -60,6 +84,29 @@ fn tile_rect(tile: u32) -> Rect {
 }
 
 impl AreaCtx {
+    /// Cell ranges of the ways that may pass the way test (`db_way` or that
+    /// of the implicit areas). A way is stored in the cell of the corner of
+    /// its box at the level where the box is at most one cell wide and
+    /// high, and the box lies within that cell and its neighbours to the
+    /// north and east (`Cell::loose_rect`). Against DB areas the edges are
+    /// straight lines between the nodes, inside the box; a way wider than
+    /// 180 degrees may cross the antimeridian, and it is stored at level 0
+    /// or 1, in a cell these ranges always hold. Against implicit areas the
+    /// edges are great-circle arcs, which may pass north or south of the
+    /// box: at each level the rectangles of the implicit areas are grown by
+    /// the bulge of an arc one cell wide (`arc_bulge`).
+    fn way_ranges(&self) -> Vec<CodeRange> {
+        let tiles: Vec<Rect> = self.tiles.keys().map(|t| tile_rect(*t)).collect();
+        let mut out = ranges_for(Kind::Way, &tiles);
+        for level in 0..=MAX_LEVEL {
+            let m = arc_bulge(1u64 << (32 - level as u32));
+            for r in &self.implicit_rects {
+                out.extend(level_ranges(level, &Rect { y0: r.y0.saturating_sub(m), y1: r.y1.saturating_add(m), ..*r }, true));
+            }
+        }
+        merge_ranges(out)
+    }
+
     /// Point test against the DB areas (`add_border`: the border counts).
     fn db_point(&self, p: IC, add_border: bool) -> bool {
         let Some(areas) = self.tiles.get(&areageom::block_tile(p.0, p.1)) else { return false };
@@ -182,9 +229,9 @@ impl<'s, W: Write> Engine<'s, W> {
             }
         }
         let ways: Vec<&Way> = input.ways.iter().filter(|w| is_closed(w)).collect();
-        let (implicit, way_rects) = self.tilewise_of(&ways)?;
-        rects.extend(way_rects);
-        Ok(AreaCtx { tiles, implicit, rects })
+        let (implicit, implicit_rects) = self.tilewise_of(&ways)?;
+        rects.extend(implicit_rects.iter().copied());
+        Ok(AreaCtx { tiles, implicit, implicit_rects, rects })
     }
 
     pub fn area_keep_nodes(&self, ctx: &AreaCtx, nodes: &[&Node]) -> Result<Vec<bool>> {
@@ -223,28 +270,47 @@ impl<'s, W: Write> Engine<'s, W> {
         Ok(out)
     }
 
+    /// Relation test: a member node or a member way passes (the member
+    /// variants of the node and way tests). Only the members stored in
+    /// cells that may reach an area are read (the cells come from the id
+    /// index): a route or boundary across a city has most of its members
+    /// elsewhere. The ways of the relations a member node decides are not
+    /// read.
     pub fn area_keep_rels(&self, ctx: &AreaCtx, rels: &[&Relation]) -> Result<Vec<bool>> {
-        let nids: Vec<Id> = rels.iter().flat_map(|r| r.members.iter()).filter(|m| m.mtype == ElemType::Node).map(|m| m.id).collect();
-        let wids: Vec<Id> = rels.iter().flat_map(|r| r.members.iter()).filter(|m| m.mtype == ElemType::Way).map(|m| m.id).collect();
-        let npos = self.f.node_positions(&nids)?;
-        let ways = self.f.by_ids::<Way>(&wids)?;
-        let wrefs: Vec<&Way> = ways.iter().collect();
-        let wok: FxHashMap<Id, bool> = ways.iter().map(|w| w.id).zip(self.area_keep_ways(ctx, &wrefs)?).collect();
-        let mut nok: FxHashMap<Id, bool> = FxHashMap::default();
-        for (id, p) in &npos {
-            let q = ic(*p);
-            nok.insert(*id, ctx.implicit.point(q.0, q.1, false) == RelPos::Inside || ctx.db_point(q, false));
-        }
-        Ok(rels
-            .iter()
-            .map(|r| {
-                r.members.iter().any(|m| match m.mtype {
-                    ElemType::Node => nok.get(&m.id).copied().unwrap_or(false),
-                    ElemType::Way => wok.get(&m.id).copied().unwrap_or(false),
-                    _ => false,
-                })
+        let members = |t: ElemType, rels: &[&Relation]| -> Vec<Id> {
+            let mut v: Vec<Id> = rels.iter().flat_map(|r| r.members.iter()).filter(|m| m.mtype == t).map(|m| m.id).collect();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        #[cfg(not(test))]
+        let keep = |c: Cell, ranges: &[CodeRange]| cell_in_ranges(c, ranges);
+        #[cfg(test)]
+        let keep = |c: Cell, ranges: &[CodeRange]| MEMBERS_ALL.get() || cell_in_ranges(c, ranges);
+        let near = |kind: Kind, ids: &[Id], ranges: &[CodeRange]| -> Result<Vec<(Cell, Id)>> {
+            Ok(self.f.snap.cells_of(kind, ids)?.into_iter().filter(|(_, c)| keep(*c, ranges)).map(|(id, c)| (c, id)).collect())
+        };
+        // A node passes only inside the rectangles of the areas.
+        let nids: Vec<Id> = near(Kind::Node, &members(ElemType::Node, rels), &ranges_for(Kind::Node, &ctx.rects))?.into_iter().map(|(_, id)| id).collect();
+        let nok: FxHashSet<Id> = self
+            .f
+            .node_positions(&nids)?
+            .into_iter()
+            .filter(|(_, p)| {
+                let q = ic(*p);
+                ctx.implicit.point(q.0, q.1, false) == RelPos::Inside || ctx.db_point(q, false)
             })
-            .collect())
+            .map(|(id, _)| id)
+            .collect();
+        let by_node = |r: &Relation| r.members.iter().any(|m| m.mtype == ElemType::Node && nok.contains(&m.id));
+        let open: Vec<&Relation> = rels.iter().copied().filter(|r| !by_node(r)).collect();
+        self.check()?;
+        let ways = self.f.ways_untagged_at(near(Kind::Way, &members(ElemType::Way, &open), &ctx.way_ranges())?)?;
+        #[cfg(test)]
+        MEMBER_WAYS_READ.set(ways.len());
+        let wrefs: Vec<&Way> = ways.iter().collect();
+        let wok: FxHashSet<Id> = ways.iter().zip(self.area_keep_ways(ctx, &wrefs)?).filter(|(_, ok)| *ok).map(|(w, _)| w.id).collect();
+        Ok(rels.iter().map(|r| by_node(r) || r.members.iter().any(|m| m.mtype == ElemType::Way && wok.contains(&m.id))).collect())
     }
 
     /// DB areas of an `area` query (spatial clauses never filter areas).
@@ -384,5 +450,44 @@ impl<'s, W: Write> Engine<'s, W> {
             }
         }
         Ok(Set { nodes: self.f.by_ids::<Node>(&nids)?, ways: self.f.by_ids::<Way>(&wids)?, rels: self.f.by_ids::<Relation>(&rids)?, ..Default::default() })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The great-circle arcs between points at most a cell of a level apart
+    /// in longitude stay within `arc_bulge` of the latitudes of their ends.
+    #[test]
+    fn arc_bulge_bounds_great_circles() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for level in 2..=MAX_LEVEL {
+            let width = 1u64 << (32 - level as u32);
+            let bulge = arc_bulge(width) as f64 / 1e7;
+            let mut most = 0.0f64;
+            for _ in 0..20_000 {
+                let d = next() * (width as f64 / 1e7).min(179.999);
+                // ends at about the same latitude half the time: an arc
+                // between them reaches past them
+                let la = next() * 170.0 - 85.0;
+                let lb = if next() < 0.5 { la + (next() - 0.5) * d * 0.01 } else { next() * 170.0 - 85.0 };
+                let lo = next() * (360.0 - d) - 180.0;
+                let (s, n) = crate::geo::Segment::new(la, lo, lb, lo + d).lat_extent();
+                let out = (la.min(lb) - s).max(n - la.max(lb));
+                most = most.max(out);
+                assert!(out <= bulge, "level {level}: {la} {lb} {d}: {out} > {bulge}");
+            }
+            // the bound is not far off (less the margin and rounding)
+            assert!(most >= 0.3 * (bulge - 1.001e-4), "level {level}: {most} {bulge}");
+        }
+        assert_eq!(arc_bulge(1 << 31), u32::MAX);
+        assert_eq!(arc_bulge(1_800_000_000), u32::MAX);
     }
 }

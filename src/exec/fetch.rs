@@ -372,6 +372,14 @@ impl<'s> Fetch<'s> {
         Ok(out)
     }
 
+    /// `ways_untagged` for ways at known (cell, id) positions.
+    pub fn ways_untagged_at(&self, pairs: Vec<(Cell, Id)>) -> Result<Vec<Way>> {
+        let chunks = self.snap.chunks_at(Kind::Way, pairs)?;
+        let mut out = decode_chunks(&self.limits, &chunks, |(v, _)| *v, |(v, want)| codec::decode_ways(v, Pick::Ids(want), false))?;
+        out.sort_unstable_by_key(|w| w.id);
+        Ok(out)
+    }
+
     /// All elements stored in the given cell ranges that pass `keep`.
     pub fn in_ranges<T: Stored>(&self, ranges: &[CodeRange], keep: impl Fn(&T) -> bool + Sync + Send) -> Result<Vec<T>> {
         self.in_ranges_by(ranges, T::decode, keep)

@@ -159,9 +159,10 @@ pub trait QElem: Stored {
     fn bbox_geoms(f: &Fetch, elems: &[&Self], _rects: &[Rect]) -> Result<Vec<EGeom>> {
         Self::geoms(f, elems)
     }
-    /// Geometry sufficient for bbox and around tests whose regions meet
-    /// the stored boxes `near` accepts (relations: see `rel_geoms_near`).
-    fn near_geoms(f: &Fetch, elems: &[&Self], _near: &dyn Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
+    /// Geometry sufficient for bbox, around and poly tests whose regions
+    /// meet the stored boxes `near` accepts (relations: see
+    /// `rel_geoms_near`, which also takes `near_cell`).
+    fn near_geoms(f: &Fetch, elems: &[&Self], _near: &dyn Fn(&Rect) -> bool, _near_cell: &dyn Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
         Self::geoms(f, elems)
     }
     fn as_el(&self) -> super::eval::El<'_>;
@@ -249,8 +250,8 @@ impl QElem for Relation {
     fn bbox_geoms(f: &Fetch, elems: &[&Self], rects: &[Rect]) -> Result<Vec<EGeom>> {
         super::geom::rel_geoms_for_bbox(f, elems, rects)
     }
-    fn near_geoms(f: &Fetch, elems: &[&Self], near: &dyn Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
-        rel_geoms_near(f, elems, near)
+    fn near_geoms(f: &Fetch, elems: &[&Self], near: &dyn Fn(&Rect) -> bool, near_cell: &dyn Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
+        rel_geoms_near(f, elems, near, near_cell)
     }
     fn as_el(&self) -> super::eval::El<'_> {
         super::eval::El::R(self)
@@ -591,8 +592,19 @@ impl<'s, W: Write> Engine<'s, W> {
                     let geoms = if only_bbox && bbox_rects.len() == 1 {
                         T::bbox_geoms(&self.f, &refs, &bbox_rects[0])?
                     } else if reduce_rel_geoms(plan) {
-                        let near = |b: &Rect| bbox_rects.iter().any(|rs| rs.iter().any(|r| grow(r).intersects(b))) || arounds.iter().zip(&around_rects).any(|((s, _), rs)| s.near_box(rs, b));
-                        T::near_geoms(&self.f, &refs, &near)?
+                        // A way apart from a polygon at every shift fails its
+                        // way test (`PolyTest::rect_pos`). `matches_line`
+                        // takes an edge wider than 180 degrees across the
+                        // antimeridian, while `rect_pos` decides boxes up to
+                        // 2^31 units (215 degrees): those ways are kept.
+                        let polys: Vec<PolyTest> = plan.polys.iter().map(|p| p.prepare()).collect();
+                        let near_poly = |b: &Rect| !b.is_empty() && polys.iter().any(|p| b.x1 - b.x0 > 1_800_000_000 || p.rect_pos(b) != RectPos::Apart);
+                        let near_bbox = |b: &Rect| bbox_rects.iter().any(|rs| rs.iter().any(|r| grow(r).intersects(b)));
+                        let near = |b: &Rect| near_bbox(b) || arounds.iter().zip(&around_rects).any(|((s, _), rs)| s.near_box(rs, b)) || near_poly(b);
+                        // for cells: the rectangles of an around clause, which
+                        // hold all it can pass
+                        let near_cell = |b: &Rect| near_bbox(b) || around_rects.iter().any(|rs| rs.iter().any(|r| grow(r).intersects(b))) || near_poly(b);
+                        T::near_geoms(&self.f, &refs, &near, &near_cell)?
                     } else {
                         T::geoms(&self.f, &refs)?
                     };
@@ -1177,14 +1189,13 @@ fn rel_boxes_on() -> bool {
     true
 }
 
-/// Whether relation geometry for the spatial tests may leave out member
-/// ways far from every region (not for polygons).
-fn reduce_rel_geoms(plan: &Plan) -> bool {
+/// Whether relation geometry for the spatial tests may leave out the
+/// members far from every region; off in tests to compare.
+fn reduce_rel_geoms(_plan: &Plan) -> bool {
     #[cfg(test)]
-    if tests::NEAR_GEOMS_OFF.get() {
-        return false;
-    }
-    plan.polys.is_empty()
+    return !tests::NEAR_GEOMS_OFF.get();
+    #[cfg(not(test))]
+    true
 }
 
 /// Cost of reading a region, for choosing where to read: the level-16
@@ -1618,8 +1629,11 @@ mod tests {
         }
         nodes += &format!("<node id=\"200011\" lat=\"10.0\" lon=\"179.999\" {m}/>\n<node id=\"200012\" lat=\"10.0\" lon=\"-179.999\" {m}/>\n");
         nodes += &format!("<node id=\"200013\" lat=\"47.9\" lon=\"1.95\" {m}/>\n");
+        // north of Paris; a way 200 degrees wide, taken across the
+        // antimeridian; north of the antimeridian polygon below
+        nodes += &format!("<node id=\"200014\" lat=\"49.5\" lon=\"2.35\" {m}/>\n<node id=\"200015\" lat=\"10.0\" lon=\"-100.0\" {m}/>\n<node id=\"200016\" lat=\"10.0\" lon=\"100.0\" {m}/>\n<node id=\"200017\" lat=\"10.5\" lon=\"179.9\" {m}/>\n");
         let way = |id: usize, nds: &[usize]| format!("<way id=\"{id}\" {m}>{}</way>\n", nds.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect::<String>());
-        let ways = [way(4000, &[200_001, 200_002, 200_003, 200_004, 200_005]), way(4001, &[200_006, 200_007, 200_008, 200_009, 200_010]), way(4002, &[200_011, 200_012])].concat();
+        let ways = [way(4000, &[200_001, 200_002, 200_003, 200_004, 200_005]), way(4001, &[200_006, 200_007, 200_008, 200_009, 200_010]), way(4002, &[200_011, 200_012]), way(4003, &[200_015, 200_016])].concat();
         let rels = [
             relation(21, &[("way", 1000), ("way", 4000)], &[("route", "bus")]),
             relation(22, &[("way", 4000), ("node", 200_013)], &[("route", "bus")]),
@@ -1629,15 +1643,21 @@ mod tests {
             relation(26, &[("node", 466), ("way", 4001)], &[]),
             relation(27, &[("relation", 21), ("way", 4001)], &[]),
             relation(28, &[("way", 999_000), ("node", 1)], &[]),
+            relation(29, &[("way", 4000), ("node", 200_014)], &[("route", "bus")]),
+            relation(30, &[("way", 4003), ("node", 200_017)], &[]),
         ]
         .concat();
         let (db, dir) = osm_db("near-geoms", &grid_osm_with(&nodes, &ways, &rels));
+        // polygons larger than rel_spatial_by_members takes: over Paris, and
+        // across the antimeridian
+        let big = "(poly:\"48.7 2.2 48.7 2.5 49.0 2.5 49.0 2.2\")";
+        let anti = "(poly:\"9.8 179.8 9.8 -179.8 10.2 -179.8 10.2 179.8\")";
         let (paris, orleans) = ("(around:20000,48.85,2.35)", "(47.85,1.85,47.95,1.96)");
         // query, ids (None: not checked)
         let cases: &[(String, Option<&[&str]>)] = &[
             (format!("rel{paris};out ids;"), Some(&["21", "23", "26", "28"])),
             (format!("rel{paris}{orleans};out ids;"), Some(&["21", "26"])),
-            ("rel(around:20000,47.9,1.9);out ids;".to_string(), Some(&["21", "22", "25", "26", "27"])),
+            ("rel(around:20000,47.9,1.9);out ids;".to_string(), Some(&["21", "22", "25", "26", "27", "29"])),
             ("rel(around:20000,47.9,1.9)(48.80,2.30,48.90,2.40);out ids;".to_string(), Some(&["21", "26"])),
             ("way(1000)->.w;rel(around.w:20000);out ids;".to_string(), Some(&["21", "23", "26", "28"])),
             (format!("rel(48.80,2.30,48.90,2.40){orleans};out ids;"), Some(&["21", "26"])),
@@ -1645,6 +1665,11 @@ mod tests {
             (format!("rel[route=bus]{paris};out geom;"), None),
             (format!("rel{paris};out center;"), None),
             (format!("[bbox:47.85,1.85,47.95,1.96];rel{paris};out bb;"), None),
+            (format!("rel{big};out ids;"), Some(&["21", "23", "26", "28"])),
+            (format!("rel{big}{orleans};out ids;"), Some(&["21", "26"])),
+            (format!("rel{anti};out ids;"), Some(&["23", "24", "30"])),
+            (format!("rel[route=bus]{big};out geom;"), None),
+            (format!("nwr{big}[route];out center;"), None),
         ];
         let c = "[out:csv(::id;false)];";
         for (q, ids) in cases {
@@ -1660,6 +1685,9 @@ mod tests {
                 assert_eq!(reduced.lines().collect::<Vec<_>>(), *ids, "{q}");
             }
         }
+        // the way of relation 21 near Orleans is stored apart from the polygon
+        output(&db, &format!("rel[route=bus]{big};out ids;"));
+        assert_eq!(super::super::geom::NEAR_WAYS_READ.get(), 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1918,6 +1946,103 @@ mod tests {
         let (both, _) = source("area[\"boundary\"=\"administrative\"][\"name\"=\"Town 7\"];out ids;");
         NARROW.set(None);
         assert_eq!((both.as_str(), READ.get()), ("area\t3600000017\n", 2));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `rel(area)` reads the members stored where they may reach an area,
+    /// with the answers of testing every member. A DB area with a hole: a
+    /// member node inside, a way across, a way inside, a long way across
+    /// pass; members on both sides only and a way in the hole do not; a
+    /// node on the border. An implicit area: a way whose great-circle edge
+    /// runs through it south of its nodes passes, from a cell apart from it.
+    #[test]
+    fn rel_area_reads_the_members_near_the_area() {
+        use super::super::area::{MEMBER_WAYS_READ, MEMBERS_ALL};
+        let m = r#"version="1" timestamp="2020-01-01T00:00:00Z" uid="1" user="a" changeset="1""#;
+        let mut nodes: Vec<(usize, f64, f64)> = Vec::new();
+        let mut ways: Vec<(usize, Vec<usize>)> = Vec::new();
+        let mut rels = String::new();
+        let ring = |nodes: &mut Vec<(usize, f64, f64)>, ways: &mut Vec<(usize, Vec<usize>)>, id: usize, s: f64, w: f64, n: f64, e: f64| {
+            let ids: Vec<usize> = (0..4).map(|k| id * 10 + k).collect();
+            for (k, (la, lo)) in [(s, w), (s, e), (n, e), (n, w)].into_iter().enumerate() {
+                nodes.push((ids[k], la, lo));
+            }
+            ways.push((id, vec![ids[0], ids[1], ids[2], ids[3], ids[0]]));
+        };
+        // the area: 48.8-48.9 N, 2.3-2.4 E with a hole 48.84-48.86 N, 2.34-2.36 E
+        ring(&mut nodes, &mut ways, 901, 48.80, 2.30, 48.90, 2.40);
+        ring(&mut nodes, &mut ways, 902, 48.84, 2.34, 48.86, 2.36);
+        rels += &relation(900, &[("way", 901), ("way", 902)], &[("type", "multipolygon"), ("name", "Square")]);
+        // the implicit area: closed way 7100, 37.75-37.6 S, 144-146 E
+        ring(&mut nodes, &mut ways, 7100, -37.75, 144.0, -37.60, 146.0);
+        // 300 short ways far away
+        for i in 0..300 {
+            nodes.push((20_000 + 2 * i, 40.0 + i as f64 * 0.01, 20.0));
+            nodes.push((20_001 + 2 * i, 40.0 + i as f64 * 0.01, 20.005));
+            ways.push((5000 + i, vec![20_000 + 2 * i, 20_001 + 2 * i]));
+        }
+        let pt = [(101, 48.82, 2.32), (102, 48.82, 2.0), (103, 48.82, 2.7), (104, 48.0, 2.0), (105, 49.5, 3.0), (106, 48.849, 2.349), (107, 48.851, 2.351), (108, 49.5, 2.35), (109, 48.80, 2.35), (110, 40.0, 20.0), (111, 48.85, -10.0), (112, 48.85, 15.0), (113, -37.30, 135.0), (114, -37.30, 155.0), (115, -38.5, 145.0), (116, 48.81, 2.31), (117, 48.815, 2.315)];
+        nodes.extend(pt);
+        for (id, nds) in [(7001, vec![102, 103]), (7002, vec![106, 107]), (7003, vec![116, 117]), (7005, vec![111, 112]), (7006, vec![113, 114])] {
+            ways.push((id, nds));
+        }
+        let far = |from: usize, to: usize| (from..to).map(|i| ("way", i)).collect::<Vec<_>>();
+        let with = |mut v: Vec<(&'static str, usize)>, more: &[(&'static str, usize)]| {
+            v.extend_from_slice(more);
+            v
+        };
+        let route = [("type", "route")];
+        rels += &relation(1, &with(far(5000, 5100), &[("node", 101)]), &route);
+        rels += &relation(2, &with(far(5100, 5200), &[("way", 7001)]), &route);
+        rels += &relation(3, &with(far(5200, 5210), &[("node", 104), ("node", 105)]), &route);
+        rels += &relation(4, &[("way", 7002), ("node", 108)], &route);
+        rels += &relation(5, &[("node", 109), ("node", 110)], &route);
+        rels += &relation(6, &[("way", 7005)], &route);
+        rels += &relation(7, &[("way", 7006), ("node", 115)], &route);
+        rels += &relation(8, &with(far(5210, 5300), &[("way", 7003)]), &route);
+        let mut x = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<osm version=\"0.6\">\n");
+        nodes.sort_by_key(|n| n.0);
+        for (id, la, lo) in &nodes {
+            x += &format!("<node id=\"{id}\" lat=\"{la:.7}\" lon=\"{lo:.7}\" {m}/>\n");
+        }
+        ways.sort_by_key(|w| w.0);
+        for (id, nds) in &ways {
+            let nds: String = nds.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect();
+            x += &format!("<way id=\"{id}\" {m}>{nds}</way>\n");
+        }
+        x += &rels.replace("{m}", m);
+        x += "</osm>\n";
+        let (db, dir) = osm_db("rel-area", &x);
+        crate::update::areas::make_areas(&db).unwrap();
+        let ids = |q: &str, all: bool| {
+            MEMBERS_ALL.set(all);
+            MEMBER_WAYS_READ.set(0);
+            let out = output(&db, q);
+            MEMBERS_ALL.set(false);
+            let ids: Vec<usize> = out.lines().filter_map(|l| l.strip_prefix("relation\t")).map(|i| i.parse().unwrap()).collect();
+            (ids, MEMBER_WAYS_READ.get())
+        };
+        let q = "[out:csv(::type,::id;false)];area[name=Square]->.a;rel(area.a);out ids;";
+        let (near, read) = ids(q, false);
+        let (all, read_all) = ids(q, true);
+        assert_eq!(near, all);
+        for id in [1, 2, 6, 8] {
+            assert!(near.contains(&id), "{id}: {near:?}");
+        }
+        for id in [3, 4, 7] {
+            assert!(!near.contains(&id), "{id}: {near:?}");
+        }
+        // the ways near the area, not the 200 far ones of the relations a
+        // node does not decide
+        assert!(read < 10 && read_all > 200, "{read} {read_all}");
+        // with a tag filter, and with nwr
+        for q in ["[out:csv(::type,::id;false)];area[name=Square]->.a;rel(area.a)[type=route];out ids;", "[out:csv(::type,::id;false)];area[name=Square]->.a;nwr(area.a);out ids;"] {
+            assert_eq!(ids(q, false).0, ids(q, true).0, "{q}");
+        }
+        let q = "[out:csv(::type,::id;false)];way(7100);rel(area);out ids;";
+        let (near, read) = ids(q, false);
+        assert_eq!(near, vec![7]);
+        assert_eq!((near, read), (ids(q, true).0, 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
