@@ -143,8 +143,8 @@ pub fn rel_geoms_near<R: Borrow<Relation>>(f: &Fetch, rels: &[R], near: impl Fn(
     let mut ways = f.ways_untagged_at(stored_near(Kind::Way, &members(ElemType::Way))?)?;
     #[cfg(test)]
     NEAR_WAYS_READ.set(ways.len());
-    // boxes wider than half the world may cross the antimeridian: kept
-    ways.retain(|w| !w.missing && !w.bbox.is_empty() && (w.bbox.x1 - w.bbox.x0 > 0x8000_0000 || near(&w.bbox)));
+    // an edge across the antimeridian leaves the box: kept
+    ways.retain(|w| !w.missing && !w.bbox.is_empty() && (w.bbox.may_cross() || near(&w.bbox)));
     let wv = way_vertices(f, &ways)?;
     let node_ids: Vec<Id> = stored_near(Kind::Node, &members(ElemType::Node))?.into_iter().map(|(_, id)| id).collect();
     let npos = f.node_positions(&node_ids)?;
@@ -190,7 +190,7 @@ pub fn rel_geoms_for_bbox<R: Borrow<Relation>>(f: &Fetch, rels: &[R], rects: &[c
         if w.missing || sb.is_empty() {
             continue;
         }
-        if sb.x1 - sb.x0 > 0x8000_0000 {
+        if sb.may_cross() {
             decided.insert(w.id, None);
             open.push(w);
             continue;
@@ -423,8 +423,8 @@ impl AroundSource {
         }
     }
 
-    /// Whether a stored element box (key space, at most half the world
-    /// wide) may come within the radius: it meets one of `rects` (from
+    /// Whether a stored element box (key space, not `Rect::may_cross`) may
+    /// come within the radius: it meets one of `rects` (from
     /// `bbox_rects`, grown by one unit). With a grid index, its cells answer
     /// instead of every rectangle when the box covers fewer cells than an
     /// eighth of the rectangles (a cell lookup costs more than a rectangle
@@ -736,8 +736,8 @@ impl PolyTest {
     /// inside, passes the way tests; `Apart`, every vertex and segment
     /// outside at every shift, fails them. A connected rectangle that no
     /// edge meets is on one side of the border, which one of its corners
-    /// tells. Boxes wider than half the world are `Border`: their way may
-    /// cross the antimeridian, where `matches_line` unwraps it.
+    /// tells. Boxes that may hold an edge across the antimeridian
+    /// (`Rect::may_cross`) are `Border`: `matches_line` unwraps it.
     pub fn rect_pos(&self, r: &crate::geo::Rect) -> RectPos {
         if r.is_empty() {
             return RectPos::Border;
@@ -745,7 +745,7 @@ impl PolyTest {
         if self.contains_rect(r) {
             return RectPos::Inside;
         }
-        if r.x1 - r.x0 > 0x8000_0000 {
+        if r.may_cross() {
             return RectPos::Border;
         }
         let (lo, hi) = (qp(Pt { y: r.y0, x: r.x0 }), qp(Pt { y: r.y1, x: r.x1 }));

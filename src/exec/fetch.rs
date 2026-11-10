@@ -4,7 +4,7 @@
 //! cheap pointer walks over the memory map) and decoded in parallel.
 
 use super::filter::TagFilter;
-use crate::geo::{Cell, CodeRange, Pt, Rect, level_ranges, loose_ranges, merge_ranges, tile_ranges, MAX_LEVEL};
+use crate::geo::{Cell, CodeRange, Pt, Rect, arc_bulge, level_ranges, loose_ranges, merge_ranges, tile_ranges, MAX_LEVEL};
 use crate::model::*;
 use crate::store::codec::{self, Pick};
 use crate::store::{Kind, Snapshot, Scan};
@@ -204,6 +204,32 @@ pub fn ranges_for(kind: Kind, rects: &[Rect]) -> Vec<CodeRange> {
         match kind {
             Kind::Node => r.extend(tile_ranges(rect)),
             _ => r.extend(loose_ranges(rect)),
+        }
+    }
+    merge_ranges(r)
+}
+
+/// Cell ranges where ways or relations whose great-circle edges may meet
+/// the rectangles are stored (`around`, implicit areas): as `ranges_for`,
+/// with the rectangles grown north and south at each level by the bulge of
+/// an edge one cell wide (`arc_bulge`), as a cell holds boxes at most one
+/// cell wide. Nodes as `ranges_for`.
+pub fn arc_ranges(kind: Kind, rects: &[Rect]) -> Vec<CodeRange> {
+    if kind == Kind::Node {
+        return ranges_for(kind, rects);
+    }
+    let runs;
+    let rects = if rects.len() > 32 {
+        runs = tile_runs(rects);
+        &runs[..]
+    } else {
+        rects
+    };
+    let mut r = Vec::new();
+    for level in 0..=MAX_LEVEL {
+        let m = arc_bulge(1u64 << (32 - level as u32));
+        for rect in rects {
+            r.extend(level_ranges(level, &rect.grow_lat(m), true));
         }
     }
     merge_ranges(r)
@@ -829,5 +855,55 @@ mod tests {
         let points: Vec<Rect> = (0..2000).map(|_| Rect::point(Pt { y: 0x6000_0000 + rnd(40 << 16) as u32, x: 0x7000_0000 + rnd(40 << 16) as u32 })).collect();
         assert!(tile_runs(&points).len() <= 800);
         assert_eq!(ranges_for(Kind::Way, &points), one_by_one(Kind::Way, &points));
+    }
+
+    /// Whether every range of `small` lies within a range of `big`.
+    fn covers(big: &[CodeRange], small: &[CodeRange]) -> bool {
+        small.iter().all(|s| big.iter().any(|b| b.level == s.level && b.lo <= s.lo && s.hi <= b.hi))
+    }
+
+    /// The cell of a way is in the `arc_ranges` of a rectangle that its
+    /// great-circle edge meets north or south of its box (a thin band at
+    /// the extreme latitude of the edge, over its longitudes), which
+    /// `ranges_for` misses for some. `arc_ranges` hold `ranges_for`, and
+    /// with many rectangles the ranges of each one.
+    #[test]
+    fn arc_ranges_hold_ways_whose_edges_meet() {
+        let mut seed = 0x5851_f42d_4c95_7f2du64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut missed = 0;
+        let mut bands = Vec::new();
+        for _ in 0..4000 {
+            // widths from 10^-3 to 170 degrees
+            let d = 10f64.powf(next() * 5.3 - 3.0).min(170.0);
+            let la = next() * 160.0 - 80.0;
+            let lb = la + (next() - 0.5) * d * 0.01;
+            let lo = next() * (360.0 - d) - 180.0;
+            let (a, b) = (Pt::from_ll(la, lo), Pt::from_ll(lb, lo + d));
+            let mut bx = Rect::point(a);
+            bx.extend(b);
+            let cell = crate::geo::anchor_cell(&bx);
+            let (s, n) = crate::geo::Segment::new(a.lat(), a.lon(), b.lat(), b.lon()).lat_extent();
+            let y = ((if la >= 0.0 { n } else { s } + 91.0) * 1e7) as u32;
+            let band = Rect { y0: y - 1, x0: bx.x0, y1: y + 1, x1: bx.x1 };
+            let arc = arc_ranges(Kind::Way, &[band]);
+            let plain = ranges_for(Kind::Way, &[band]);
+            assert!(cell_in_ranges(cell, &arc), "{la} {lb} {lo} {d}");
+            assert!(bx.arc_box().intersects(&band), "{la} {lb} {lo} {d}");
+            assert!(covers(&arc, &plain), "{la} {lb} {lo} {d}");
+            missed += !cell_in_ranges(cell, &plain) as usize;
+            bands.push(band);
+        }
+        assert!(missed > 0);
+        // many small rectangles go through `tile_runs`
+        let small: Vec<Rect> = bands.iter().take(200).map(|b| Rect { x1: b.x0.saturating_add(50_000), ..*b }).collect();
+        let each: Vec<CodeRange> = small.iter().flat_map(|r| arc_ranges(Kind::Way, std::slice::from_ref(r))).collect();
+        assert!(covers(&arc_ranges(Kind::Way, &small), &each));
+        assert_eq!(arc_ranges(Kind::Node, &small), ranges_for(Kind::Node, &small));
     }
 }

@@ -4,7 +4,7 @@
 
 //! The query statement: candidate generation and filtering per element type.
 
-use super::fetch::{Fetch, Source, ranges_for, tile_runs};
+use super::fetch::{Fetch, Source, arc_ranges, ranges_for, tile_runs};
 use super::filter::TagFilter;
 use super::geom::{AroundSource, EGeom, PolyTest, Polygon, RectPos, rel_geoms, rel_geoms_near, way_geoms};
 use super::set::Set;
@@ -283,19 +283,25 @@ fn node_test(b: &BBox) -> impl Fn(crate::geo::Pt) -> bool {
 }
 
 /// Way test: ways with a missing node have no geometry and never match.
-/// A way passes when one of its nodes passes the node test, so a node on a
-/// box edge takes its way (the f64 latitude of such a node can lie 1e-14
-/// outside the edge), and otherwise when a segment crosses the box.
+/// A way passes when an end of one of its segments passes the node test,
+/// so a node on a box edge takes its way (the f64 latitude of such a node
+/// can lie 1e-14 outside the edge), and otherwise when a segment crosses
+/// the box. The ends of a segment taken across the antimeridian do not
+/// count: C++ tests the segment only (`bbox_intersects`), which then meets
+/// a box east or west of the antimeridian only when the box holds both
+/// ends.
 fn line_in_bbox(v: &[Option<crate::geo::Pt>], b: &BBox) -> bool {
     if v.is_empty() || v.iter().any(|p| p.is_none()) {
         return false;
     }
     let inside = node_test(b);
-    if v.iter().flatten().any(|p| inside(*p)) {
-        return true;
+    let pts: Vec<crate::geo::Pt> = v.iter().flatten().copied().collect();
+    if pts.len() == 1 {
+        return inside(pts[0]);
     }
-    let pts: Vec<(f64, f64)> = v.iter().flatten().map(|p| (p.lat(), p.lon())).collect();
-    pts.windows(2).any(|w| crate::geo::bbox_intersects(b, w[0], w[1]))
+    let ll = |p: crate::geo::Pt| (p.lat(), p.lon());
+    pts.windows(2).any(|w| (inside(w[0]) || inside(w[1])) && !crate::geo::bbox_across(ll(w[0]), ll(w[1])))
+        || pts.windows(2).any(|w| crate::geo::bbox_intersects(b, ll(w[0]), ll(w[1])))
 }
 
 /// Element-type specific bbox test (spec §5).
@@ -450,25 +456,27 @@ impl<'s, W: Write> Engine<'s, W> {
         Ok(Some(acc))
     }
 
-    fn spatial_rects(&self, plan: &Plan, arounds: &[(AroundSource, f64)], area_ctxs: &[super::area::AreaCtx]) -> Result<Option<Vec<Rect>>> {
-        // Use the most restrictive single spatial clause for range selection.
-        let mut options: Vec<(&'static str, Vec<Rect>)> = plan.bboxes.iter().map(|b| ("bbox", b.rects())).collect();
-        options.extend(plan.polys.iter().map(|p| ("poly", p.bbox().rects())));
-        options.extend(arounds.iter().map(|(src, r)| ("around", src.bbox_rects(*r))));
-        options.extend(area_ctxs.iter().map(|c| ("area", c.rects.clone())));
-        let mut best: Option<(u64, &'static str, Vec<Rect>)> = None;
+    /// The rectangles of the most restrictive single spatial clause, for
+    /// range selection, and whether its test follows great-circle edges
+    /// (`around`, implicit areas: `arc_ranges`).
+    fn spatial_rects(&self, plan: &Plan, arounds: &[(AroundSource, f64)], area_ctxs: &[super::area::AreaCtx]) -> Result<Option<(Vec<Rect>, bool)>> {
+        let mut options: Vec<(&'static str, Vec<Rect>, bool)> = plan.bboxes.iter().map(|b| ("bbox", b.rects(), false)).collect();
+        options.extend(plan.polys.iter().map(|p| ("poly", p.bbox().rects(), false)));
+        options.extend(arounds.iter().map(|(src, r)| ("around", src.bbox_rects(*r), true)));
+        options.extend(area_ctxs.iter().map(|c| ("area", c.rects.clone(), c.has_implicit())));
+        let mut best: Option<(u64, &'static str, Vec<Rect>, bool)> = None;
         if options.len() == 1 {
-            best = options.pop().map(|(what, rects)| (0, what, rects));
+            best = options.pop().map(|(what, rects, arcs)| (0, what, rects, arcs));
         }
-        for (what, rects) in options {
+        for (what, rects, arcs) in options {
             let n = region_cost(&rects);
-            if best.as_ref().is_none_or(|(b, _, _)| n < *b) {
-                best = Some((n, what, rects));
+            if best.as_ref().is_none_or(|(b, _, _, _)| n < *b) {
+                best = Some((n, what, rects, arcs));
             }
         }
         #[cfg(test)]
-        tests::REGION.set(best.as_ref().map(|(_, what, _)| *what));
-        Ok(best.map(|(_, _, r)| r))
+        tests::REGION.set(best.as_ref().map(|(_, what, _, _)| *what));
+        Ok(best.map(|(_, _, r, arcs)| (r, arcs)))
     }
 
     fn query_type<T: QElem>(&mut self, plan: &Plan, (area_ctxs, arounds): (&[super::area::AreaCtx], &[(AroundSource, f64)])) -> Result<Vec<T>> {
@@ -478,7 +486,7 @@ impl<'s, W: Write> Engine<'s, W> {
             Some(c) => c,
             None => {
                 let rects = self.spatial_rects(plan, arounds, area_ctxs)?;
-                let ranges: Option<Vec<CodeRange>> = rects.as_ref().map(|r| ranges_for(kind, r));
+                let ranges: Option<Vec<CodeRange>> = rects.as_ref().map(|(r, arcs)| if *arcs { arc_ranges(kind, r) } else { ranges_for(kind, r) });
                 if let Some((pairs, read)) = self.indexed_candidates(kind, plan, ranges.as_deref())? {
                     self.check()?;
                     self.at_tagged::<T>(plan, pairs, &read)?
@@ -541,8 +549,10 @@ impl<'s, W: Write> Engine<'s, W> {
             let grow = |r: &Rect| Rect { y0: r.y0.saturating_sub(1), x0: r.x0.saturating_sub(1), y1: r.y1.saturating_add(1), x1: r.x1.saturating_add(1) };
             let bbox_rects: Vec<Vec<Rect>> = plan.bboxes.iter().map(|b| b.rects()).collect();
             let around_rects: Vec<Vec<Rect>> = arounds.iter().map(|(s, r)| s.bbox_rects(*r)).collect();
-            let mut other_rects: Vec<Vec<Rect>> = plan.polys.iter().map(|p| p.bbox().rects()).collect();
-            other_rects.extend(area_ctxs.iter().map(|c| c.rects.clone()));
+            let poly_rects: Vec<Vec<Rect>> = plan.polys.iter().map(|p| p.bbox().rects()).collect();
+            // `around` and implicit areas follow great-circle edges, which
+            // pass north or south of the box (`Rect::arc_box`)
+            let arcs = !arounds.is_empty() || area_ctxs.iter().any(|c| c.has_implicit());
             let only_bbox = arounds.is_empty() && plan.polys.is_empty() && plan.areas.is_empty();
             let mut keep = vec![true; cands.len()];
             let mut undecided: Vec<usize> = Vec::new();
@@ -552,9 +562,8 @@ impl<'s, W: Write> Engine<'s, W> {
                         keep[i] = false;
                         continue;
                     }
-                    // Wider than half the world: may cross the antimeridian,
-                    // where the stored box covers the wrong side.
-                    if sb.x1 - sb.x0 > 0x8000_0000 {
+                    // An edge across the antimeridian leaves the box.
+                    if sb.may_cross() {
                         undecided.push(i);
                         continue;
                     }
@@ -569,7 +578,13 @@ impl<'s, W: Write> Engine<'s, W> {
                         all_inside &= inside;
                     }
                     if !reject {
-                        reject = arounds.iter().zip(&around_rects).any(|((s, _), rs)| !s.near_box(rs, &sb)) || other_rects.iter().any(|rs| rs.iter().all(|r| !grow(r).intersects(&sb)));
+                        let arc = if arcs { sb.arc_box() } else { sb };
+                        reject = arounds.iter().zip(&around_rects).any(|((s, _), rs)| !s.near_box(rs, &arc))
+                            || poly_rects.iter().any(|rs| rs.iter().all(|r| !grow(r).intersects(&sb)))
+                            || area_ctxs.iter().any(|c| {
+                                let b = if c.has_implicit() { &arc } else { &sb };
+                                c.rects.iter().all(|r| !grow(r).intersects(b))
+                            });
                     }
                     if reject {
                         keep[i] = false;
@@ -593,17 +608,29 @@ impl<'s, W: Write> Engine<'s, W> {
                         T::bbox_geoms(&self.f, &refs, &bbox_rects[0])?
                     } else if reduce_rel_geoms(plan) {
                         // A way apart from a polygon at every shift fails its
-                        // way test (`PolyTest::rect_pos`). `matches_line`
-                        // takes an edge wider than 180 degrees across the
-                        // antimeridian, while `rect_pos` decides boxes up to
-                        // 2^31 units (215 degrees): those ways are kept.
+                        // way test (`PolyTest::rect_pos`).
                         let polys: Vec<PolyTest> = plan.polys.iter().map(|p| p.prepare()).collect();
-                        let near_poly = |b: &Rect| !b.is_empty() && polys.iter().any(|p| b.x1 - b.x0 > 1_800_000_000 || p.rect_pos(b) != RectPos::Apart);
+                        let near_poly = |b: &Rect| !b.is_empty() && polys.iter().any(|p| p.rect_pos(b) != RectPos::Apart);
                         let near_bbox = |b: &Rect| bbox_rects.iter().any(|rs| rs.iter().any(|r| grow(r).intersects(b)));
-                        let near = |b: &Rect| near_bbox(b) || arounds.iter().zip(&around_rects).any(|((s, _), rs)| s.near_box(rs, b)) || near_poly(b);
+                        let near_around = |b: &Rect| {
+                            if arounds.is_empty() {
+                                return false;
+                            }
+                            let a = b.arc_box();
+                            arounds.iter().zip(&around_rects).any(|((s, _), rs)| s.near_box(rs, &a))
+                        };
+                        let near = |b: &Rect| near_bbox(b) || near_around(b) || near_poly(b);
                         // for cells: the rectangles of an around clause, which
-                        // hold all it can pass
-                        let near_cell = |b: &Rect| near_bbox(b) || around_rects.iter().any(|rs| rs.iter().any(|r| grow(r).intersects(b))) || near_poly(b);
+                        // hold all it can pass, against the cell grown by the
+                        // bulge of the edges it may hold (boxes up to its width)
+                        let near_cell = |b: &Rect| {
+                            near_bbox(b)
+                                || (!around_rects.is_empty() && {
+                                    let a = b.arc_box();
+                                    around_rects.iter().any(|rs| rs.iter().any(|r| grow(r).intersects(&a)))
+                                })
+                                || near_poly(b)
+                        };
                         T::near_geoms(&self.f, &refs, &near, &near_cell)?
                     } else {
                         T::geoms(&self.f, &refs)?
@@ -735,7 +762,7 @@ impl<'s, W: Write> Engine<'s, W> {
                     let grow = |r: &Rect| Rect { y0: r.y0.saturating_sub(1), x0: r.x0.saturating_sub(1), y1: r.y1.saturating_add(1), x1: r.x1.saturating_add(1) };
                     // ways apart from the polygon fail without their vertices
                     let boxes = way_boxes_on();
-                    let mut ways = self.f.in_ranges_by::<Way>(&ranges_for(Kind::Way, &rects), |v, p| codec::decode_ways(v, p, false), |w| rects.iter().any(|r| grow(r).intersects(&w.bbox)) && !(boxes && test.rect_pos(&w.bbox) == RectPos::Apart))?;
+                    let mut ways = self.f.in_ranges_by::<Way>(&ranges_for(Kind::Way, &rects), |v, p| codec::decode_ways(v, p, false), |w| (w.bbox.may_cross() || rects.iter().any(|r| grow(r).intersects(&w.bbox))) && !(boxes && test.rect_pos(&w.bbox) == RectPos::Apart))?;
                     self.check()?;
                     let pass = poly_member_ways(&self.f, &test, &ways.iter().collect::<Vec<_>>())?;
                     let mut i = 0;
@@ -804,7 +831,11 @@ impl<'s, W: Write> Engine<'s, W> {
         let plan = Plan::new(&rest)?;
         let region_cost0 = region_cost(rects0);
         let bbox = plan.bboxes.iter().map(|b| (region_cost(&b.rects()), b.rects())).filter(|(n, _)| *n < region_cost0).min_by_key(|(n, _)| *n).map(|(_, rs)| rs);
-        let ranges = ranges_for(Kind::Relation, bbox.as_deref().unwrap_or(rects0));
+        let ranges = match (&bbox, member_tests.first()) {
+            (Some(rs), _) => ranges_for(Kind::Relation, rs),
+            (None, Some((MemberTest::Around(..), _))) => arc_ranges(Kind::Relation, rects0),
+            (None, _) => ranges_for(Kind::Relation, rects0),
+        };
         // An unanchored regex or a key filter would walk every value of its
         // key (every name on the planet): those are tested on the relations
         // stored in the cells of the region instead.
@@ -833,15 +864,16 @@ impl<'s, W: Write> Engine<'s, W> {
             tests::CANDIDATES.set(Some("too_many_candidates"));
             return Ok(None);
         }
-        // as the stored-bbox test of query_type: boxes wider than half the
-        // world may cross the antimeridian and go to the geometry test
-        let wide = |b: &Rect| b.x1 - b.x0 > 0x8000_0000;
+        // as the stored-bbox test of query_type: an edge across the
+        // antimeridian leaves the box, which goes to the geometry test
+        let wide = |b: &Rect| b.may_cross();
         let grow = |r: &Rect| Rect { y0: r.y0.saturating_sub(1), x0: r.x0.saturating_sub(1), y1: r.y1.saturating_add(1), x1: r.x1.saturating_add(1) };
         let meets = |b: &Rect, rs: &[Rect]| rs.iter().any(|x| grow(x).intersects(b));
+        // `around` follows great-circle edges (`Rect::arc_box`)
         let near = |b: &Rect, test: &MemberTest, rs: &[Rect]| {
             wide(b)
                 || match test {
-                    MemberTest::Around(src, _) => src.near_box(rs, b),
+                    MemberTest::Around(src, _) => src.near_box(rs, &b.arc_box()),
                     MemberTest::Poly(_) => meets(b, rs),
                 }
         };
@@ -934,7 +966,7 @@ impl<'s, W: Write> Engine<'s, W> {
                 MemberTest::Poly(poly) if lookups => {
                     let tiles = ranges_for(Kind::Node, rs);
                     let nodes = positions.iter().filter(|(_, p)| cell_in_ranges(Cell::tile(tile_of(**p)), &tiles) && poly.contains_member(**p)).map(|(id, _)| *id).collect();
-                    let close: Vec<&Way> = ways.iter().filter(|w| meets(&w.bbox, rs)).collect();
+                    let close: Vec<&Way> = ways.iter().filter(|w| wide(&w.bbox) || meets(&w.bbox, rs)).collect();
                     let pass = poly_member_ways(&self.f, poly, &close)?;
                     (nodes, close.iter().zip(pass).filter(|(_, p)| *p).map(|(w, _)| w.id).collect())
                 }
@@ -942,7 +974,7 @@ impl<'s, W: Write> Engine<'s, W> {
                     let want_nodes: HashSet<Id> = nids.iter().copied().collect();
                     let want_ways: HashSet<Id> = wids.iter().copied().collect();
                     let nodes = self.f.in_ranges_by::<Node>(&ranges_for(Kind::Node, rs), |v, p| codec::decode_nodes(v, p, false), |n| want_nodes.contains(&n.id) && poly.contains_member(n.pos))?;
-                    let close = self.f.in_ranges_by::<Way>(&ranges_for(Kind::Way, rs), |v, p| codec::decode_ways(v, p, false), |w| want_ways.contains(&w.id) && meets(&w.bbox, rs))?;
+                    let close = self.f.in_ranges_by::<Way>(&ranges_for(Kind::Way, rs), |v, p| codec::decode_ways(v, p, false), |w| want_ways.contains(&w.id) && (wide(&w.bbox) || meets(&w.bbox, rs)))?;
                     self.check()?;
                     let refs: Vec<&Way> = close.iter().collect();
                     let pass = poly_member_ways(&self.f, poly, &refs)?;
@@ -1725,7 +1757,7 @@ mod tests {
                 let p = Pt::from_ll(50.0 + (rnd() - 0.5) * spread * 1.5, lon(rnd()));
                 let q = Pt::from_ll((p.lat() + rnd() * size).min(89.0), lon(rnd()).clamp(p.lon(), p.lon() + size));
                 let b = Rect { y0: p.y.min(q.y), x0: p.x.min(q.x), y1: p.y.max(q.y), x1: p.x.max(q.x) };
-                if b.x1 - b.x0 > 0x8000_0000 {
+                if b.may_cross() {
                     continue;
                 }
                 let linear = rects.iter().any(|r| grow(r).intersects(&b));
@@ -2332,6 +2364,186 @@ mod tests {
         assert_eq!(ids(&format!("relation[route](poly:\"{}\");out ids;", polys[3])), ["1"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
+    /// A way 200 degrees wide is taken across the antimeridian by the
+    /// polygon and bbox tests: every path finds it at 175 degrees east, where
+    /// its nodes are not, and none finds a way of two edges of 95 degrees
+    /// there. The polygons: a small one (candidate and member paths) and one
+    /// larger than they take.
+    #[test]
+    fn ways_across_the_antimeridian_on_every_path() {
+        let m = "{m}";
+        let node = |id: usize, lat: f64, lon: f64| format!("<node id=\"{id}\" lat=\"{lat}\" lon=\"{lon}\" {m}/>\n");
+        let nodes = [node(300_001, 10.0, -100.0), node(300_002, 10.0, 100.0), node(300_003, 10.002, -95.0), node(300_004, 10.002, 0.0), node(300_005, 10.002, 95.0)].concat();
+        let way = |id: usize, nds: &[usize]| format!("<way id=\"{id}\" {m}>{}</way>\n", nds.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect::<String>());
+        let ways = [way(4100, &[300_001, 300_002]), way(4101, &[300_003, 300_004, 300_005])].concat();
+        let rels = [relation(41, &[("way", 4100)], &[("route", "ferry")]), relation(42, &[("way", 4101)], &[("route", "ferry")])].concat();
+        let (db, dir) = osm_db("across", &grid_osm_with(&nodes, &ways, &rels));
+        let c = "[out:csv(::type,::id;false)];";
+        let small = "(poly:\"9.975 174.975 9.975 175.025 10.025 175.025 10.025 174.975\")";
+        let large = "(poly:\"9.5 174.5 9.5 175.5 10.5 175.5 10.5 174.5\")";
+        for (f, t, want) in [
+            (small, "way", "way\t4100"),
+            (small, "rel", "relation\t41"),
+            (small, "rel[route=ferry]", "relation\t41"),
+            (large, "way", "way\t4100"),
+            (large, "rel", "relation\t41"),
+            (large, "rel[route=ferry]", "relation\t41"),
+            ("(9.5,175,10.5,-175)", "way", "way\t4100"),
+            ("(9.5,175,10.5,-175)", "rel", "relation\t41"),
+            ("(9.5,175,10.5,-175)(9.9,170,10.1,-170)", "rel", "relation\t41"),
+        ] {
+            let q = format!("{c}{t}{f};out ids;");
+            let plain = both_ways(&db, &q).0;
+            assert_eq!(plain, [want], "{q}");
+            for (boxes_off, scan, near_off) in [(true, false, false), (false, true, false), (true, true, true)] {
+                REL_BOXES_OFF.set(boxes_off);
+                WAY_BOXES_OFF.set(boxes_off);
+                MEMBER_SCAN.set(scan);
+                NEAR_GEOMS_OFF.set(near_off);
+                let out = both_ways(&db, &q).0;
+                REL_BOXES_OFF.set(false);
+                WAY_BOXES_OFF.set(false);
+                MEMBER_SCAN.set(false);
+                NEAR_GEOMS_OFF.set(false);
+                assert_eq!(out, plain, "{q} {boxes_off} {scan} {near_off}");
+            }
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `around` and implicit areas follow great-circle edges, which pass
+    /// north (or south) of the box of their nodes. A way of one edge 20
+    /// degrees long at 48.41 N (and one at 48.41 S) reaches 48.85 at 2.35 E,
+    /// over the Paris grid, 49 km off its box: `around` there finds the way
+    /// and its relation, as does a closed way there used as an area. A
+    /// triangle with that edge holds a node in the bulge, and the long way
+    /// as an `around` source finds a node on its edge (C++ answers the same).
+    /// Every path gives the answer: tag index and cell candidates, the
+    /// relation candidate and member paths, reduced and full relation
+    /// geometries, and the relation area test with every member read.
+    #[test]
+    fn great_circle_edges_on_every_path() {
+        use super::super::area::MEMBERS_ALL;
+        let m = "{m}";
+        let half = 10.0f64;
+        // ends at 48.41: the edge reaches 48.85 at 2.35
+        let low = (48.85f64.to_radians().tan() * half.to_radians().cos()).atan().to_degrees();
+        let low: f64 = format!("{low:.7}").parse().unwrap();
+        let apex = (low.to_radians().tan() / half.to_radians().cos()).atan().to_degrees();
+        let node = |id: usize, lat: f64, lon: f64, tags: &str| format!("<node id=\"{id}\" lat=\"{lat:.7}\" lon=\"{lon:.7}\" {m}>{tags}</node>\n");
+        let probe = "<tag k=\"probe\" v=\"n\"/>";
+        let way = |id: usize, nds: &[usize], tags: &str| format!("<way id=\"{id}\" {m}>{}{tags}</way>\n", nds.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect::<String>());
+        let (mut nodes, mut ways, mut rels) = (String::new(), String::new(), String::new());
+        // per hemisphere: the long way, a square around the apex, a
+        // triangle with the long edge, a node in the bulge, one beyond
+        // the apex and one on it
+        for (k, s) in [(0usize, 1.0f64), (1, -1.0)] {
+            let n0 = 300_100 + 20 * k;
+            let (lo, ap) = (s * low, s * apex);
+            nodes += &node(n0, lo, 2.35 - half, "");
+            nodes += &node(n0 + 1, lo, 2.35 + half, "");
+            for (i, (dy, dx)) in [(-0.01, -0.01), (-0.01, 0.01), (0.01, 0.01), (0.01, -0.01)].into_iter().enumerate() {
+                nodes += &node(n0 + 2 + i, ap + dy, 2.35 + dx, "");
+            }
+            nodes += &node(n0 + 6, lo, 2.35 - half, "");
+            nodes += &node(n0 + 7, lo, 2.35 + half, "");
+            nodes += &node(n0 + 8, lo - s * 5.0, 2.35, "");
+            nodes += &node(n0 + 9, (lo + ap) / 2.0, 2.35, probe);
+            nodes += &node(n0 + 10, ap + s * 0.05, 2.35, probe);
+            nodes += &node(n0 + 11, ap, 2.35, probe);
+            ways += &way(4500 + k, &[n0, n0 + 1], "<tag k=\"probe\" v=\"w\"/>");
+            ways += &way(4502 + k, &[n0 + 2, n0 + 3, n0 + 4, n0 + 5, n0 + 2], "<tag k=\"area\" v=\"yes\"/>");
+            ways += &way(4504 + k, &[n0 + 6, n0 + 7, n0 + 8, n0 + 6], "<tag k=\"area\" v=\"yes\"/>");
+            rels += &relation(71 + k, &[("way", 4500 + k)], &[("route", "ferry")]);
+        }
+        let (db, dir) = osm_db("arcs", &grid_osm_with(&nodes, &ways, &rels));
+        let c = "[out:csv(::type,::id;false)];";
+        let mut answered = 0;
+        for (k, s) in [(0usize, 1.0f64), (1, -1.0)] {
+            let a = format!("{:.7},2.35", s * apex);
+            let (w, r, sq, tri, n0) = (4500 + k, 71 + k, 4502 + k, 4504 + k, 300_100 + 20 * k);
+            let (w, r, inside, on) = (format!("way\t{w}"), format!("relation\t{r}"), format!("node\t{}", n0 + 9), format!("node\t{}", n0 + 11));
+            for (q, want, exact) in [
+                (format!("way(around:100,{a})"), &w, false),
+                (format!("way[probe](around:100,{a})"), &w, true),
+                (format!("way[probe](around:10000,{a})"), &w, true),
+                (format!("rel(around:100,{a})"), &r, false),
+                (format!("rel[route=ferry](around:100,{a})"), &r, true),
+                (format!("rel[route=ferry](around:10000,{a})"), &r, true),
+                (format!("way({sq});way(area)[probe]"), &w, true),
+                (format!("way({sq});way(area)"), &w, false),
+                (format!("way({sq});rel(area)[route=ferry]"), &r, true),
+                (format!("way({sq});rel(area)"), &r, false),
+                (format!("way({w});node[probe](around:100)", w = 4500 + k), &on, true),
+                (format!("way({tri});node[probe](area)"), &inside, true),
+            ] {
+                let q = format!("{c}{q};out ids;");
+                let (plain, what) = both_ways(&db, &q);
+                answered += (what == Some("answered")) as usize;
+                if exact {
+                    assert_eq!(plain, [want.as_str()], "{q}");
+                } else {
+                    assert!(plain.contains(want), "{q}: {plain:?}");
+                }
+                for (near_off, all) in [(true, false), (false, true)] {
+                    NEAR_GEOMS_OFF.set(near_off);
+                    MEMBERS_ALL.set(all);
+                    let out = both_ways(&db, &q).0;
+                    NEAR_GEOMS_OFF.set(false);
+                    MEMBERS_ALL.set(false);
+                    assert_eq!(out, plain, "{q} {near_off} {all}");
+                }
+            }
+        }
+        // the relation candidate path answered over the Paris grid
+        assert!(answered > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `bb` and `center` from stored boxes give the output of the member
+    /// positions: ways with all nodes and with a missing one, an empty way,
+    /// relations with a missing node, a missing way, a way with a missing
+    /// node, one 200 degrees wide, one of a relation only; in each format,
+    /// and with a box after `out`.
+    #[test]
+    fn bb_and_center_from_stored_boxes() {
+        use super::super::print::BOXES_OFF;
+        let m = "{m}";
+        let nodes = format!("<node id=\"300001\" lat=\"10.0\" lon=\"-100.0\" {m}/>\n<node id=\"300002\" lat=\"10.0\" lon=\"100.0\" {m}/>\n");
+        let ways = format!("<way id=\"4200\" {m}></way>\n");
+        let rels = [
+            relation(51, &[("way", 1000), ("node", 466), ("way", 2005)], &[]),
+            relation(52, &[("way", 3001), ("node", 466)], &[]),
+            relation(53, &[("node", 999_998), ("way", 1001)], &[]),
+            relation(54, &[("way", 999_000), ("node", 1)], &[]),
+            relation(55, &[("node", 300_001), ("node", 300_002)], &[]),
+            relation(56, &[("relation", 51)], &[]),
+            relation(57, &[("way", 4200), ("node", 2)], &[]),
+            relation(58, &[("way", 3000), ("way", 1000), ("way", 1029)], &[]),
+        ]
+        .concat();
+        let (db, dir) = osm_db("boxes", &grid_osm_with(&nodes, &ways, &rels));
+        let sets = ["way(id:1000,1015,2005,3000,3001,4200)", "rel(id:51,52,53,54,55,56,57,58)", "(way(id:1000,3001);rel(id:51,55);)"];
+        let outs = ["out center;", "out bb;", "out center qt;", "out ids bb;", "out tags center;", "out skel center;", "out center(48.83,2.33,48.85,2.36);", "out bb(48.83,2.33,48.85,2.36);"];
+        let heads = ["", "[out:json];", "[out:csv(::type,::id,::lat,::lon;true)];"];
+        let mut boxed = 0;
+        for set in sets {
+            for out in outs {
+                for head in heads {
+                    let q = format!("{head}{set};{out}");
+                    let fast = output(&db, &q);
+                    BOXES_OFF.set(true);
+                    let full = output(&db, &q);
+                    BOXES_OFF.set(false);
+                    assert_eq!(fast, full, "{q}");
+                    boxed += fast.contains("center") as usize;
+                }
+            }
+        }
+        assert!(boxed > 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// The buildings of a city: more relations than the estimate of 50
     /// members each allows, with one small way each, inside a polygon or
     /// across its border. The candidates come from the index (key=value) or

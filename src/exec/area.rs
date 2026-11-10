@@ -60,21 +60,10 @@ fn bulge_rect(g: &[IC]) -> Rect {
     r
 }
 
-/// Bound on how far, in units of 10^-7 degrees, a great-circle edge whose
-/// ends lie at most `width` units apart in longitude reaches north or south
-/// of its ends (the way test of implicit areas follows such edges). From
-/// 180 degrees on, the edge may pass a pole or cross the antimeridian, and
-/// the bound is the whole range.
+/// `geo::arc_bulge` (the way test of implicit areas follows great-circle
+/// edges), plus 10^-4 degrees for rounding, as in `bulge_rect`.
 fn arc_bulge(width: u64) -> u32 {
-    if width >= 1_800_000_000 {
-        return u32::MAX;
-    }
-    // Between ends at latitudes up to p, tan(lat) <= tan(p) / cos(width / 2)
-    // = tan(p) / c; atan(tan(p) / c) - p is largest at tan(p) = sqrt(c).
-    let c = (width as f64 / 2e7).to_radians().cos().sqrt();
-    let d = ((1.0 / c).atan() - c.atan()).to_degrees();
-    // plus 10^-4 degrees for rounding, as in `bulge_rect`
-    (d * 1e7).ceil() as u32 + 1_000
+    crate::geo::arc_bulge(width).saturating_add(1_000)
 }
 
 fn tile_rect(tile: u32) -> Rect {
@@ -84,6 +73,12 @@ fn tile_rect(tile: u32) -> Rect {
 }
 
 impl AreaCtx {
+    /// Whether the clause holds closed ways (implicit areas), whose way test
+    /// follows great-circle edges (`Rect::arc_box`).
+    pub fn has_implicit(&self) -> bool {
+        !self.implicit_rects.is_empty()
+    }
+
     /// Cell ranges of the ways that may pass the way test (`db_way` or that
     /// of the implicit areas). A way is stored in the cell of the corner of
     /// its box at the level where the box is at most one cell wide and
@@ -450,44 +445,5 @@ impl<'s, W: Write> Engine<'s, W> {
             }
         }
         Ok(Set { nodes: self.f.by_ids::<Node>(&nids)?, ways: self.f.by_ids::<Way>(&wids)?, rels: self.f.by_ids::<Relation>(&rids)?, ..Default::default() })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The great-circle arcs between points at most a cell of a level apart
-    /// in longitude stay within `arc_bulge` of the latitudes of their ends.
-    #[test]
-    fn arc_bulge_bounds_great_circles() {
-        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
-        let mut next = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed >> 11) as f64 / (1u64 << 53) as f64
-        };
-        for level in 2..=MAX_LEVEL {
-            let width = 1u64 << (32 - level as u32);
-            let bulge = arc_bulge(width) as f64 / 1e7;
-            let mut most = 0.0f64;
-            for _ in 0..20_000 {
-                let d = next() * (width as f64 / 1e7).min(179.999);
-                // ends at about the same latitude half the time: an arc
-                // between them reaches past them
-                let la = next() * 170.0 - 85.0;
-                let lb = if next() < 0.5 { la + (next() - 0.5) * d * 0.01 } else { next() * 170.0 - 85.0 };
-                let lo = next() * (360.0 - d) - 180.0;
-                let (s, n) = crate::geo::Segment::new(la, lo, lb, lo + d).lat_extent();
-                let out = (la.min(lb) - s).max(n - la.max(lb));
-                most = most.max(out);
-                assert!(out <= bulge, "level {level}: {la} {lb} {d}: {out} > {bulge}");
-            }
-            // the bound is not far off (less the margin and rounding)
-            assert!(most >= 0.3 * (bulge - 1.001e-4), "level {level}: {most} {bulge}");
-        }
-        assert_eq!(arc_bulge(1 << 31), u32::MAX);
-        assert_eq!(arc_bulge(1_800_000_000), u32::MAX);
     }
 }

@@ -205,7 +205,7 @@ pass = S <= node.ilat <= N && ((W <= node.ilon <= E) || (E < W && (node.ilon >= 
 **Ways** (`Bbox_Filter::matches`, `bbox_filter.cc:106-125`) — on decoded f64 coordinates and the **unrounded** f64 bbox (so a node exactly on an edge given with >7 decimals can be in for the node test and out for the way test):
 - empty geometry → false; one coordinate → `contains(p)`;
 - else true iff some consecutive segment satisfies `intersects(a, b)`. A way crossing the box with no node inside matches.
-- Rust: a way also passes when one of its nodes passes the integer node test above, checked before the segments. A node on an edge can decode 1e-14 outside the f64 box (`ilat/1e7 - 91.0`), and an edge given with more than 7 decimals rounds onto the node in the integer test; in both cases the way passes as its node does. The live C++ returns these ways as well. Member nodes of relations use the integer node test too.
+- Rust: a way also passes when one of its nodes passes the integer node test above, checked before the segments. A node on an edge can decode 1e-14 outside the f64 box (`ilat/1e7 - 91.0`), and an edge given with more than 7 decimals rounds onto the node in the integer test; in both cases the way passes as its node does. The live C++ returns these ways as well. Member nodes of relations use the integer node test too. The ends of a segment taken across the antimeridian (below) do not count: C++ tests such a segment only by `intersects`, which for a box with `w <= e` passes only when the box holds the longitudes of both ends, so a way whose only segment runs from 175 to −170 does not match `(5,165,20,180)` although its node at 175 lies inside.
 ```
 contains(p): s <= p.lat <= n && (if e >= w { w <= p.lon <= e } else { p.lon >= w || p.lon <= e })   // geometry.cc:48
 intersects(from, to):                                                                                 // geometry.cc:60-112
@@ -272,6 +272,7 @@ Radius box of a source point (`add_coord`, `around.cc:698`): `dlat = r*360/4e7`;
 
 **Targets.** Node: `inside(p)`. Way: empty geometry → false; any vertex `inside` → true; else any consecutive segment `inside(a→b)`. Relation: some existing member node `inside`, or some existing member way matches as a way (`around.cc:268-311`).
 Candidates are first restricted to tiles derived from the sources' tiles expanded by the radius (`expand`, `around.cc:103-123`); this prefilter is conservative except near poles/antimeridian. A missing or empty source set → ∅.
+C++ restricts target ways and relations by their index (a coarse block that holds all their nodes), so a target whose segment reaches the radius only on its great circle, north or south of the box of its nodes, still matches (an edge 5 degrees long passes up to about 3 km off that box). Rust grows a stored box by the largest bulge its width allows (`Rect::arc_box`, `arc_ranges`) before it uses it.
 Standalone `node(around…)` = node test (`around.cc:969-982`).
 
 ---

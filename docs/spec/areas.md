@@ -468,6 +468,8 @@ as a derived-like object with no geometry and no metadata (print.cc:315-321):
   "inside" means that the west or east side parity is odd.
 - Implicit areas: the border tolerance is `|lat - y| < 0.5` (f64), and tile-column crossings use **great-circle** latitudes
   rounded with `ilat()`. Within a column, row crossings use truncated linear interpolation.
+  The ways and relations tested against implicit areas follow these great circles too, which may leave the box of their
+  nodes; Rust grows a stored box by the largest bulge its width allows (`Rect::arc_box`) before it compares it with the areas.
 - Midpoints use integer floor division (DB areas: tile-local; implicit: `(a+b)/2` on u64/i64).
 - The u32 wrap in `ordered()` (§4.3) and the u32/i32 casts listed above must be reproduced for bit-identical results.
 

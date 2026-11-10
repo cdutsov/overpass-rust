@@ -82,6 +82,17 @@ pub struct Rect {
 }
 
 impl Rect {
+    /// Whether the box of the nodes of a way (or of the members of a
+    /// relation) may hold an edge that the exact tests take across the
+    /// antimeridian, which leaves the box: ends more than 180 degrees apart
+    /// (C++ `Bbox_Double::intersects`, polygons and areas, the shorter
+    /// great circle of `around`), or exactly 180 apart, which the way test of
+    /// implicit areas takes over a pole. The box alone cannot decide such an
+    /// element.
+    pub fn may_cross(&self) -> bool {
+        !self.is_empty() && self.x1 - self.x0 >= 1_800_000_000
+    }
+
     pub const EMPTY: Rect = Rect { y0: u32::MAX, x0: u32::MAX, y1: 0, x1: 0 };
     pub const WORLD: Rect = Rect { y0: 0, x0: 0, y1: u32::MAX, x1: u32::MAX };
 
@@ -112,6 +123,42 @@ impl Rect {
     pub fn intersects(&self, o: &Rect) -> bool {
         !(o.y0 > self.y1 || o.y1 < self.y0 || o.x0 > self.x1 || o.x1 < self.x0)
     }
+
+    /// The box grown north and south by `m` units (an empty box stays empty).
+    pub fn grow_lat(&self, m: u32) -> Rect {
+        if self.is_empty() {
+            return *self;
+        }
+        Rect { y0: self.y0.saturating_sub(m), y1: self.y1.saturating_add(m), ..*self }
+    }
+
+    /// The box that holds the great-circle edges of an element whose nodes
+    /// (or members) have this box: grown north and south by the `arc_bulge`
+    /// of its width. `around` and the way test of implicit areas follow
+    /// these edges; the bbox test, polygons and DB areas take straight lines
+    /// between the nodes, which stay in the box.
+    pub fn arc_box(&self) -> Rect {
+        if self.is_empty() {
+            return *self;
+        }
+        self.grow_lat(arc_bulge((self.x1 - self.x0) as u64))
+    }
+}
+
+/// Bound on how far, in units of 10^-7 degrees, the great-circle arc between
+/// two points at most `width` units apart in longitude passes north or south
+/// of the latitudes of its ends, plus 2 units for rounding. From 180 degrees
+/// on, the arc may pass a pole or cross the antimeridian, and the bound is
+/// the whole range.
+pub fn arc_bulge(width: u64) -> u32 {
+    if width >= 1_800_000_000 {
+        return u32::MAX;
+    }
+    // Between ends at latitudes up to p, tan(lat) <= tan(p) / cos(width / 2)
+    // = tan(p) / c; atan(tan(p) / c) - p is largest at tan(p) = sqrt(c).
+    let c = (width as f64 / 2e7).to_radians().cos().sqrt();
+    let d = ((1.0 / c).atan() - c.atan()).to_degrees();
+    (d * 1e7).ceil() as u32 + 2
 }
 
 /// A geographic bbox as given in queries (south, west, north, east) in degrees.
@@ -618,9 +665,17 @@ impl Segment {
     }
 }
 
+/// Whether `bbox_intersects` takes the segment across the antimeridian:
+/// its ends lie more than 180 degrees of longitude apart.
+pub fn bbox_across(from: (f64, f64), to: (f64, f64)) -> bool {
+    (from.1 < 0.0 && to.1 - from.1 > 180.0) || (to.1 < 0.0 && from.1 - to.1 > 180.0)
+}
+
 /// C++ `Bbox_Double::intersects` for a segment, on unrounded doubles.
 /// Segments spanning more than 180 degrees of longitude are taken across
-/// the antimeridian.
+/// the antimeridian (`bbox_across`); such a segment meets a box that does
+/// not cross the antimeridian only when the box holds the longitudes of
+/// both ends.
 pub fn bbox_intersects(b: &BBox, from: (f64, f64), to: (f64, f64)) -> bool {
     let (s, n, w, e) = (b.south, b.north, b.west, b.east);
     let mut fl = from.1;
@@ -798,5 +853,62 @@ mod tests {
     fn distance_sane() {
         let d = great_circle_dist(0.0, 0.0, 0.0, 1.0);
         assert!((d - 111_111.1).abs() < 1.0, "{d}");
+    }
+
+    /// The great-circle arcs between points at most a cell of a level apart
+    /// in longitude stay within `arc_bulge` of the latitudes of their ends,
+    /// and ends at the latitude where the bulge is largest reach it.
+    #[test]
+    fn arc_bulge_bounds_great_circles() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for level in 2..=MAX_LEVEL {
+            let width = 1u64 << (32 - level as u32);
+            let bulge = arc_bulge(width) as f64 / 1e7;
+            for _ in 0..20_000 {
+                let d = next() * (width as f64 / 1e7).min(179.999);
+                // ends at about the same latitude half the time: an arc
+                // between them reaches past them
+                let la = next() * 170.0 - 85.0;
+                let lb = if next() < 0.5 { la + (next() - 0.5) * d * 0.01 } else { next() * 170.0 - 85.0 };
+                let lo = next() * (360.0 - d) - 180.0;
+                let (s, n) = Segment::new(la, lo, lb, lo + d).lat_extent();
+                let out = (la.min(lb) - s).max(n - la.max(lb));
+                assert!(out <= bulge, "level {level}: {la} {lb} {d}: {out} > {bulge}");
+            }
+            // the largest bulge: ends `width` apart at tan(p) = sqrt(c), north and south
+            let d = (width as f64 / 1e7).min(179.999);
+            let p = (d / 2.0).to_radians().cos().sqrt().atan().to_degrees();
+            for p in [p, -p] {
+                let (s, n) = Segment::new(p, -d / 2.0, p, d / 2.0).lat_extent();
+                let out = (p - s).max(n - p);
+                assert!(out <= bulge && out >= bulge - 3e-7, "level {level}: {p} {d}: {out} {bulge}");
+            }
+        }
+        assert_eq!(arc_bulge(0), 2);
+        assert_eq!(arc_bulge(1 << 31), u32::MAX);
+        assert_eq!(arc_bulge(1_800_000_000), u32::MAX);
+    }
+
+    /// `arc_box` holds the great-circle edges between the corners of a box,
+    /// and empty boxes stay empty.
+    #[test]
+    fn arc_box_holds_the_edges() {
+        for (la, lb, lo, d) in [(60.0, 60.0, 0.0, 20.0), (-60.0, -60.0, -20.0, 20.0), (48.4124, 48.4124, -7.65, 20.0), (10.0, 30.0, 100.0, 179.0), (0.0, 0.0, 5.0, 90.0), (45.0, 45.0, 1.0, 0.001)] {
+            let (a, b) = (Pt::from_ll(la, lo), Pt::from_ll(lb, lo + d));
+            let mut r = Rect::point(a);
+            r.extend(b);
+            let (s, n) = Segment::new(a.lat(), a.lon(), b.lat(), b.lon()).lat_extent();
+            let arc = r.arc_box();
+            assert!(arc.y0 as f64 <= (s + 91.0) * 1e7 && (n + 91.0) * 1e7 <= arc.y1 as f64, "{la} {lb} {lo} {d}");
+            assert_eq!((arc.x0, arc.x1), (r.x0, r.x1));
+        }
+        assert!(Rect::EMPTY.arc_box().is_empty());
+        assert!(Rect::EMPTY.grow_lat(5).is_empty());
     }
 }

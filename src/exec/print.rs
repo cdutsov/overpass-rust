@@ -3,14 +3,14 @@
 use super::Engine;
 use super::geom::way_vertices;
 use super::set::Set;
-use crate::geo::{BBox, Pt};
+use crate::geo::{BBox, Pt, Rect, ilon_of_x, lat_of, lon_of};
 use crate::model::*;
 use crate::output::flags::*;
 use crate::output::{GeomOut, Item, TagList, LatLon, MemberGeom, MetaOut, calc_bounds, combine_bounds};
 use crate::ql::ast::{GeomMode, Order, OutMode, OutOpts};
 use crate::store::Kind;
 use anyhow::Result;
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::io::Write;
 
 pub fn out_flags(o: &OutOpts) -> u32 {
@@ -116,6 +116,30 @@ fn way_geom(v: &[Option<Pt>], fl: u32, clip: Option<&BBox>) -> GeomOut {
     g
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Turns off `bb` and `center` from stored boxes.
+    pub(super) static BOXES_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `bb` and `center` from a stored box, which is the box of the positions
+/// `way_geom` and `rel_geom` take their minimum and maximum of: the same
+/// numbers, as the decoding of a coordinate keeps its order.
+fn box_geom(b: &Rect, fl: u32) -> GeomOut {
+    let mut g = GeomOut::default();
+    if b.is_empty() {
+        return g;
+    }
+    let b = (lat_of(b.y0), lon_of(ilon_of_x(b.x0)), lat_of(b.y1), lon_of(ilon_of_x(b.x1)));
+    if fl & BOUNDS != 0 {
+        g.bounds = Some(b);
+    }
+    if fl & CENTER != 0 {
+        g.center = Some(((b.0 + b.2) / 2.0, (b.1 + b.3) / 2.0));
+    }
+    g
+}
+
 /// Elements prepared and printed at a time.
 const WINDOW: usize = 8192;
 
@@ -186,9 +210,14 @@ impl<'s, W: Write> Engine<'s, W> {
         let ways: Vec<&Way> = ways.into_iter().take(remaining.min(usize::MAX as u64) as usize).collect();
         remaining -= ways.len() as u64;
         let need_geom = fl & (GEOMETRY | BOUNDS | CENTER) != 0;
+        // `bb` and `center` of a way with all its nodes come from its box
+        let boxes = fl & GEOMETRY == 0;
+        #[cfg(test)]
+        let boxes = boxes && !BOXES_OFF.get();
+        let by_box = |w: &Way| boxes && !w.missing && !w.bbox.is_empty();
         let mut metas = HashMap::default();
         for (i, win) in ways.chunks(WINDOW).enumerate() {
-            let mut verts = if need_geom { way_vertices(&self.f, win)? } else { HashMap::default() };
+            let mut verts = if need_geom { way_vertices(&self.f, &win.iter().copied().filter(|w| !by_box(w)).collect::<Vec<&Way>>())? } else { HashMap::default() };
             if want_meta && i % META_WINDOWS == 0 {
                 metas = self.f.meta(Kind::Way, &meta_span(&ways, i).iter().map(|w| w.id).collect::<Vec<_>>())?;
             }
@@ -198,6 +227,7 @@ impl<'s, W: Write> Engine<'s, W> {
                 .map(|w| {
                     let g = match verts.remove(&w.id) {
                         Some(v) => way_geom(&cpp_way_positions(v, w.idx), fl, clip),
+                        None if need_geom && by_box(w) => box_geom(&w.bbox, fl),
                         None => GeomOut::default(),
                     };
                     (Item::Way(w), g, metas.get(&w.id).map(|m| MetaOut { meta: *m, user: users.get(&m.uid).map(|s| s.as_str()) }))
@@ -220,11 +250,19 @@ impl<'s, W: Write> Engine<'s, W> {
                 metas = self.f.meta(Kind::Relation, &meta_span(&rels, i).iter().map(|r| r.id).collect::<Vec<_>>())?;
             }
             let users = self.users_for(win.iter().filter_map(|r| metas.get(&r.id)))?;
-            let (npos, wverts) = if need_geom { self.member_geometry(win)? } else { (HashMap::default(), HashMap::default()) };
+            let boxed = if need_geom && boxes && clip.is_none() { self.rels_by_box(win)? } else { HashSet::default() };
+            let open: Vec<&Relation> = win.iter().copied().filter(|r| !boxed.contains(&r.id)).collect();
+            let (npos, wverts) = if need_geom { self.member_geometry(&open)? } else { (HashMap::default(), HashMap::default()) };
             let list: Vec<(Item, GeomOut, Option<MetaOut>)> = win
                 .iter()
                 .map(|r| {
-                    let g = if need_geom { rel_geom(r, fl, clip, &npos, &wverts) } else { GeomOut::default() };
+                    let g = if boxed.contains(&r.id) {
+                        box_geom(&r.bbox, fl)
+                    } else if need_geom {
+                        rel_geom(r, fl, clip, &npos, &wverts)
+                    } else {
+                        GeomOut::default()
+                    };
                     (Item::Relation(r), g, metas.get(&r.id).map(|m| MetaOut { meta: *m, user: users.get(&m.uid).map(|s| s.as_str()) }))
                 })
                 .collect();
@@ -267,6 +305,45 @@ impl<'s, W: Write> Engine<'s, W> {
         Ok(out)
     }
 
+    /// The relations whose `bb` and `center` come from their stored box:
+    /// the box of their member nodes and the boxes of their member ways,
+    /// when every member node exists and every member way that exists has
+    /// all its nodes (missing ones enter `rel_geom` as the C++ sentinel),
+    /// and the box is less than 180 degrees wide (`rel_geom` treats wider
+    /// boxes as across the antimeridian). Member ways are read without their
+    /// nodes: a route has thousands of them.
+    fn rels_by_box(&self, rels: &[&Relation]) -> Result<HashSet<Id>> {
+        let mut nids = Vec::new();
+        let mut wids = Vec::new();
+        for r in rels {
+            for m in &r.members {
+                match m.mtype {
+                    ElemType::Node => nids.push(m.id),
+                    ElemType::Way => wids.push(m.id),
+                    _ => {}
+                }
+            }
+        }
+        nids.sort_unstable();
+        nids.dedup();
+        wids.sort_unstable();
+        wids.dedup();
+        let nodes: HashSet<Id> = self.f.snap.cells_of(Kind::Node, &nids)?.into_iter().map(|(id, _)| id).collect();
+        let broken: HashSet<Id> = self.f.ways_untagged(&wids)?.into_iter().filter(|w| w.missing).map(|w| w.id).collect();
+        Ok(rels
+            .iter()
+            .filter(|r| {
+                (r.bbox.is_empty() || r.bbox.x1 - r.bbox.x0 < 1_790_000_000)
+                    && r.members.iter().all(|m| match m.mtype {
+                        ElemType::Node => nodes.contains(&m.id),
+                        ElemType::Way => !broken.contains(&m.id),
+                        _ => true,
+                    })
+            })
+            .map(|r| r.id)
+            .collect())
+    }
+
     #[allow(clippy::type_complexity)]
     fn member_geometry(&self, rels: &[&Relation]) -> Result<(HashMap<Id, Pt>, HashMap<Id, (u32, Vec<Option<Pt>>)>)> {
         let mut nids = Vec::new();
@@ -282,7 +359,7 @@ impl<'s, W: Write> Engine<'s, W> {
         }
         wids.sort_unstable();
         wids.dedup();
-        let ways = self.f.by_ids::<Way>(&wids)?;
+        let ways = self.f.ways_untagged(&wids)?;
         let mut wverts = way_vertices(&self.f, &ways)?;
         let mut out = HashMap::default();
         for w in &ways {
