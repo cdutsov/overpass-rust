@@ -1433,6 +1433,17 @@ impl Parser {
                 }
                 bail!("line {}: parse error: Put quotation marks around \"{w}\" if it should be a constant and not a tag evaluation.", self.line())
             }
+            // `.a.count(nodes)`: C++ reads it as a set that never exists (count 0,
+            // keys empty), whatever `a` holds. The dot is a mistake for `a.count(nodes)`.
+            Tok::P(".") if matches!((self.peek_at(1), self.peek_at(2)), (Tok::Word(_), Tok::P("."))) => {
+                let Tok::Word(name) = self.peek_at(1).clone() else { unreachable!() };
+                let prop = match (self.peek_at(3), self.peek_at(4)) {
+                    (Tok::Word(w), Tok::P("(")) => format!("{w}(...)"),
+                    (Tok::Word(w), _) => w.clone(),
+                    _ => String::new(),
+                };
+                self.err(format!("Write {name}.{prop} instead of .{name}.{prop}; inside an expression a set name comes without the dot."))
+            }
             _ => self.err(format!("Operator expected, but \"{}\"found.", self.found())),
         }
     }
@@ -1543,6 +1554,21 @@ mod tests {
             StmtKind::Make { entries, .. } => assert!(matches!(entries[0].value, Some(Expr::Ternary(ref c, _, _)) if matches!(**c, Expr::Ternary(..)))),
             _ => panic!(),
         }
+    }
+
+    #[test]
+    fn set_name_with_a_dot_in_an_expression() {
+        for (q, want) in [
+            ("make x n=.a.count(nodes);", "line 1: parse error: Write a.count(...) instead of .a.count(...);"),
+            ("node(1)->.c;\nif (.c.count(deriveds) == 0) { make x n=1; }", "line 2: parse error: Write c.count(...) instead of .c.count(...);"),
+            ("make x n=.a.val;", "line 1: parse error: Write a.val instead of .a.val;"),
+        ] {
+            let e = parse(q).unwrap_err().to_string();
+            assert!(e.starts_with(want), "{q}: {e}");
+        }
+        // without the second dot the old message stands
+        assert!(parse("make x n=.a;").unwrap_err().to_string().contains("Operator expected, but \".\"found."));
+        assert!(parse("make x n=a.count(nodes);").is_ok());
     }
 
     #[test]

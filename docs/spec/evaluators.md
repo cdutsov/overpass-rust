@@ -203,6 +203,11 @@ task at all* (`aggregators.cc:80-91`). Consequences:
 `count(…)` on a missing set returns `"0"`; `<set>.<key>` returns `""`. An existing but empty set
 behaves normally (`u()` → `""`, `sum()` → `"0"`, …).
 
+A set name written with a dot inside an expression (`.a.count(nodes)`, `.a.val`) is taken by C++ as
+such a missing set: `count` gives `"0"` and a key `""`, whatever `a` holds, so `if (.a.count(nodes) == 0)`
+always takes its first branch. Rust rejects it: `Write a.count(...) instead of .a.count(...); inside an
+expression a set name comes without the dot.`
+
 ### 2.6 Element iteration order
 
 Every place that iterates a set (aggregators, `convert`, `(if:)`, `for`, `set()`, `gcat`) visits:
