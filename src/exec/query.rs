@@ -492,26 +492,26 @@ impl<'s, W: Write> Engine<'s, W> {
                     self.at_tagged::<T>(plan, pairs, &read)?
                 } else if let Some(r) = &ranges {
                     // A key or value-regex filter over a large region (a
-                    // country) reads its tag index instead of every chunk.
+                    // country) reads its tag index instead of every chunk
+                    // (which one: `index_candidates`).
                     // In a smaller region, an anchored regex reads the
                     // index entries of its prefixes in the region, unless
                     // that takes more steps than the region has chunks.
-                    let indexed = plan.tags.iter().find(|t| matches!(t, TagFilter::HasKey(_) | TagFilter::Regex { neg: false, .. }));
+                    let indexed = plan.tags.iter().any(|t| matches!(t, TagFilter::HasKey(_) | TagFilter::Regex { neg: false, .. }));
                     let anchored = plan.tags.iter().find(|t| anchored(t));
-                    let pairs = match indexed {
-                        Some(t) => {
-                            let (region, total) = self.f.chunk_share(kind, r)?;
-                            if total > 0 && region > (total as f64 * 0.1).ceil() as usize {
-                                Some((self.f.tag_candidates_in(kind, t, r)?, t))
-                            } else if let Some(a) = anchored {
-                                #[cfg(test)]
-                                let region = tests::INDEX_STEPS.get().unwrap_or(region);
-                                self.f.tag_candidates_bounded(kind, a, Some(r), region)?.map(|p| (p, a))
-                            } else {
-                                None
-                            }
+                    let pairs = if indexed {
+                        let (region, total) = self.f.chunk_share(kind, r)?;
+                        if total > 0 && region > (total as f64 * 0.1).ceil() as usize {
+                            self.index_candidates(kind, plan, Some(r))?
+                        } else if let Some(a) = anchored {
+                            #[cfg(test)]
+                            let region = tests::INDEX_STEPS.get().unwrap_or(region);
+                            self.f.tag_candidates_bounded(kind, a, Some(r), region)?.map(|p| (p, a))
+                        } else {
+                            None
                         }
-                        None => None,
+                    } else {
+                        None
                     };
                     #[cfg(test)]
                     tests::INDEXED.set(pairs.is_some());
@@ -522,8 +522,7 @@ impl<'s, W: Write> Engine<'s, W> {
                         }
                         None => self.f.in_ranges::<T>(r, |e| plan.tags.iter().all(|t| t.matches(e.tags_of())))?,
                     }
-                } else if let Some(t) = plan.tags.iter().find(|t| anchored(t)).or_else(|| plan.tags.iter().find(|t| t.is_positive())) {
-                    let pairs = self.f.tag_candidates(kind, t, None)?;
+                } else if let Some((pairs, t)) = self.index_candidates(kind, plan, None)? {
                     self.check()?;
                     self.at_tagged::<T>(plan, pairs, &[t])?
                 } else {
@@ -1002,6 +1001,47 @@ impl<'s, W: Write> Engine<'s, W> {
         Ok(Some(cands))
     }
 
+    /// Candidates from the tag index for a query without `key=value`
+    /// filters on the planet, or in a large region (`within`), and the
+    /// filter they come from: on the planet an anchored regex, else the
+    /// first positive filter (in a region the first `[key]` filter or value
+    /// regex). A `[key]` filter lists every element with the key, each then
+    /// decoded from its chunk; a regex reads every index entry of its key
+    /// and decodes the elements with a matching value. So a first `[key]`
+    /// filter with more than `MANY` candidates gives way to a regex of the
+    /// query with at most `MANY` (`["name"~"."]` lists every name).
+    /// `node["place"]["name"~"Springfield"]`: 7.7 x 10^6 place
+    /// nodes in 1.8 x 10^6 chunks (26 GB, 9 to 33 s), the node names 1.5 s;
+    /// in the box of the US: 2.7 x 10^5 place nodes 0.6 s, the names 1.7 s.
+    fn index_candidates<'p>(&self, kind: Kind, plan: &'p Plan, within: Option<&[CodeRange]>) -> Result<Option<(Vec<(Cell, Id)>, &'p TagFilter)>> {
+        const MANY: usize = 500_000;
+        #[cfg(test)]
+        let many = tests::MANY.get().unwrap_or(MANY);
+        #[cfg(not(test))]
+        let many = MANY;
+        let planet = within.is_none();
+        let first = if planet {
+            plan.tags.iter().find(|t| anchored(t)).or_else(|| plan.tags.iter().find(|t| t.is_positive()))
+        } else {
+            plan.tags.iter().find(|t| matches!(t, TagFilter::HasKey(_) | TagFilter::Regex { neg: false, .. }))
+        };
+        let Some(first) = first else { return Ok(None) };
+        let regex = plan.tags.iter().find(|t| matches!(t, TagFilter::Regex { neg: false, .. }) || planet && matches!(t, TagFilter::KeyRegex { .. }));
+        let (pairs, t) = match (first, regex) {
+            (TagFilter::HasKey(_), Some(re)) => match self.f.tag_candidates_in(kind, first, within, many)? {
+                Some(pairs) => (pairs, first),
+                None => match self.f.tag_candidates_in(kind, re, within, many)? {
+                    Some(pairs) => (pairs, re),
+                    None => (self.f.tag_candidates_in(kind, first, within, usize::MAX)?.unwrap_or_default(), first),
+                },
+            },
+            _ => (self.f.tag_candidates_in(kind, first, within, usize::MAX)?.unwrap_or_default(), first),
+        };
+        #[cfg(test)]
+        tests::INDEX_FILTER.set(Some(format!("{t:?}")));
+        Ok(Some((pairs, t)))
+    }
+
     /// The filter to read the tag index for, when there is a `key=value`
     /// filter: the `key=value` filter or anchored regex (`anchored`) with
     /// the fewest index entries. All tag filters are checked on the
@@ -1353,6 +1393,11 @@ mod tests {
         /// How many tag filters the last decoding of index candidates
         /// tested before decoding an element whole (`at_tagged`).
         pub(super) static TESTED_FIRST: Cell<usize> = const { Cell::new(0) };
+        /// The filter whose candidates `index_candidates` read last.
+        pub(super) static INDEX_FILTER: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+        /// Candidates of a first `[key]` filter over which
+        /// `index_candidates` reads a regex, in place of 500,000.
+        pub(super) static MANY: Cell<Option<usize>> = const { Cell::new(None) };
     }
 
     /// A 30 x 30 grid of nodes 0.002 degrees apart in Paris (node 466 at
@@ -1914,6 +1959,102 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// Without a `key=value` filter, on the planet or over a large region,
+    /// a first `[key]` filter with many candidates (in the region) gives
+    /// way to a regex, and the answers are those of reading the key.
+    #[test]
+    fn many_keyed_elements_yield_to_a_regex() {
+        let (db, dir) = tagged_grid("index-candidates");
+        let c = "[out:csv(::type,::id;false)];";
+        // 400 named nodes in Paris, 30 with a place; 20,000 with a note at
+        // 10 to 11 N, half of them south of 10.495 N
+        let cases = [
+            ("node[\"name\"][\"place\"~\"town\"];", 100, "Regex", 20),
+            ("node[\"name\"][\"place\"~\"town\"];", 400, "HasKey(\"name\")", 20),
+            ("node[\"place\"~\"town\"][\"name\"];", 100, "Regex", 20),
+            // 200 names with "lpha": over the limit the key, under it the regex
+            ("node[\"name\"][\"place\"][\"name\"~\"lpha\"];", 100, "HasKey(\"name\")", 20),
+            ("node[\"name\"][\"place\"][\"name\"~\"lpha\"];", 250, "Regex", 20),
+            ("node[\"name\"][\"name\"~\"a\",i];", 100, "HasKey(\"name\")", 400),
+            ("node[\"name\"][~\"^pla\"~\"village\"];", 100, "KeyRegex", 10),
+            ("node[\"name\"][\"place\"!~\".\"];", 100, "HasKey(\"name\")", 370),
+            ("node[\"name\"][\"place\"~\"town\"](-80,-170,80,170);", 100, "Regex", 20),
+            ("node[\"name\"][\"place\"~\"town\"](-80,-170,80,170);", 400, "HasKey(\"name\")", 20),
+            ("node[\"note\"][\"note\"~\"number 12\"](9,9,10.495,13);", 5_000, "Regex", 111),
+            ("node[\"note\"][\"note\"~\"number 12\"](9,9,10.495,13);", 15_000, "HasKey(\"note\")", 111),
+        ];
+        for (q, many, chosen, n) in cases {
+            let q = format!("{c}{q}out ids;");
+            MANY.set(Some(1_000_000));
+            let keyed = output(&db, &q);
+            MANY.set(Some(many));
+            INDEX_FILTER.set(None);
+            INDEXED.set(false);
+            let out = output(&db, &q);
+            MANY.set(None);
+            let t = INDEX_FILTER.take().unwrap_or_default();
+            assert!(t.starts_with(chosen), "{q} {many}: {t}");
+            assert_eq!(out, keyed, "{q}");
+            assert_eq!(out.lines().count(), n, "{q}");
+            assert_eq!(INDEXED.get(), q.contains("(9,9") || q.contains("(-80"), "{q}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The tag index scan on several threads gives the candidates of the
+    /// scan on one thread: regexes (with and without prefixes, any case),
+    /// keys, with ranges, and filtered by ranges afterwards.
+    #[test]
+    fn parallel_tag_scan_gives_the_same_candidates() {
+        use super::super::fetch::PAR_SCAN_VALUES;
+        let (db, dir) = tagged_grid("parscan");
+        let snap = db.snapshot().unwrap();
+        let f = Fetch::new(&snap);
+        let rects = BBox { south: 10.3, west: 10.2, north: 11.05, east: 11.4 }.rects();
+        let ranges = ranges_for(Kind::Node, &rects);
+        let re = |s: &str, ci: bool| TagFilter::from_ast(&Filter::Regex { key: "note".into(), re: s.into(), ci, neg: false }).unwrap().unwrap();
+        let filters = [re("number 1", false), re("NUMBER 1[0-9]*7$", true), re("^far away from the grid, number 1(2|5)", false), re("^(far|near)", false), re("x", false), TagFilter::HasKey("note".into())];
+        for t in &filters {
+            for r in [None, Some(&ranges[..])] {
+                PAR_SCAN_VALUES.set(Some(usize::MAX));
+                let one = f.tag_candidates(Kind::Node, t, r).unwrap();
+                let one_in = f.tag_candidates_in(Kind::Node, t, Some(&ranges), usize::MAX).unwrap().unwrap();
+                for limit in [0, 1, 100, usize::MAX] {
+                    PAR_SCAN_VALUES.set(Some(limit));
+                    assert_eq!(f.tag_candidates(Kind::Node, t, r).unwrap(), one, "{t:?} {}", r.is_some());
+                    assert_eq!(f.tag_candidates_in(Kind::Node, t, Some(&ranges), usize::MAX).unwrap().unwrap(), one_in, "{t:?}");
+                    // a limit of as many pairs keeps them, one fewer gives none
+                    assert_eq!(f.tag_candidates_in(Kind::Node, t, Some(&ranges), one_in.len()).unwrap(), Some(one_in.clone()), "{t:?}");
+                    if !one_in.is_empty() {
+                        assert_eq!(f.tag_candidates_in(Kind::Node, t, Some(&ranges), one_in.len() - 1).unwrap(), None, "{t:?}");
+                    }
+                }
+            }
+        }
+        PAR_SCAN_VALUES.set(None);
+        // the scans above ran on threads
+        assert!(super::super::fetch::PAR_SCANS.get() >= filters.len() * 2 * 3 * 2, "{}", super::super::fetch::PAR_SCANS.get());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A snapshot opens a second transaction on its data only while no
+    /// commit came in between.
+    #[test]
+    fn sibling_snapshot_sees_the_same_data() {
+        let (db, dir) = tagged_grid("sibling");
+        let snap = db.snapshot().unwrap();
+        assert!(snap.sibling().unwrap().is_some());
+        db.write().unwrap().commit().unwrap();
+        assert!(snap.sibling().unwrap().is_none());
+        let now = db.snapshot().unwrap();
+        assert!(now.sibling().unwrap().is_some());
+        db.write().unwrap().commit().unwrap();
+        assert!(now.sibling().unwrap().is_none());
+        drop((snap, now));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// An `area` query with several key=value filters reads the index
     /// entries of the one with the fewest, in any order of the filters.
     #[test]

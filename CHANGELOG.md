@@ -3,6 +3,20 @@
 Changes of overpass-rust, newest first. "Overpass API" is the C++ server
 (0.7.62) whose answers overpass-rust reproduces.
 
+## 0.2.1 (2026-11-11)
+
+Faster
+- A statement without a `key=value` filter, on the planet or over a large
+  region, whose first filter is a key alone (`["place"]`) and which also has a
+  regular expression, takes its candidates from the regular expression when
+  the key has more than 500,000 elements there and the expression at most
+  500,000. `node["place"]["name"~"Springfield"]` on the planet: 0.7 s (1.9 s
+  with the index on disk), 52 s before; `way["highway"]["name"~"..."]`: under
+  2 s, over 100 s before.
+- A regular expression or a key alone on a key with many values reads the tag
+  index on 8 threads: the node names in 1.9 s from disk, 16 s before;
+  `nwr["website"~"...",i]` in 0.2 s, 0.6 s before.
+
 ## 0.2.0 (2026-11-11)
 
 Fixed: answers that differed from Overpass API

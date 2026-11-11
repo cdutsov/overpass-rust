@@ -17,6 +17,26 @@ use std::cell::RefCell;
 /// Chunks below this count are decoded on the calling thread.
 const PAR_THRESHOLD: usize = 8;
 
+/// Threads of a tag index scan over a key with many values: they mostly
+/// wait for the disk.
+const SCAN_THREADS: usize = 8;
+
+/// Values of a key above which its tag index scan runs on `SCAN_THREADS`
+/// threads (`tag_candidates_par`).
+fn par_scan_values() -> usize {
+    #[cfg(test)]
+    if let Some(n) = PAR_SCAN_VALUES.get() {
+        return n;
+    }
+    20_000
+}
+
+#[cfg(test)]
+thread_local! {
+    pub static PAR_SCAN_VALUES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    pub static PAR_SCANS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Where `Fetch::bounded` reads: the elements stored in cell ranges, or
 /// those at known (cell, id) positions.
 pub enum Source<'a> {
@@ -532,6 +552,12 @@ impl<'s> Fetch<'s> {
     /// restricts the cells. Entries with truncated keys or values are always
     /// included; callers verify candidates against the element.
     pub fn tag_candidates(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>) -> Result<Vec<(Cell, Id)>> {
+        if let Some(mut out) = self.tag_candidates_par(kind, f, ranges, |_| true, usize::MAX)? {
+            self.limits.check()?;
+            out.sort_unstable();
+            out.dedup();
+            return Ok(out);
+        }
         let mut out = Vec::new();
         let mut n = 0u32;
         self.scan_candidates(kind, f, ranges, || true, |cell, ids| {
@@ -630,23 +656,79 @@ impl<'s> Fetch<'s> {
     }
 
     /// Candidates from the tag index without ranges, kept when their cell
-    /// lies in `ranges` (a filter, not a seek per range and value).
-    pub fn tag_candidates_in(&self, kind: Kind, f: &TagFilter, ranges: &[CodeRange]) -> Result<Vec<(Cell, Id)>> {
+    /// lies in `within` (a filter, not a seek per range and value), or None
+    /// once more than `max` are kept. On several threads where the key has
+    /// many values (`tag_candidates_par`).
+    pub fn tag_candidates_in(&self, kind: Kind, f: &TagFilter, within: Option<&[CodeRange]>, max: usize) -> Result<Option<Vec<(Cell, Id)>>> {
+        if let Some(mut out) = self.tag_candidates_par(kind, f, None, |cell| within.is_none_or(|r| cell_in_ranges(cell, r)), max)? {
+            if out.len() > max {
+                return Ok(None);
+            }
+            self.limits.check()?;
+            out.sort_unstable();
+            out.dedup();
+            return Ok(Some(out));
+        }
         let mut out = Vec::new();
         let mut n = 0u32;
+        let mut over = false;
         self.scan_candidates(kind, f, None, || true, |cell, ids| {
             n = n.wrapping_add(1);
             if n % 4096 == 0 {
                 self.limits.check()?;
             }
-            if cell_in_ranges(cell, ranges) {
+            if within.is_none_or(|r| cell_in_ranges(cell, r)) {
                 out.extend(ids.iter().map(|id| (cell, *id)));
+                if out.len() > max {
+                    over = true;
+                    return Ok(Scan::Stop);
+                }
             }
             Ok(Scan::Next)
         })?;
+        if over {
+            return Ok(None);
+        }
         self.limits.check()?;
         out.sort_unstable();
         out.dedup();
+        Ok(Some(out))
+    }
+
+    /// `tag_candidates` on several threads (`Snapshot::scan_tags_par`) for
+    /// a regex or `[key]` filter on a key with more than `par_scan_values()`
+    /// values: such a scan reads many index pages, mostly from disk, and a
+    /// thread waits for each read (`nwr["website"~"example",i]` reads
+    /// 10^5 pages). Counting the values first reads the start of the scan,
+    /// which the threads then find in memory. None: the filter is of
+    /// another kind, the key has fewer values, or the threads cannot read
+    /// the same snapshot; the caller scans on its own thread.
+    /// The threads stop once more than `max` pairs are kept, and then
+    /// return more than `max`.
+    fn tag_candidates_par(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>, keep: impl Fn(Cell) -> bool + Sync, max: usize) -> Result<Option<Vec<(Cell, Id)>>> {
+        let (key, re, prefixes) = match f {
+            TagFilter::HasKey(key) => (key, None, None),
+            TagFilter::Regex { key, re, neg: false, prefixes, .. } => (key, Some(re), prefixes.as_deref()),
+            _ => return Ok(None),
+        };
+        let mut k = Vec::new();
+        crate::store::index_part(key, &mut k);
+        let limit = par_scan_values();
+        let mut n = 0usize;
+        let r = self.snap.scan_tags_matching(kind, &k, prefixes, ranges, |_| {
+            n += 1;
+            if n > limit { Scan::Stop } else { Scan::SkipValue }
+        }, |_, _, _| Ok(Scan::Next))?;
+        if r != Scan::Stop {
+            return Ok(None);
+        }
+        self.limits.check()?;
+        let limits = &self.limits;
+        // Values failing the regex are skipped as a whole (`scan_candidates`).
+        let accept = |val: &[u8]| re.is_none_or(|re| val.contains(&1) || std::str::from_utf8(val).is_ok_and(|s| re.is_match(s)));
+        let out = self.snap.scan_tags_par(kind, &k, prefixes, ranges, SCAN_THREADS, max, || limits.expired(), accept, keep)?;
+        #[cfg(test)]
+        PAR_SCANS.set(PAR_SCANS.get() + out.is_some() as usize);
         Ok(out)
     }
 

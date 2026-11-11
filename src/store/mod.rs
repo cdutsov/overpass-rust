@@ -34,6 +34,9 @@ const FORMAT: &str = "2";
 
 /// `info` key present while a bulk import runs.
 pub const IMPORT_RUNNING: &str = "import_running";
+/// Info key counting the commits: two read transactions with the same
+/// count see the same data (`Snapshot::sibling`).
+const COMMITS: &str = "commits";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Kind {
@@ -86,6 +89,8 @@ pub struct Db {
     info: Database<Bytes, Bytes>,
     /// `block_tile(4) area_id(4)` -> polylines of that area in that tile
     area_blocks: Database<Bytes, Bytes>,
+    /// Read transactions `Snapshot::scan_tags_par` may hold at once.
+    sibling_cap: usize,
 }
 
 pub type ChunkKey = [u8; 13];
@@ -137,6 +142,67 @@ pub fn tag_prefix(k: &str, v: &str) -> Vec<u8> {
 
 fn memchr0(b: &[u8]) -> Option<usize> {
     b.iter().position(|&c| c == 0)
+}
+
+/// Read transactions `scan_tags_par` holds besides the snapshots of the
+/// queries, over all queries at once: the reader table of LMDB has 126
+/// slots, and each query and the updates need one. Fewer when the server
+/// leaves fewer slots free (`Db::open_read`).
+const SIBLING_CAP: usize = 64;
+static SIBLINGS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The values a thread of `scan_tags_par` walks: from `at` (the value it
+/// is in) up to `hi` (exclusive).
+#[derive(Default)]
+struct Part {
+    at: Vec<u8>,
+    hi: Vec<u8>,
+}
+
+/// The smallest byte string after every string starting with `p` (which
+/// is not all 0xFF: a key prefix holds the 0 after the key).
+fn successor(p: &[u8]) -> Vec<u8> {
+    let mut s = p.to_vec();
+    while s.last() == Some(&0xFF) {
+        s.pop();
+    }
+    if let Some(b) = s.last_mut() {
+        *b += 1;
+    }
+    s
+}
+
+/// The first 8 bytes of `s` from `n` on as a number (zeros after the end).
+fn word_at(s: &[u8], n: usize) -> u64 {
+    let mut w = [0u8; 8];
+    for (i, b) in s.iter().skip(n).take(8).enumerate() {
+        w[i] = *b;
+    }
+    u64::from_be_bytes(w)
+}
+
+/// A byte string about halfway between `a` and `b` in byte order, strictly
+/// between them; None when `a` is not below `b` or they are too close.
+fn midpoint(a: &[u8], b: &[u8]) -> Option<Vec<u8>> {
+    if a >= b {
+        return None;
+    }
+    let n = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    let (x, y) = (word_at(a, n), word_at(b, n));
+    if y <= x + 1 {
+        return None;
+    }
+    let mut m = a[..n].to_vec();
+    m.extend_from_slice(&(x + (y - x) / 2).to_be_bytes());
+    Some(m)
+}
+
+/// Rough size of the byte order interval from `a` to `b` (to pick the
+/// part to split), None when it cannot be split.
+fn split_width(a: &[u8], b: &[u8]) -> Option<f64> {
+    midpoint(a, b)?;
+    let n = a.iter().zip(b).take_while(|(x, y)| x == y).count();
+    Some((word_at(b, n) - word_at(a, n)) as f64 * 256f64.powi(-(n as i32)))
 }
 
 /// What a tag index scan does after an entry, or with a value it is
@@ -208,7 +274,7 @@ impl Db {
             None => info.put(&mut wtxn, "format".as_bytes(), FORMAT.as_bytes())?,
         }
         wtxn.commit()?;
-        Ok(Db { env, kinds, relmembers, pending, users, info, area_blocks })
+        Ok(Db { env, kinds, relmembers, pending, users, info, area_blocks, sibling_cap: SIBLING_CAP })
     }
 
     /// Open an existing database for queries, without taking the writer
@@ -242,7 +308,9 @@ impl Db {
         }
         let (relmembers, pending, users, area_blocks) = (open("relmembers")?, open("pending")?, open("users")?, open("area_blocks")?);
         rtxn.commit()?;
-        Ok(Db { env, kinds, relmembers, pending, users, info, area_blocks })
+        // The slots beyond the readers asked for, for parallel scans.
+        let sibling_cap = ((readers.max(126) - readers) as usize).min(SIBLING_CAP);
+        Ok(Db { env, kinds, relmembers, pending, users, info, area_blocks, sibling_cap })
     }
 
     fn k(&self, kind: Kind) -> &KindDbs {
@@ -452,6 +520,14 @@ pub struct Snapshot<'e> {
 }
 
 impl<'e> Snapshot<'e> {
+    /// A second read transaction on the same data, for a scan on another
+    /// thread (a transaction is used by one thread at a time). None when a
+    /// commit came in between, or no reader slot is free.
+    pub fn sibling(&self) -> Result<Option<Snapshot<'e>>> {
+        let Ok(s) = self.db.snapshot() else { return Ok(None) };
+        Ok((s.info(COMMITS)? == self.info(COMMITS)?).then_some(s))
+    }
+
     pub fn info(&self, key: &str) -> Result<Option<String>> {
         Ok(self.db.info.get(&self.txn, key.as_bytes())?.map(|v| String::from_utf8_lossy(v).into_owned()))
     }
@@ -567,12 +643,182 @@ impl<'e> Snapshot<'e> {
         }
     }
 
+    /// The (cell, id) pairs of the values of `key` (with one of `prefixes`)
+    /// that pass `accept`, in cells in `ranges` that pass `keep`, read on
+    /// `threads` threads: the pages of a key with many values are mostly
+    /// read from disk, one at a time per thread. Each thread has its own
+    /// read transaction on this snapshot (fewer threads when `SIBLING_CAP`
+    /// is reached). The prefixes are the first parts;
+    /// a thread without one takes the upper half of what another thread
+    /// has left (by byte order of the values). The pairs are in no
+    /// particular order. None when another transaction cannot be opened on
+    /// the same data. `stop` ends the scan early (out of time); so does a
+    /// count of pairs over `max`, and then more than `max` are returned.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scan_tags_par(&self, kind: Kind, key: &[u8], prefixes: Option<&[Vec<u8>]>, ranges: Option<&[CodeRange]>, threads: usize, max: usize, stop: impl Fn() -> bool + Sync, accept: impl Fn(&[u8]) -> bool + Sync, keep: impl Fn(Cell) -> bool + Sync) -> Result<Option<Vec<(Cell, Id)>>> {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::SeqCst};
+        // Extra transactions within the cap (all queries together).
+        let cap = self.db.sibling_cap;
+        let want = threads.max(1) - 1;
+        let held = SIBLINGS.try_update(SeqCst, SeqCst, |n| Some(n + want.min(cap.saturating_sub(n)))).unwrap_or(cap);
+        let got = want.min(cap.saturating_sub(held));
+        struct Release(usize);
+        impl Drop for Release {
+            fn drop(&mut self) {
+                SIBLINGS.fetch_sub(self.0, SeqCst);
+            }
+        }
+        let _release = Release(got);
+        if got == 0 {
+            return Ok(None);
+        }
+        let mut snaps = Vec::new();
+        for _ in 0..got {
+            match self.sibling()? {
+                Some(s) => snaps.push(s),
+                None => return Ok(None),
+            }
+        }
+        let vstart = key.len() + 1;
+        let empty = [Vec::new()];
+        let parts: Vec<(Vec<u8>, Vec<u8>)> = prefixes.unwrap_or(&empty).iter().map(|p| {
+            let within = [key, &[0], p].concat();
+            let hi = successor(&within);
+            (within, hi)
+        }).collect();
+        let todo = Mutex::new(parts);
+        let running: Vec<Mutex<Part>> = (0..=got).map(|_| Mutex::new(Part::default())).collect();
+        // Threads holding a part (in `running` or about to put it there).
+        let busy = AtomicUsize::new(0);
+        // Pairs kept by all threads; past `max` every thread stops.
+        let kept = AtomicUsize::new(0);
+        let over = AtomicBool::new(false);
+        let halt = || over.load(SeqCst) || stop();
+        // Next part for thread `i`: a prefix not started, else the upper half
+        // of the widest part another thread is in. None when every part is
+        // done; a thread waits while others still work, as their parts may
+        // be split.
+        let take = |i: usize| -> Option<(Vec<u8>, Vec<u8>)> {
+            let mut wait = 50;
+            loop {
+                {
+                    let mut t = todo.lock().unwrap();
+                    if let Some(p) = t.pop() {
+                        busy.fetch_add(1, SeqCst);
+                        return Some(p);
+                    }
+                }
+                let widest = (0..running.len()).filter(|&j| j != i).filter_map(|j| {
+                    let g = running[j].lock().unwrap();
+                    Some((split_width(&g.at, &g.hi)?, j))
+                }).max_by(|a, b| a.0.total_cmp(&b.0));
+                if let Some((_, j)) = widest {
+                    let mut g = running[j].lock().unwrap();
+                    if let Some(mid) = midpoint(&g.at, &g.hi) {
+                        let hi = std::mem::replace(&mut g.hi, mid.clone());
+                        busy.fetch_add(1, SeqCst);
+                        return Some((mid, hi));
+                    }
+                    continue;
+                }
+                if busy.load(SeqCst) == 0 || halt() {
+                    return None;
+                }
+                // A walker cannot be split while it reads a value with
+                // many entries (highway=residential).
+                std::thread::sleep(std::time::Duration::from_micros(wait));
+                wait = (wait * 2).min(5000);
+            }
+        };
+        // Gives a part back when its walk ends, also by an error or a
+        // panic, so that no thread waits for it to be split.
+        struct Done<'a>(&'a Mutex<Part>, &'a AtomicUsize);
+        impl Drop for Done<'_> {
+            fn drop(&mut self) {
+                *self.0.lock().unwrap_or_else(|e| e.into_inner()) = Part::default();
+                self.1.fetch_sub(1, SeqCst);
+            }
+        }
+        let work = |i: usize, snap: &Snapshot<'e>| -> Result<Vec<(Cell, Id)>> {
+            let mut out = Vec::new();
+            let n = std::cell::Cell::new(0u32);
+            let stopped = std::cell::Cell::new(false);
+            // Values and entries visited; every 4096th checks `halt`.
+            let tick = || {
+                n.set(n.get().wrapping_add(1));
+                if n.get() % 4096 == 0 && halt() {
+                    stopped.set(true);
+                }
+                stopped.get()
+            };
+            while let Some((lo, hi)) = take(i) {
+                let done = Done(&running[i], &busy);
+                {
+                    let mut g = running[i].lock().unwrap();
+                    g.at.clone_from(&lo);
+                    g.hi = hi;
+                }
+                let within: Vec<u8> = lo[..vstart].to_vec();
+                let accept = |val: &[u8]| match (tick(), accept(val)) {
+                    (true, _) => Scan::Stop,
+                    (false, true) => Scan::Next,
+                    (false, false) => Scan::SkipValue,
+                };
+                let r = snap.walk_values(kind, vstart, &within, &lo, Some(&running[i]), ranges, accept, &mut |_, cell, ids| {
+                    if tick() {
+                        return Ok(Scan::Stop);
+                    }
+                    if keep(cell) {
+                        out.extend(ids.iter().map(|id| (cell, *id)));
+                        if kept.fetch_add(ids.len(), SeqCst) + ids.len() > max {
+                            over.store(true, SeqCst);
+                            stopped.set(true);
+                            return Ok(Scan::Stop);
+                        }
+                    }
+                    Ok(Scan::Next)
+                });
+                // Nothing left here to split off.
+                drop(done);
+                r?;
+                if stopped.get() {
+                    break;
+                }
+            }
+            Ok(out)
+        };
+        let results: Vec<Result<Vec<(Cell, Id)>>> = std::thread::scope(|s| {
+            let work = &work;
+            // A thread the system refuses leaves the parts to the others.
+            let handles: Vec<_> = snaps.into_iter().enumerate().filter_map(|(i, snap)| std::thread::Builder::new().spawn_scoped(s, move || work(i + 1, &snap)).ok()).collect();
+            let mut res = vec![work(0, self)];
+            res.extend(handles.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(anyhow::anyhow!("tag index scan thread failed")))));
+            res
+        });
+        let mut out = Vec::new();
+        for r in results {
+            out.extend(r?);
+        }
+        Ok(Some(out))
+    }
+
     /// Walk the values of `key` that start with `prefix` in one pass of a
     /// cursor: each value is tested once with `accept` (see
     /// `scan_tags_matching`); the entries of accepted values go to `f`
     /// (cells in `ranges` only), those of other values are stepped over, or
     /// skipped with a seek when there are many.
-    fn scan_tag_values(&self, kind: Kind, key: &[u8], prefix: &[u8], ranges: Option<&[CodeRange]>, mut accept: impl FnMut(&[u8]) -> Scan, f: &mut impl FnMut(&[u8], Cell, &[Id]) -> Result<Scan>) -> Result<Scan> {
+    fn scan_tag_values(&self, kind: Kind, key: &[u8], prefix: &[u8], ranges: Option<&[CodeRange]>, accept: impl FnMut(&[u8]) -> Scan, f: &mut impl FnMut(&[u8], Cell, &[Id]) -> Result<Scan>) -> Result<Scan> {
+        let within = [key, &[0], prefix].concat();
+        self.walk_values(kind, key.len() + 1, &within, &within, None, ranges, accept, f)
+    }
+
+    /// The walk of `scan_tag_values` over the values whose entry prefix
+    /// (`key 0 value 0`) starts with `within` and is not below `lo`; with
+    /// `part`, also below its bound `hi`, which another thread may lower
+    /// while the walk runs (`scan_tags_par`).
+    #[allow(clippy::too_many_arguments)]
+    fn walk_values(&self, kind: Kind, vstart: usize, within: &[u8], lo: &[u8], part: Option<&std::sync::Mutex<Part>>, ranges: Option<&[CodeRange]>, mut accept: impl FnMut(&[u8]) -> Scan, f: &mut impl FnMut(&[u8], Cell, &[Id]) -> Result<Scan>) -> Result<Scan> {
         // Entries of one value read in turn before seeking past the rest
         // (rejected values) or reading the rest by range (accepted values
         // with `ranges`, see `scan_value`).
@@ -581,12 +827,7 @@ impl<'e> Snapshot<'e> {
             return Ok(Scan::Next);
         }
         let db = self.db.k(kind).tags;
-        let mut kp = key.to_vec();
-        kp.push(0);
-        let vstart = kp.len();
-        let mut within = kp.clone();
-        within.extend_from_slice(prefix);
-        let mut seek = within.clone();
+        let mut seek = lo.to_vec();
         // Smallest key after every entry of the value with prefix `p`.
         let past = |p: &[u8]| {
             let mut s = p.to_vec();
@@ -615,6 +856,20 @@ impl<'e> Snapshot<'e> {
                 if p != cur.as_slice() {
                     if memchr0(&p[vstart..p.len() - 1]).is_some() {
                         continue;
+                    }
+                    if let Some(part) = part {
+                        // A value whose entries begin before `lo` belongs
+                        // to the part below.
+                        if p < lo {
+                            seek = past(p);
+                            continue 'walk;
+                        }
+                        let mut g = part.lock().unwrap();
+                        if p >= g.hi.as_slice() {
+                            return Ok(Scan::Next);
+                        }
+                        g.at.clear();
+                        g.at.extend_from_slice(p);
                     }
                     cur.clear();
                     cur.extend_from_slice(p);
@@ -1100,6 +1355,8 @@ impl<'e> WriteTxn<'e> {
 
     pub fn commit(mut self) -> Result<()> {
         self.flush_indexes()?;
+        let n: u64 = self.db.info.get(&self.txn, COMMITS.as_bytes())?.and_then(|v| std::str::from_utf8(v).ok()?.parse().ok()).unwrap_or(0);
+        self.db.info.put(&mut self.txn, COMMITS.as_bytes(), (n + 1).to_string().as_bytes())?;
         self.txn.commit()?;
         Ok(())
     }
@@ -1160,4 +1417,45 @@ fn area_block_key(tile: u32, id: u32) -> [u8; 8] {
     k[..4].copy_from_slice(&tile.to_be_bytes());
     k[4..].copy_from_slice(&id.to_be_bytes());
     k
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn midpoints_lie_between() {
+        let cases: [(&[u8], &[u8]); 7] = [
+            (b"key\0", b"key\x01"),
+            (b"key\0http://a\0", b"key\0www\0"),
+            (b"key\0https://www.a", b"key\0https://www.b"),
+            (b"key\0abc\0", b"key\0abc\0\x05"),
+            (b"a", b"a\0\0\0\0\0\0\0\0\x01"),
+            (b"a\xff\xff\xff\xff\xff\xff\xff\xff", b"b"),
+            (b"", b"\x01"),
+        ];
+        for (a, b) in cases {
+            if let Some(m) = midpoint(a, b) {
+                assert!(a < m.as_slice() && m.as_slice() < b, "{a:?} {m:?} {b:?}");
+                assert!(split_width(a, b).is_some_and(|w| w > 0.0));
+            } else {
+                assert!(split_width(a, b).is_none());
+            }
+        }
+        assert!(midpoint(b"key\0http://a\0", b"key\0www\0").is_some());
+        assert_eq!(midpoint(b"b", b"a"), None);
+        assert_eq!(midpoint(b"a", b"a"), None);
+        // repeated halving reaches every gap of 2 or more
+        let (a, mut b) = (b"key\0abc".to_vec(), b"key\0abd".to_vec());
+        for _ in 0..200 {
+            match midpoint(&a, &b) {
+                Some(m) => b = m,
+                None => break,
+            }
+        }
+        assert!(a < b && midpoint(&a, &b).is_none());
+        assert_eq!(successor(b"key\0ab"), b"key\0ac");
+        assert_eq!(successor(b"key\0a\xff"), b"key\0b");
+        assert_eq!(successor(b"key\0"), b"key\x01");
+    }
 }
