@@ -380,6 +380,125 @@ pub fn level_ranges(level: u8, r: &Rect, loose: bool) -> Vec<CodeRange> {
     merged
 }
 
+/// `level_ranges` of many rectangles in one walk of the quadtree: a node
+/// is taken whole once one rectangle covers it, or up to 8 do together
+/// (rectangles that meet in a seam), and dropped once none meets it.
+/// The cost follows the edges of the union, not of each rectangle: the
+/// 3 x 10^5 tiles of a large country share most of their edges. The cells
+/// are those whose (loose) extent meets a rectangle, as with `level_ranges`
+/// of each one; nodes are taken whole when a depth has more than 512 for
+/// each rectangle.
+pub fn level_ranges_many(level: u8, rects: &[Rect], loose: bool) -> Vec<CodeRange> {
+    if rects.iter().all(|r| r.is_empty()) {
+        return Vec::new();
+    }
+    if level == 0 {
+        return vec![CodeRange { level: 0, lo: 0, hi: 0 }];
+    }
+    let shift = 32 - level as u32;
+    let lv = level as u32;
+    // The rectangles in cells of this level, [y0, x0, y1, x1].
+    let mut cells: Vec<[u32; 4]> = rects
+        .iter()
+        .filter(|r| !r.is_empty())
+        .map(|r| {
+            let (mut y0, mut x0) = (r.y0 >> shift, r.x0 >> shift);
+            if loose {
+                y0 = y0.saturating_sub(1);
+                x0 = x0.saturating_sub(1);
+            }
+            [y0, x0, r.y1 >> shift, r.x1 >> shift]
+        })
+        .collect();
+    cells.sort_unstable();
+    cells.dedup();
+    let budget = MAX_RANGES_PER_LEVEL.saturating_mul(cells.len());
+    let meets = |c: &[u32; 4], n: &[u32; 4]| c[0] <= n[2] && n[0] <= c[2] && c[1] <= n[3] && n[1] <= c[3];
+    let holds = |c: &[u32; 4], n: &[u32; 4]| c[0] <= n[0] && n[2] <= c[2] && c[1] <= n[1] && n[3] <= c[3];
+    let mut out: Vec<(u32, u32)> = Vec::new();
+    // Nodes of one depth: (cy, cx) and their rectangles in `idx[a..b]`.
+    let mut idx: Vec<u32> = (0..cells.len() as u32).collect();
+    let mut frontier: Vec<(u32, u32, usize, usize)> = vec![(0, 0, 0, idx.len())];
+    for d in 0..=lv {
+        let span = lv - d;
+        let coarse = frontier.len() > budget;
+        let mut next = Vec::new();
+        let mut next_idx: Vec<u32> = Vec::new();
+        for &(cy, cx, a, b) in &frontier {
+            let node = [cy << span, cx << span, ((cy + 1) << span) - 1, ((cx + 1) << span) - 1];
+            let list = &idx[a..b];
+            let full = d == lv
+                || coarse
+                || list.iter().any(|&i| holds(&cells[i as usize], &node))
+                || (list.len() <= 8 && union_holds(&node, list.iter().map(|&i| &cells[i as usize])));
+            if full {
+                let base = morton(cy << (16 - d), cx << (16 - d));
+                let width = if d == 0 { u32::MAX } else { (1u32 << (2 * (16 - d))) - 1 };
+                out.push((base, base + width));
+                continue;
+            }
+            for (sy, sx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
+                let (ny, nx) = (cy * 2 + sy, cx * 2 + sx);
+                let child = [ny << (span - 1), nx << (span - 1), ((ny + 1) << (span - 1)) - 1, ((nx + 1) << (span - 1)) - 1];
+                let start = next_idx.len();
+                next_idx.extend(list.iter().copied().filter(|&i| meets(&cells[i as usize], &child)));
+                if next_idx.len() > start {
+                    next.push((ny, nx, start, next_idx.len()));
+                }
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        frontier = next;
+        idx = next_idx;
+    }
+    out.sort_unstable();
+    let mut merged: Vec<CodeRange> = Vec::new();
+    for (lo, hi) in out {
+        if let Some(last) = merged.last_mut() {
+            if last.hi != u32::MAX && lo <= last.hi + 1 {
+                last.hi = last.hi.max(hi);
+                continue;
+            }
+        }
+        merged.push(CodeRange { level, lo, hi });
+    }
+    merged
+}
+
+/// Whether the rectangles (at most 8, each meeting `node`) cover `node`
+/// together: every piece of the grid their edges cut it into is covered.
+fn union_holds<'a>(node: &[u32; 4], rs: impl Iterator<Item = &'a [u32; 4]> + Clone) -> bool {
+    let mut ys = [0u32; 17];
+    let mut xs = [0u32; 17];
+    let (mut ny, mut nx) = (1, 1);
+    ys[0] = node[0];
+    xs[0] = node[1];
+    for c in rs.clone() {
+        if c[0] > node[0] {
+            ys[ny] = c[0];
+            ny += 1;
+        }
+        if c[2] < node[2] {
+            ys[ny] = c[2] + 1;
+            ny += 1;
+        }
+        if c[1] > node[1] {
+            xs[nx] = c[1];
+            nx += 1;
+        }
+        if c[3] < node[3] {
+            xs[nx] = c[3] + 1;
+            nx += 1;
+        }
+    }
+    let (ys, xs) = (&mut ys[..ny], &mut xs[..nx]);
+    ys.sort_unstable();
+    xs.sort_unstable();
+    ys.iter().all(|&y| xs.iter().all(|&x| rs.clone().any(|c| c[0] <= y && y <= c[2] && c[1] <= x && x <= c[3])))
+}
+
 /// Sort ranges by level and start and merge overlapping or adjacent ones.
 pub fn merge_ranges(mut r: Vec<CodeRange>) -> Vec<CodeRange> {
     r.sort_by_key(|c| (c.level, c.lo));

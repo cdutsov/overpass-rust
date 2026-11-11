@@ -4,7 +4,7 @@
 //! cheap pointer walks over the memory map) and decoded in parallel.
 
 use super::filter::TagFilter;
-use crate::geo::{Cell, CodeRange, Pt, Rect, arc_bulge, level_ranges, loose_ranges, merge_ranges, tile_ranges, MAX_LEVEL};
+use crate::geo::{Cell, CodeRange, Pt, Rect, arc_bulge, level_ranges, level_ranges_many, loose_ranges, merge_ranges, tile_ranges, MAX_LEVEL};
 use crate::model::*;
 use crate::store::codec::{self, Pick};
 use crate::store::{Kind, Snapshot, Scan};
@@ -191,14 +191,16 @@ pub use crate::geo::cell_in_ranges;
 
 
 /// Cell ranges where elements of a kind intersecting the rectangles may be stored.
+/// Many rectangles (the tiles of an area) are joined into rows and walked
+/// together (`level_ranges_many`).
 pub fn ranges_for(kind: Kind, rects: &[Rect]) -> Vec<CodeRange> {
-    let runs;
-    let rects = if rects.len() > 32 {
-        runs = tile_runs(rects);
-        &runs[..]
-    } else {
-        rects
-    };
+    if rects.len() > 32 {
+        let rows = join_rows(tile_runs(rects));
+        return merge_ranges(match kind {
+            Kind::Node => level_ranges_many(MAX_LEVEL, &rows, false),
+            _ => (0..=MAX_LEVEL).flat_map(|level| level_ranges_many(level, &rows, true)).collect(),
+        });
+    }
     let mut r = Vec::new();
     for rect in rects {
         match kind {
@@ -218,14 +220,16 @@ pub fn arc_ranges(kind: Kind, rects: &[Rect]) -> Vec<CodeRange> {
     if kind == Kind::Node {
         return ranges_for(kind, rects);
     }
-    let runs;
-    let rects = if rects.len() > 32 {
-        runs = tile_runs(rects);
-        &runs[..]
-    } else {
-        rects
-    };
     let mut r = Vec::new();
+    if rects.len() > 32 {
+        let rows = join_rows(tile_runs(rects));
+        for level in 0..=MAX_LEVEL {
+            let m = arc_bulge(1u64 << (32 - level as u32));
+            let grown: Vec<Rect> = rows.iter().map(|rect| rect.grow_lat(m)).collect();
+            r.extend(level_ranges_many(level, &grown, true));
+        }
+        return merge_ranges(r);
+    }
     for level in 0..=MAX_LEVEL {
         let m = arc_bulge(1u64 << (32 - level as u32));
         for rect in rects {
@@ -233,6 +237,23 @@ pub fn arc_ranges(kind: Kind, rects: &[Rect]) -> Vec<CodeRange> {
         }
     }
     merge_ranges(r)
+}
+
+/// The rectangles with those of one row (same south and north edge) that
+/// touch or overlap joined: the tiles of an area become a few runs a row.
+fn join_rows(mut rects: Vec<Rect>) -> Vec<Rect> {
+    rects.sort_unstable_by_key(|r| (r.y0, r.y1, r.x0));
+    let mut out: Vec<Rect> = Vec::with_capacity(rects.len());
+    for r in rects {
+        if let Some(l) = out.last_mut() {
+            if l.y0 == r.y0 && l.y1 == r.y1 && r.x0 <= l.x1.saturating_add(1) {
+                l.x1 = l.x1.max(r.x1);
+                continue;
+            }
+        }
+        out.push(r);
+    }
+    out
 }
 
 /// The rectangles with the small ones (up to 64 level-16 tiles) replaced
@@ -812,8 +833,34 @@ impl<'s> Fetch<'s> {
 mod tests {
     use super::*;
 
-    /// Many rectangles give the cell ranges of each one computed alone:
-    /// points, small and larger rectangles, at the edges of the key space.
+    /// Whether a cell may hold an element of the kind that meets one of the
+    /// rectangles: its tile (nodes) or its loose extent (ways, relations).
+    fn cell_meets(kind: Kind, c: Cell, rects: &[Rect]) -> bool {
+        let ext = if kind == Kind::Node {
+            let (ty, tx) = crate::geo::unmorton(c.code);
+            Rect { y0: ty << 16, x0: tx << 16, y1: (ty << 16) | 0xffff, x1: (tx << 16) | 0xffff }
+        } else {
+            c.loose_rect()
+        };
+        rects.iter().any(|r| !r.is_empty() && ext.intersects(r))
+    }
+
+    /// Cells of the ranges for a check: the first, middle and last of each.
+    fn sample_cells(ranges: &[CodeRange]) -> Vec<Cell> {
+        let mut out = Vec::new();
+        for r in ranges {
+            let mask = if r.level == 0 { u32::MAX } else { (1u32 << (2 * (16 - r.level as u32))) - 1 };
+            for code in [r.lo, r.lo + (r.hi - r.lo) / 2, r.hi] {
+                out.push(Cell { level: r.level, code: code & !mask });
+            }
+        }
+        out
+    }
+
+    /// Many rectangles give the cells that meet them, within the cell ranges
+    /// of each one computed alone (which takes nodes whole when a depth has
+    /// many): points, small and larger rectangles, at the edges of the key
+    /// space, and the tiles of an area on a grid offset from the cells.
     #[test]
     fn tile_runs_keep_the_ranges() {
         let mut seed = 0x2545_f491_4f6c_dd1du64;
@@ -830,6 +877,7 @@ mod tests {
             }
             merge_ranges(r)
         };
+        let mut cases: Vec<Vec<Rect>> = Vec::new();
         for case in 0..40u64 {
             // a cluster of 40 tiles, or the whole key space
             let (y, x, spread) = match case % 4 {
@@ -847,14 +895,44 @@ mod tests {
                 rects.push(Rect { y0: y0 as u32, x0: x0 as u32, y1: y1 as u32, x1: x1 as u32 });
             }
             rects.push(Rect::EMPTY);
-            for kind in [Kind::Node, Kind::Way] {
-                assert_eq!(ranges_for(kind, &rects), one_by_one(kind, &rects), "case {case}");
-            }
+            cases.push(rects);
         }
         // 2000 points in 40 x 40 tiles: at most 20 runs a row
         let points: Vec<Rect> = (0..2000).map(|_| Rect::point(Pt { y: 0x6000_0000 + rnd(40 << 16) as u32, x: 0x7000_0000 + rnd(40 << 16) as u32 })).collect();
         assert!(tile_runs(&points).len() <= 800);
-        assert_eq!(ranges_for(Kind::Way, &points), one_by_one(Kind::Way, &points));
+        cases.push(points);
+        // the tiles of an area (2^20 wide, offset from the cells) with holes
+        let mut area = Vec::new();
+        for ty in 0..30u32 {
+            for tx in 0..30u32 {
+                if rnd(5) > 0 {
+                    let (y0, x0) = (0x6008_9680 + (ty << 20), 0x7003_0000 + (tx << 20));
+                    area.push(Rect { y0, x0, y1: y0 + 0xfffff, x1: x0 + 0xfffff });
+                }
+            }
+        }
+        cases.push(area);
+        for (case, rects) in cases.iter().enumerate() {
+            for kind in [Kind::Node, Kind::Way] {
+                let many = ranges_for(kind, rects);
+                let each = one_by_one(kind, rects);
+                assert!(covers(&each, &many), "case {case}");
+                let mut cells = sample_cells(&each);
+                for _ in 0..2000 {
+                    let r = &rects[rnd(rects.len() as u64) as usize];
+                    if r.is_empty() {
+                        continue;
+                    }
+                    let level = if kind == Kind::Node { MAX_LEVEL } else { rnd(17) as u8 };
+                    let mut near = |a: u32, b: u32| (a as u64).saturating_sub(1 << 21) + rnd((b - a) as u64 + (2 << 21));
+                    let p = Pt { y: near(r.y0, r.y1).min(u32::MAX as u64) as u32, x: near(r.x0, r.x1).min(u32::MAX as u64) as u32 };
+                    cells.push(crate::geo::cell_at(level, p));
+                }
+                for c in cells {
+                    assert_eq!(cell_in_ranges(c, &many), cell_meets(kind, c, rects), "case {case} {kind:?} {c:?}");
+                }
+            }
+        }
     }
 
     /// Whether every range of `small` lies within a range of `big`.

@@ -7,7 +7,7 @@ use super::eval::{Cx, El, Evaluator};
 use super::query::Plan;
 use super::set::{Set, sort_dedup};
 use super::fetch::ranges_for;
-use crate::geo::{Cell, CodeRange, MAX_LEVEL, Pt, Rect, cell_in_ranges, ilat, ilon, level_ranges, merge_ranges};
+use crate::geo::{Cell, CodeRange, MAX_LEVEL, Pt, Rect, cell_in_ranges, ilat, ilon, level_ranges, level_ranges_many, merge_ranges};
 use crate::model::*;
 use crate::store::Kind;
 use anyhow::Result;
@@ -93,10 +93,11 @@ impl AreaCtx {
     fn way_ranges(&self) -> Vec<CodeRange> {
         let tiles: Vec<Rect> = self.tiles.keys().map(|t| tile_rect(*t)).collect();
         let mut out = ranges_for(Kind::Way, &tiles);
-        for level in 0..=MAX_LEVEL {
-            let m = arc_bulge(1u64 << (32 - level as u32));
-            for r in &self.implicit_rects {
-                out.extend(level_ranges(level, &Rect { y0: r.y0.saturating_sub(m), y1: r.y1.saturating_add(m), ..*r }, true));
+        if !self.implicit_rects.is_empty() {
+            for level in 0..=MAX_LEVEL {
+                let m = arc_bulge(1u64 << (32 - level as u32));
+                let grown: Vec<Rect> = self.implicit_rects.iter().map(|r| Rect { y0: r.y0.saturating_sub(m), y1: r.y1.saturating_add(m), ..*r }).collect();
+                out.extend(level_ranges_many(level, &grown, true));
             }
         }
         merge_ranges(out)

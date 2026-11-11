@@ -5,14 +5,41 @@ use crate::ql::ast::Filter;
 use anyhow::{Result, anyhow};
 use regex::{Regex, RegexBuilder};
 
-/// Translate a glibc POSIX extended regular expression into Rust syntax.
+/// The Rust class (a bracket expression) of the POSIX class `[:name:]` as
+/// glibc defines it in the C.UTF-8 locale: Unicode letters and digits count,
+/// so `ü` is in `[:alnum:]`. Non-ASCII decimal digits are in `alpha`, not in
+/// `digit`. With REG_ICASE glibc reads `upper` and `lower` as `alpha`.
+/// None for an unknown name (glibc: invalid character class).
+fn posix_class(name: &str, ci: bool) -> Option<&'static str> {
+    const ALPHA: &str = r"[[\p{Alphabetic}\p{Nd}]--0-9]";
+    Some(match name {
+        "alnum" => r"[\p{Alphabetic}\p{Nd}]",
+        "alpha" => ALPHA,
+        "upper" | "lower" if ci => ALPHA,
+        "upper" => r"[\p{Uppercase}\p{Lt}]",
+        "lower" => r"[\p{Lowercase}\x{1C5}\x{1C8}\x{1CB}\x{1F2}]",
+        "digit" => "[0-9]",
+        "xdigit" => "[0-9A-Fa-f]",
+        "space" => r"[\t-\r \x{1680}\x{2000}-\x{2006}\x{2008}-\x{200A}\x{2028}\x{2029}\x{205F}\x{3000}]",
+        "blank" => r"[\t \x{1680}\x{2000}-\x{2006}\x{2008}-\x{200A}\x{205F}\x{3000}]",
+        "cntrl" => r"[\x00-\x1F\x7F-\x9F\x{2028}\x{2029}]",
+        "print" => r"[^\p{Cn}\p{Cc}\p{Zl}\p{Zp}]",
+        "graph" => r"[[^\p{Cn}\p{Cc}\p{Zs}\p{Zl}\p{Zp}]\x{A0}\x{2007}\x{202F}]",
+        "punct" => r"[[[^\p{Cn}\p{Cc}\p{Zs}\p{Zl}\p{Zp}]--[\p{Alphabetic}\p{Nd}]]\x{A0}\x{2007}\x{202F}]",
+        _ => return None,
+    })
+}
+
+/// Translate a glibc POSIX extended regular expression into Rust syntax;
+/// `ci`: the regex is case-insensitive (REG_ICASE).
 ///
-/// GNU escapes `\w \W \s \S \b \B` keep their meaning, `\<`/`\>` become
-/// word boundaries, `` \` ``/`\'` anchor at text start/end; any other
-/// escaped character is literal (so `\d` is the letter d). Inside a bracket
-/// expression a backslash is an ordinary character. Perl extensions such as
-/// `(?i)` are not ERE and are rejected.
-pub fn translate_ere(re: &str) -> Option<String> {
+/// GNU escapes `\w \W \s \S` match the glibc classes `[_[:alnum:]]` and
+/// `[[:space:]]` and their complements, `\b \B` keep their meaning,
+/// `\<`/`\>` become word boundaries, `` \` ``/`\'` anchor at text
+/// start/end; any other escaped character is literal (so `\d` is the
+/// letter d). Inside a bracket expression a backslash is an ordinary
+/// character. Perl extensions such as `(?i)` are not ERE and are rejected.
+pub fn translate_ere(re: &str, ci: bool) -> Option<String> {
     let chars: Vec<char> = re.chars().collect();
     let mut out = String::with_capacity(re.len() + 8);
     let mut i = 0;
@@ -22,7 +49,17 @@ pub fn translate_ere(re: &str) -> Option<String> {
             '\\' => {
                 let Some(&n) = chars.get(i + 1) else { return None };
                 match n {
-                    'w' | 'W' | 's' | 'S' | 'b' | 'B' => {
+                    'w' | 'W' => {
+                        out.push_str(if n == 'w' { "[_" } else { "[^_" });
+                        out.push_str(posix_class("alnum", ci)?);
+                        out.push(']');
+                    }
+                    's' | 'S' => {
+                        out.push_str(if n == 's' { "[" } else { "[^" });
+                        out.push_str(posix_class("space", ci)?);
+                        out.push(']');
+                    }
+                    'b' | 'B' => {
                         out.push('\\');
                         out.push(n);
                     }
@@ -57,7 +94,7 @@ pub fn translate_ere(re: &str) -> Option<String> {
                         break;
                     }
                     if d == '[' && matches!(chars.get(i + 1), Some(':' | '.' | '=')) {
-                        // POSIX class like [:alpha:]: copy through the closing ":]".
+                        // `[:alpha:]`, `[.x.]` or `[=x=]`: up to the closing ":]".
                         let close = chars.get(i + 1).copied().unwrap();
                         let start = i;
                         i += 2;
@@ -67,8 +104,19 @@ pub fn translate_ere(re: &str) -> Option<String> {
                         if i + 1 >= chars.len() {
                             return None;
                         }
+                        let inner = &chars[start + 2..i];
+                        if close == ':' {
+                            let name: String = inner.iter().collect();
+                            out.push_str(posix_class(&name, ci)?);
+                        } else {
+                            // C.UTF-8 has single ASCII characters only: `[.-.]`, `[=a=]`.
+                            let [ch] = inner else { return None };
+                            if !ch.is_ascii() {
+                                return None;
+                            }
+                            out.push_str(&regex::escape(ch.encode_utf8(&mut [0u8; 4])));
+                        }
                         i += 2;
-                        out.extend(&chars[start..i]);
                         continue;
                     }
                     if matches!(d, '\\' | '[' | '&' | '~' | '-') && !(d == '-' && (chars.get(i + 1) != Some(&']') && out.ends_with(|ch: char| ch != '[' && ch != '^'))) {
@@ -91,7 +139,7 @@ pub fn translate_ere(re: &str) -> Option<String> {
 /// Compile a regex written for glibc POSIX ERE.
 pub fn compile_regex(re: &str, ci: bool) -> Result<Regex> {
     let err = || anyhow!("Invalid regular expression: \"{re}\"");
-    let translated = translate_ere(re).ok_or_else(err)?;
+    let translated = translate_ere(re, ci).ok_or_else(err)?;
     RegexBuilder::new(&translated)
         .case_insensitive(ci)
         // POSIX `.` matches newlines.
@@ -234,6 +282,55 @@ mod tests {
 
     fn m(re: &str, s: &str) -> bool {
         compile_regex(re, false).unwrap().is_match(s)
+    }
+
+    fn mi(re: &str, s: &str) -> bool {
+        compile_regex(re, true).unwrap().is_match(s)
+    }
+
+    /// Expected values from glibc `regexec` in C.UTF-8, as the C++ server runs it.
+    #[test]
+    fn posix_classes_as_glibc() {
+        assert!(m("^[[:alnum:]]$", "ü"));
+        assert!(m("^[[:alnum:]]$", "٣"));
+        assert!(!m("^[[:alnum:]]$", "_"));
+        assert!(m("^[[:alpha:]]$", "٣"));
+        assert!(!m("^[[:digit:]]$", "٣"));
+        assert!(m("^[[:alpha:]]$", "\u{e31}"));
+        assert!(!m("^[[:alpha:]]$", "\u{301}"));
+        // A word on its own: "Grüne" does not contain the word "ne".
+        let word = "(^|[^[:alnum:]])ne([^[:alnum:]]|$)";
+        assert!(!mi(word, "Grüne Aue"));
+        assert!(!mi(word, "Domäne"));
+        assert!(mi(word, "so 'ne Art Salon"));
+        assert!(m("^[[:upper:]]$", "ǅ") && m("^[[:lower:]]$", "ǅ"));
+        assert!(m("^[[:upper:]]$", "Ⅳ"));
+        assert!(!m("^[[:upper:]]$", "a"));
+        // REG_ICASE reads upper and lower as alpha.
+        assert!(mi("^[[:upper:]]$", "a") && mi("^[[:upper:]]$", "ß") && mi("^[[:lower:]]$", "ª"));
+        assert!(!mi("^[^[:upper:]]$", "a"));
+        assert!(mi("^[[:upper:][:digit:]]+$", "a1"));
+        assert!(!m("^[[:space:]]$", "\u{a0}") && m("^[[:space:]]$", "\u{2003}"));
+        assert!(m("^[^[:space:]]$", "\u{85}") && m("^[[:cntrl:]]$", "\u{85}"));
+        assert!(m("^[[:cntrl:]]$", "\u{2028}") && m("^[[:blank:]]$", "\u{3000}"));
+        assert!(m("^[[:punct:]]$", "€") && m("^[[:punct:]]$", "\u{a0}"));
+        assert!(m("^[[:graph:]]$", "\u{a0}") && m("^[[:print:]]$", "\u{a0}"));
+        assert!(!m("^[[:xdigit:]]+$", "Ａ"));
+        assert!(m("^[[:alpha:]-]+$", "a-b"));
+        assert!(compile_regex("^[[:foo:]]$", false).is_err());
+        assert!(compile_regex("[[:alpha:]", false).is_err());
+        // GNU escapes: \w is [_[:alnum:]], \s is [[:space:]].
+        assert!(m("^\\w$", "ü") && m("^\\w$", "_") && mi("^\\w$", "Ü"));
+        assert!(!m("^\\w$", "\u{301}") && !m("^\\w$", "‿") && m("^\\W$", "\u{301}"));
+        assert!(!m("^\\s$", "\u{a0}") && m("^\\S$", "\u{a0}"));
+        // Collating elements and equivalence classes: one ASCII character.
+        assert!(m("^[[=a=]]$", "a") && !m("^[[=a=]]$", "á") && mi("^[[=a=]]$", "A"));
+        assert!(m("^[[.-.]a]$", "-") && m("^[[.].]]$", "]") && m("^[[=[=]]$", "["));
+        assert!(compile_regex("[[=ab=]]", false).is_err());
+        assert!(compile_regex("[[.ü.]]", false).is_err());
+        // Many Unicode classes stay within the size limits.
+        let many = "([^[:alnum:]]*x[^[:alpha:]]*y[^[:alnum:]]*){8}";
+        assert!(compile_regex(many, true).is_ok());
     }
 
     #[test]
