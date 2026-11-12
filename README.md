@@ -8,8 +8,8 @@ A Rust reimplementation of the [Overpass API](https://wiki.openstreetmap.org/wik
 the read-only query server for OpenStreetMap data. It aims to be compatible with clients of the
 C++ Overpass API 0.7.62 (Overpass Turbo, iD, JOSM, osmnx, overpy).
 
-Deployed on [overpass.ch](https://overpass.ch). On live queries, it is typically 25 times faster than Overpass API
-0.7.62.11 on queries with answers under 100 KB, and 13 times faster in total time over all queries.
+Deployed on [overpass.ch](https://overpass.ch). On live queries, it is typically 84 times faster than Overpass API
+0.7.62.11 on queries with answers under 100 KB, and 14 times faster in total time over all queries.
 
 ## Status
 
