@@ -84,8 +84,8 @@ data is more than three times the size of the RAM, so many C++ queries wait for 
 different queries and compare only roughly.
 
 The Germany run used the Geofabrik extract of 1 November 2026 with metadata, on a Xeon E3-1275 v5
-with 8 threads, 64 GB of RAM and NVMe: `overpass-rust` before 0.2.0 versus the
-`wiktorn/overpass-api:v0.7.62.11` image, and both servers were queried over HTTP.
+with 8 threads, 64 GB of RAM and NVMe: `overpass-rust 0.1.0` versus the
+`wiktorn/overpass-api:v0.7.62.11` image, both queried over HTTP.
 
 | | Overpass API | overpass-rust |
 |---|---|---|
@@ -101,7 +101,7 @@ with 8 threads, 64 GB of RAM and NVMe: `overpass-rust` before 0.2.0 versus the
 The semantics of overpass-rust follow the specs in `docs/spec/`, which were extracted from the C++
 sources. Where the behaviour of the C++ code shows in the output, as with number formatting, `strtod`
 quirks, iteration order or area geometry, it is ported. Of 1,096 test queries over twelve datasets,
-899 give byte-identical output and 142 give no output on either side, 80 of them rejected by both
+899 give byte-identical output and 142 return nothing on either side, 80 of them rejected by both
 with the same error. 12 depend on timing. The other 43 differ on purpose, for example where
 Overpass API keeps stale state after a node changes, or finds nothing around a pole. On the Germany
 extract, the answers stayed identical through 36 hours of diffs, except where the Overpass API
