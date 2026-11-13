@@ -370,12 +370,15 @@ fn radius_box(lat_lo: f64, lat_hi: f64, lon_lo: f64, lon_hi: f64, radius: f64) -
     let dlat = radius * 360.0 / 40_000_000.0;
     let south = lat_lo - dlat;
     let north = lat_hi + dlat;
-    let mut scl = if north.abs() > south.abs() { north } else { south };
-    if scl.abs() >= 89.9 {
-        scl = 89.9f64.copysign(scl);
+    // A circle that reaches a pole takes every longitude. (C++ caps the
+    // latitude of the scale at 89.9 degrees, so near the poles its box
+    // misses points at other longitudes, and at a pole it finds nothing.)
+    if north >= 90.0 || south <= -90.0 {
+        return BBox { south: south.max(-90.0), north: north.min(90.0), west: -180.0, east: 180.0 };
     }
-    let dlon = dlat / (scl / 90.0 * std::f64::consts::FRAC_PI_2).cos();
-    BBox { south: south.max(-90.0), north: north.min(90.0), west: lon_lo - dlon, east: lon_hi + dlon }
+    let scl = if north.abs() > south.abs() { north } else { south };
+    let dlon = dlat / scl.to_radians().cos();
+    BBox { south, north, west: lon_lo - dlon, east: lon_hi + dlon }
 }
 
 fn box_rects(b: BBox) -> Vec<crate::geo::Rect> {
@@ -843,6 +846,33 @@ mod tests {
     fn inside(lat: f64, lon: f64, r: f64, p: (f64, f64)) -> bool {
         let b = radius_box(lat, lat, lon, lon, r);
         p.0 >= b.south && p.0 <= b.north && p.1 >= b.west && p.1 <= b.east
+    }
+
+    /// A circle that reaches a pole takes every longitude, and near a pole
+    /// the box holds the whole circle (the scale latitude was capped at 89.9:
+    /// around:2000 at the Amundsen-Scott station found 1 of 6 named nodes).
+    #[test]
+    fn radius_box_at_the_poles() {
+        for (lat, lon) in [(90.0, 0.0), (90.0, 123.0), (-90.0, -180.0), (89.995, 45.0), (-89.998, -139.2728), (89.95, 10.0), (89.9, 10.0), (-89.5, 0.0), (89.0, 179.9)] {
+            for r in [0.0, 1_000.0, 2_000.0, 50_000.0] {
+                let b = radius_box(lat, lat, lon, lon, r);
+                let full = b.east - b.west >= 360.0;
+                if great_circle_dist(lat, lon, 90f64.copysign(lat), 0.0) <= r {
+                    assert!(full, "({lat}, {lon}) r {r} reaches the pole: {b:?}");
+                }
+                // Radius 0: the destination lands 3e-11 degrees off, at distance 0.
+                for k in 0..if r > 0.0 { 72 } else { 0 } {
+                    for f in [0.5, 0.99] {
+                        let p = destination(lat, lon, k as f64 * 5.0, r * f);
+                        if great_circle_dist(lat, lon, p.0, p.1) > r {
+                            continue;
+                        }
+                        let lon_in = full || [p.1, p.1 - 360.0, p.1 + 360.0].iter().any(|x| *x >= b.west && *x <= b.east);
+                        assert!(p.0 >= b.south && p.0 <= b.north && lon_in, "({lat}, {lon}) r {r} bearing {} -> {p:?} outside {b:?}", k * 5);
+                    }
+                }
+            }
+        }
     }
 
     // way(around:120000,...) near 52 degrees north: ways 119 km east of the

@@ -1098,6 +1098,9 @@ impl Parser {
                 MakeEntry { key: MakeKey::Tag(k), value: Some(self.rhs(ctx, Ty::Str, "string")?) }
             };
             if let MakeKey::Tag(k) | MakeKey::Remove(k) = &entry.key {
+                if k.is_empty() {
+                    return self.static_err(line, "For the statement \"set-prop\" in mode \"keytype\"=\"tag\", the attribute \"k\" must be nonempty.");
+                }
                 if !seen.insert(k.clone()) {
                     return self.static_err(line, format!("A key cannot be added twice to an element: \"{k}\""));
                 }
@@ -1534,6 +1537,15 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(s.stmts[0].into, "a");
+    }
+
+    #[test]
+    fn make_and_convert_keys() {
+        let msg = "line 1: static error: For the statement \"set-prop\" in mode \"keytype\"=\"tag\", the attribute \"k\" must be nonempty.";
+        for q in ["make x \"\"=1;out;", "make x a=1,\"\"=2;out;", "node(1);convert x \"\"=t[\"a\"];out;", "node(1);convert x ::=::,!\"\";out;"] {
+            assert_eq!(parse(q).unwrap_err().to_string(), msg, "{q}");
+        }
+        assert!(parse("make x \" \"=1;out;").is_ok());
     }
 
     #[test]

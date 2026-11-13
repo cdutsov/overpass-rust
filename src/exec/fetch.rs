@@ -766,7 +766,7 @@ impl<'s> Fetch<'s> {
     /// (not for `key=value`); false ends the scan.
     fn scan_candidates(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>, mut visit: impl FnMut() -> bool, mut push: impl FnMut(Cell, &[Id]) -> Result<Scan>) -> Result<()> {
         // Value test for regexes: values failing it are skipped as a whole.
-        let value_test = |re: &regex::Regex, val: &[u8]| val.contains(&1) || std::str::from_utf8(val).is_ok_and(|s| re.is_match(s));
+        let value_test = |re: &super::filter::Ere, val: &[u8]| val.contains(&1) || std::str::from_utf8(val).is_ok_and(|s| re.is_match(s));
         let mut accept = |ok: bool| match (visit(), ok) {
             (false, _) => Scan::Stop,
             (true, true) => Scan::Next,

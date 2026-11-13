@@ -299,7 +299,14 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
             El::W(w) => {
                 let pos = self.eng.f.node_positions(&w.nodes)?;
                 let pts: Vec<Option<LatLon>> = w.nodes.iter().map(|n| pos.get(n).map(|p| (p.lat(), p.lon()))).collect();
-                if pts.iter().all(|p| p.is_some()) { DGeom::LineString(pts.into_iter().flatten().collect()) } else { DGeom::PartialWay(pts) }
+                if pts.iter().all(|p| p.is_some()) {
+                    DGeom::LineString(pts.into_iter().flatten().collect())
+                } else if crate::exec::print::cpp_keeps_partial_way(w.idx) {
+                    DGeom::PartialWay(pts)
+                } else {
+                    // As in C++ and in `out geom`: no geometry at all.
+                    DGeom::LineString(Vec::new())
+                }
             }
             El::R(r) => {
                 let nids: Vec<Id> = r.members.iter().filter(|m| m.mtype == ElemType::Node).map(|m| m.id).collect();
@@ -323,7 +330,11 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
                     .map(|m| match m.mtype {
                         ElemType::Node => vec![npos.get(&m.id).map(|p| (p.lat(), p.lon()))],
                         ElemType::Way => match ways.get(&m.id) {
-                            Some(w) => w.nodes.iter().map(|n| wpos.get(n).map(|p| (p.lat(), p.lon()))).collect(),
+                            Some(w) => {
+                                let v: Vec<Option<LatLon>> = w.nodes.iter().map(|n| wpos.get(n).map(|p| (p.lat(), p.lon()))).collect();
+                                // A member way without geometry in C++ (see `cpp_keeps_partial_way`) is left out.
+                                if v.iter().any(|p| p.is_none()) && !crate::exec::print::cpp_keeps_partial_way(w.idx) { vec![] } else { v }
+                            }
                             None => vec![],
                         },
                         _ => vec![],
@@ -713,11 +724,17 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
         if p == 0 || !(p + 1 < n || closed) {
             return Ok(String::new());
         }
-        let DGeom::LineString(line) = self.geom(e)? else { return Ok(String::new()) };
-        let c: Vec<crate::geo::V3> = line.iter().map(|(la, lo)| cartesian(*la, *lo)).collect();
-        let prev = c[p - 1];
-        let mid = c[p];
-        let next = if p + 1 < c.len() { c[p + 1] } else { c[1] };
+        // A vertex whose position or a neighbour's is missing: NaN, as C++
+        // gives where it does not read past its geometry.
+        let pts: Vec<Option<LatLon>> = match self.geom(e)? {
+            DGeom::LineString(l) if l.len() == n => l.into_iter().map(Some).collect(),
+            DGeom::PartialWay(v) if v.len() == n => v,
+            _ => return Ok("NaN".into()),
+        };
+        let (Some(prev), Some(mid), Some(next)) = (pts[p - 1], pts[p], pts[if p + 1 < n { p + 1 } else { 1 }]) else {
+            return Ok("NaN".into());
+        };
+        let (prev, mid, next) = (cartesian(prev.0, prev.1), cartesian(mid.0, mid.1), cartesian(next.0, next.1));
         let inn = mid.cross(&prev);
         let out = next.cross(&mid);
         let ni = inn.dot(&inn).sqrt();

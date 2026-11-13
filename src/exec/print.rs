@@ -66,11 +66,17 @@ fn inside_clip(p: Pt, b: &BBox) -> bool {
 /// Position used by the C++ code for missing nodes in `bb`/`center`.
 const SENTINEL: LatLon = (-91.0, -214.7483648);
 
+/// Whether a way with a missing node keeps the positions of its other nodes
+/// in C++: only when its C++ index stores geometry (compound, bit 0 clear).
+pub(crate) fn cpp_keeps_partial_way(idx: u32) -> bool {
+    idx & 0x8000_0000 != 0 && idx & 1 == 0
+}
+
 /// Way positions as the C++ geometry store yields them: with a missing
 /// node, only ways whose C++ index stores geometry (compound, bit 0 clear)
 /// keep their other positions; others have no geometry at all.
 fn cpp_way_positions(v: Vec<Option<Pt>>, idx: u32) -> Vec<Option<Pt>> {
-    if v.iter().any(|p| p.is_none()) && !(idx & 0x8000_0000 != 0 && idx & 1 == 0) {
+    if v.iter().any(|p| p.is_none()) && !cpp_keeps_partial_way(idx) {
         return Vec::new();
     }
     v

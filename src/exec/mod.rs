@@ -13,6 +13,7 @@ pub mod print;
 pub mod query;
 pub mod recurse;
 pub mod set;
+mod towupper;
 
 use crate::output::Printer;
 use crate::ql::ast::*;
