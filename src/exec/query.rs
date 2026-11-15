@@ -456,6 +456,15 @@ impl<'s, W: Write> Engine<'s, W> {
         Ok(Some(acc))
     }
 
+    /// The relations of the input sets of a statement (`rel.a.b`: those in
+    /// every set) that pass `keep`, in the order of the first set.
+    fn input_rels(&self, inputs: &[String], keep: impl Fn(&Relation) -> bool) -> Vec<Relation> {
+        let Some((first, rest)) = inputs.split_first() else { return Vec::new() };
+        let Some(first) = self.lookup(first) else { return Vec::new() };
+        let rest: Vec<HashSet<Id>> = rest.iter().map(|n| self.lookup(n).map(|s| s.rels.iter().map(|r| r.id).collect()).unwrap_or_default()).collect();
+        first.rels.iter().filter(|r| rest.iter().all(|ids| ids.contains(&r.id)) && keep(r)).cloned().collect()
+    }
+
     /// The rectangles of the most restrictive single spatial clause, for
     /// range selection, and whether its test follows great-circle edges
     /// (`around`, implicit areas: `arc_ranges`).
@@ -838,9 +847,18 @@ impl<'s, W: Write> Engine<'s, W> {
         // An unanchored regex or a key filter would walk every value of its
         // key (every name on the planet): those are tested on the relations
         // stored in the cells of the region instead.
-        let probe = match self.most_selective(Kind::Relation, &plan, Some(&ranges))? {
-            Some(eq) => Some(eq),
-            None => plan.tags.iter().find(|t| anchored(t)),
+        // A statement on sets (`nwr.a(around:…)`) takes the relations of
+        // its input sets as the candidates: the region may hold many more
+        // (600 relations within 2.5 km of a town centre, 70 hiking routes
+        // in the set).
+        let on_sets = !plan.inputs.is_empty();
+        let probe = if on_sets {
+            None
+        } else {
+            match self.most_selective(Kind::Relation, &plan, Some(&ranges))? {
+                Some(eq) => Some(eq),
+                None => plan.tags.iter().find(|t| anchored(t)),
+            }
         };
         // Cost: a member is a lookup by id, a node of the region a part of
         // a chunk read in order (about 500 per chunk), and the region path
@@ -857,7 +875,7 @@ impl<'s, W: Write> Engine<'s, W> {
             None => None,
         };
         #[cfg(test)]
-        tests::CANDIDATES_FROM.set(Some(if pairs.is_some() { "tags" } else if bbox.is_some() { "bbox" } else { "cells" }));
+        tests::CANDIDATES_FROM.set(Some(if on_sets { "sets" } else if pairs.is_some() { "tags" } else if bbox.is_some() { "bbox" } else { "cells" }));
         if pairs.as_ref().is_some_and(|p| p.len() > MAX_CANDIDATES) {
             #[cfg(test)]
             tests::CANDIDATES.set(Some("too_many_candidates"));
@@ -908,15 +926,23 @@ impl<'s, W: Write> Engine<'s, W> {
         let over = |n: usize, members: usize| {
             n > MAX_CANDIDATES || if scan_ok { members > 2 * region_nodes } else { n > cap && (n + members) * MEMBER_COST > region_nodes }
         };
-        let source = match pairs {
-            Some(pairs) => Source::At(pairs),
-            None => Source::Ranges(&ranges),
-        };
         self.check()?;
-        let Some(cands) = self.f.bounded::<Relation>(source, keep, |r| if open(r) { r.members.len() } else { 0 }, over)? else {
-            #[cfg(test)]
-            tests::CANDIDATES.set(Some("too_many_candidates"));
-            return Ok(None);
+        // The relations of the sets are in memory: all of them are
+        // candidates. With too many members the member path answers, as
+        // for the other sources.
+        let cands = if on_sets {
+            self.input_rels(&plan.inputs, keep)
+        } else {
+            let source = match pairs {
+                Some(pairs) => Source::At(pairs),
+                None => Source::Ranges(&ranges),
+            };
+            let Some(cands) = self.f.bounded::<Relation>(source, keep, |r| if open(r) { r.members.len() } else { 0 }, over)? else {
+                #[cfg(test)]
+                tests::CANDIDATES.set(Some("too_many_candidates"));
+                return Ok(None);
+            };
+            cands
         };
         let (mut nids, mut wids) = (Vec::new(), Vec::new());
         for r in cands.iter().filter(|r| open(r)) {
@@ -1546,6 +1572,31 @@ mod tests {
                 assert_eq!(out, ids.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "{q}");
             }
         }
+        // A statement on sets: the relations of the sets are the candidates.
+        let on_sets: &[(&str, &[&str])] = &[
+            ("relation[route]->.r;nwr.r(around:500,48.85,2.35);out ids;", &["1", "3", "9", "11"]),
+            ("relation[route]->.r;relation[\"route\"=\"bus\"]->.b;rel.r.b(around:500,48.85,2.35);out ids;", &["1", "9", "11"]),
+            ("relation[\"type\"=\"multipolygon\"]->.m;rel.m(around:500,48.85,2.35);out ids;", &["8"]),
+            ("relation[route];rel._[\"route\"=\"bus\"](around:600,48.85,2.35);out ids;", &["1", "9", "10", "11"]),
+            ("rel.none(around:500,48.85,2.35);out ids;", &[]),
+        ];
+        for (q, ids) in on_sets {
+            let q = format!("{c}{q}");
+            let (out, did) = both_ways(&db, &q);
+            assert_eq!((did, CANDIDATES_FROM.get()), (Some("answered"), Some("sets")), "{q}");
+            assert_eq!(out, ids.iter().map(|s| s.to_string()).collect::<Vec<_>>(), "{q}");
+        }
+        // and with a polygon: the answer of the statement with the tag
+        // filter of the set in place of the set
+        let poly = "(poly:\"48.84 2.34 48.86 2.34 48.86 2.36 48.84 2.36\")";
+        for tags in ["[route]", "[\"route\"=\"bus\"]"] {
+            let q = format!("{c}relation{tags}->.r;rel.r{poly};out ids;");
+            let (out, did) = both_ways(&db, &q);
+            assert_eq!((did, CANDIDATES_FROM.get()), (Some("answered"), Some("sets")), "{q}");
+            let (direct, _) = both_ways(&db, &format!("{c}relation{tags}{poly};out ids;"));
+            assert!(!direct.is_empty(), "{q}");
+            assert_eq!(out, direct, "{q}");
+        }
         // With a polygon too; not tried for regions over MAX_REGION.
         let q = "relation[\"route\"=\"bus\"](poly:\"48.84 2.34 48.86 2.34 48.86 2.36\")(around:500,48.85,2.35);out ids;";
         assert_eq!(both_ways(&db, &format!("{c}{q}")).1, Some("answered"), "{q}");
@@ -1582,7 +1633,7 @@ mod tests {
     }
 
     /// A relation with more members than the region has nodes (a long
-    /// route near a small circle): the member path answers.
+    /// route near a small circle), also in a set: the member path answers.
     #[test]
     fn rel_around_many_members_use_member_path() {
         let mut members: Vec<(&str, usize)> = (1..=900).map(|n| ("node", n)).collect();
@@ -1591,6 +1642,10 @@ mod tests {
         let (db, dir) = grid_db("members", &relation(1, &members, &[("route", "bus")]));
         let (out, did) = both_ways(&db, "[out:csv(::id;false)];relation[\"route\"=\"bus\"](around:30,48.85,2.35);out ids;");
         assert_eq!(did, Some("too_many_members"));
+        assert_eq!(out, vec!["1".to_string()]);
+        // the same with the relation in a set
+        let (out, did) = both_ways(&db, "[out:csv(::id;false)];relation[\"route\"=\"bus\"]->.r;rel.r(around:30,48.85,2.35);out ids;");
+        assert_eq!((did, CANDIDATES_FROM.get()), (Some("too_many_members"), Some("sets")));
         assert_eq!(out, vec!["1".to_string()]);
         let _ = std::fs::remove_dir_all(&dir);
     }

@@ -3,6 +3,17 @@
 Changes of overpass-rust, newest first. "Overpass API" is the C++ server
 (0.7.62) whose answers overpass-rust reproduces.
 
+## 0.2.3 (2026-11-15)
+
+Faster
+- `around` and `poly` on a set of relations (`rel.a(around:...)`,
+  `nwr.a(poly:...)`) start from the relations of the set. They started from
+  every relation near the region and kept those of the set at the end: eight
+  such statements on two sets of hiking routes, with circles of 500 m and
+  2.5 km, take 0.07 s, 0.73 s before. When the relations of the set have more
+  members than the region has nodes, the members are found from the region as
+  before.
+
 ## 0.2.2 (2026-11-13)
 
 Fixed: answers that differed from Overpass API
