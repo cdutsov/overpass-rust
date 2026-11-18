@@ -3,6 +3,24 @@
 Changes of overpass-rust, newest first. "Overpass API" is the C++ server
 (0.7.62) whose answers overpass-rust reproduces.
 
+## 0.2.6 (2026-11-18)
+
+Fixed: server
+- An answer to a client that reads slower than the server writes ended with
+  "runtime error: Query timed out" once the client had taken longer than the
+  `[timeout:]` of the query, even when the query itself needed a fraction of a
+  second: the time spent waiting for the client counted against the limit. The
+  query also held its slot and its database snapshot until the client had read
+  the answer. The part of the answer a client has not taken yet now waits in a
+  spool (1 MiB in memory per query, the rest in an unlinked file in `TMPDIR`);
+  the query finishes, frees its slot and snapshot, and `[timeout:]` counts only
+  its own time, as with the C++ server, whose web server buffers the answer.
+- Limits of the spool: `serve --spool-max` (default 4 GiB) bounds the spool
+  files of all queries; when it is used up, a query waits for its client until
+  `[timeout:]` + 30 s. A client that does not take any data for 60 s, or has
+  not read the answer 30 minutes after the query ended, loses it, and its
+  memory and file are freed.
+
 ## 0.2.5 (2026-11-18)
 
 Fixed: replication

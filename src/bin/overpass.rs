@@ -119,6 +119,12 @@ enum Cmd {
         /// Largest accepted query text, in bytes.
         #[arg(long, default_value_t = 1 << 20)]
         max_query_size: usize,
+        /// Bytes of answers that may wait on disk (in TMPDIR) for clients that
+        /// read slower than the query writes, over all queries. The query does
+        /// not wait for such a client; when this is used up, it does, until its
+        /// [timeout:] + 30 s. 0: queries always wait for their clients.
+        #[arg(long, default_value_t = 4 << 30)]
+        spool_max: u64,
     },
     /// Run an Overpass QL query (from a file, or stdin when omitted).
     Query {
@@ -214,8 +220,8 @@ fn main() -> Result<()> {
             }
             eprintln!("built {} of {} candidate areas in {:.2?}", r.created, r.candidates, start.elapsed());
         }
-        Cmd::Serve { listen, max_concurrent, max_timeout, max_maxsize, max_space, max_query_size } => {
-            let mut cfg = overpass::server::ServerConfig { max_timeout: Some(max_timeout), max_maxsize: Some(max_maxsize), max_space, max_query_len: max_query_size, ..Default::default() };
+        Cmd::Serve { listen, max_concurrent, max_timeout, max_maxsize, max_space, max_query_size, spool_max } => {
+            let mut cfg = overpass::server::ServerConfig { max_timeout: Some(max_timeout), max_maxsize: Some(max_maxsize), max_space, max_query_len: max_query_size, spool_max, ..Default::default() };
             if let Some(m) = max_concurrent {
                 cfg.max_concurrent = m;
             }

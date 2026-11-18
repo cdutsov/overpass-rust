@@ -1,12 +1,14 @@
 //! HTTP server: `/api/interpreter`, `/api/status`, `/api/timestamp`.
 //!
 //! Queries run on blocking threads, each on its own LMDB read snapshot, and
-//! stream their output. A semaphore bounds concurrent queries; requests that
+//! stream their output through a spool (spool.rs), so a slow client does not
+//! hold the query. A semaphore bounds concurrent queries; requests that
 //! cannot get a slot in time get 504 like the C++ dispatcher.
 
 use crate::exec::{RunError, RunOptions, run_script};
 use crate::output::{COPYRIGHT, escape_xml};
 use crate::ql::ast::OutFormat;
+use crate::spool::{Budget, Spool};
 use crate::store::Db;
 use axum::Router;
 use axum::body::{Body, Bytes};
@@ -19,7 +21,7 @@ use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
-use tokio::sync::{Semaphore, mpsc};
+use tokio::sync::Semaphore;
 
 pub struct ServerConfig {
     pub max_concurrent: usize,
@@ -32,6 +34,15 @@ pub struct ServerConfig {
     pub max_space: Option<u64>,
     pub queue_timeout: Duration,
     pub max_query_len: usize,
+    /// Bytes of answers that may wait on disk for slow clients, over all
+    /// queries (spool.rs). 0: queries wait for their clients.
+    pub spool_max: u64,
+    /// Where those answers wait.
+    pub spool_dir: std::path::PathBuf,
+    /// A client that takes nothing for this long while data waits loses its answer.
+    pub client_stall: Duration,
+    /// Time a client has to read the rest of the answer after the query ended.
+    pub client_max: Duration,
 }
 
 impl Default for ServerConfig {
@@ -43,6 +54,10 @@ impl Default for ServerConfig {
             max_space: None,
             queue_timeout: Duration::from_secs(15),
             max_query_len: 1 << 20,
+            spool_max: 4 << 30,
+            spool_dir: std::env::temp_dir(),
+            client_stall: Duration::from_secs(60),
+            client_max: Duration::from_secs(1800),
         }
     }
 }
@@ -58,6 +73,7 @@ struct AppState {
     cfg: ServerConfig,
     started: Instant,
     served: AtomicU64,
+    spooled: Arc<Budget>,
 }
 
 pub fn router(db: Arc<Db>, cfg: ServerConfig) -> Router {
@@ -65,7 +81,8 @@ pub fn router(db: Arc<Db>, cfg: ServerConfig) -> Router {
         let units = (b / SPACE_UNIT).clamp(1, u32::MAX as u64) as u32;
         (Arc::new(Semaphore::new(units as usize)), units)
     });
-    let state = Arc::new(AppState { db, slots: Arc::new(Semaphore::new(cfg.max_concurrent)), space, cfg, started: Instant::now(), served: AtomicU64::new(0) });
+    let spooled = Budget::new(cfg.spool_max);
+    let state = Arc::new(AppState { db, slots: Arc::new(Semaphore::new(cfg.max_concurrent)), space, cfg, started: Instant::now(), served: AtomicU64::new(0), spooled });
     // Bodies are checked against max_query_len ourselves to return the C++ error page.
     let body_limit = 4 * state.cfg.max_query_len + 4096;
     Router::new()
@@ -134,14 +151,13 @@ fn error_page(status: StatusCode, messages: &[String]) -> Response {
     (status, [(header::CONTENT_TYPE, "text/html; charset=utf-8")], body).into_response()
 }
 
-/// Writer that forwards output chunks to the HTTP body stream. A client that
-/// stops reading cannot block the query thread past its deadline.
+/// Writer that hands output chunks to the spool of the response. It waits for
+/// the client only when the spool budget is used up, and not past its deadline.
 struct ChannelWriter {
-    tx: mpsc::Sender<Result<Bytes, std::io::Error>>,
+    spool: Arc<Spool>,
     buf: Vec<u8>,
     cancel: Arc<AtomicBool>,
     deadline: Instant,
-    rt: tokio::runtime::Handle,
 }
 
 impl Write for ChannelWriter {
@@ -156,16 +172,18 @@ impl Write for ChannelWriter {
         if self.buf.is_empty() {
             return Ok(());
         }
-        let chunk = Ok(Bytes::from(std::mem::take(&mut self.buf)));
-        let wait = self.deadline.saturating_duration_since(Instant::now());
-        // Blocking threads may wait on the runtime; a client that stops
-        // reading releases the thread at the deadline.
-        let sent = self.rt.block_on(tokio::time::timeout(wait, self.tx.send(chunk)));
-        if matches!(sent, Ok(Ok(()))) {
+        let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        if self.spool.push(chunk, self.deadline).is_ok() {
             return Ok(());
         }
         self.cancel.store(true, Ordering::Relaxed);
         Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client went away"))
+    }
+}
+
+impl Drop for ChannelWriter {
+    fn drop(&mut self) {
+        self.spool.finish();
     }
 }
 
@@ -237,7 +255,8 @@ async fn run_request(st: Arc<AppState>, method: Method, query: String, jsonp: Op
     let head_only = method == Method::HEAD || method == Method::OPTIONS;
     let queue_deadline = tokio::time::Instant::now() + st.cfg.queue_timeout;
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Ready>();
-    let (tx, rx) = mpsc::channel::<Result<Bytes, std::io::Error>>(16);
+    let spool = Spool::new(st.spooled.clone(), st.cfg.spool_dir.clone());
+    let spool2 = spool.clone();
     let cancel = Arc::new(AtomicBool::new(false));
     let db = st.db.clone();
     let opts = RunOptions { max_timeout: st.cfg.max_timeout, max_maxsize: st.cfg.max_maxsize, cancel: Some(cancel.clone()), cli: false };
@@ -279,7 +298,7 @@ async fn run_request(st: Arc<AppState>, method: Method, query: String, jsonp: Op
         }
         st2.served.fetch_add(1, Ordering::Relaxed);
         let timeout = max_timeout.unwrap_or(u32::MAX).min(script.settings.timeout);
-        let mut w = ChannelWriter { tx, buf: Vec::new(), cancel: cancel2, deadline: Instant::now() + Duration::from_secs(timeout as u64 + 30), rt };
+        let mut w = ChannelWriter { spool: spool2, buf: Vec::new(), cancel: cancel2, deadline: Instant::now() + Duration::from_secs(timeout as u64 + 30) };
         let jsonp = jsonp.filter(|j| !j.is_empty() && matches!(script.settings.out, OutFormat::Json));
         if let Some(j) = &jsonp {
             let _ = w.write_all(format!("{j}(").as_bytes());
@@ -300,12 +319,16 @@ async fn run_request(st: Arc<AppState>, method: Method, query: String, jsonp: Op
         };
         let _ = w.flush();
     });
+    // Made before the wait: when the client goes away before the answer starts,
+    // dropping it with this future stops the query.
+    let stream = RxStream { spool: spool.clone(), cancel };
     match ready_rx.await {
         Ok(Ready::Ok(content_type)) => {
             if head_only {
                 return ([(header::CONTENT_TYPE, content_type)], Body::empty()).into_response();
             }
-            ([(header::CONTENT_TYPE, content_type)], Body::from_stream(RxStream { rx, cancel })).into_response()
+            tokio::spawn(Spool::watch(Arc::downgrade(&spool), st.cfg.client_stall, st.cfg.client_max));
+            ([(header::CONTENT_TYPE, content_type)], Body::from_stream(stream)).into_response()
         }
         // C++ answers HEAD/OPTIONS with headers only, even for bad queries.
         Ok(Ready::Error(_)) if head_only => ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], Body::empty()).into_response(),
@@ -325,22 +348,23 @@ enum Ready {
 }
 
 /// Stream of body chunks produced by the query thread. Dropping it (the
-/// client went away) cancels the query.
+/// client went away) cancels the query and frees its spool.
 struct RxStream {
-    rx: mpsc::Receiver<Result<Bytes, std::io::Error>>,
+    spool: Arc<Spool>,
     cancel: Arc<AtomicBool>,
 }
 
 impl futures_core::Stream for RxStream {
     type Item = Result<Bytes, std::io::Error>;
-    fn poll_next(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
-        self.rx.poll_recv(cx)
+    fn poll_next(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+        self.spool.poll_take(cx)
     }
 }
 
 impl Drop for RxStream {
     fn drop(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+        self.spool.close();
     }
 }
 

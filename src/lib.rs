@@ -10,5 +10,6 @@ pub mod ql;
 pub mod replicate;
 pub mod server;
 pub mod sorter;
+pub mod spool;
 pub mod store;
 pub mod update;
