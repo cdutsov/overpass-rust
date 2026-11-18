@@ -983,6 +983,52 @@ impl<'e> Snapshot<'e> {
         Ok(out)
     }
 
+    /// The ids in `n` id buckets picked at random (with `seed`), a sample
+    /// for consistency checks; all ids for `n = 0`.
+    pub fn sample_ids(&self, kind: Kind, n: usize, seed: u64) -> Result<Vec<Id>> {
+        let db = self.db.k(kind).ids;
+        let mut out = Vec::new();
+        let add = |k: &[u8], v: &[u8], out: &mut Vec<Id>| -> Result<()> {
+            let bucket = u64::from_be_bytes(k.try_into().context("bad id bucket key")?);
+            out.extend(codec::decode_id_bucket(v)?.into_iter().map(|(lo, _)| bucket << codec::ID_BUCKET_BITS | lo as u64));
+            Ok(())
+        };
+        if n == 0 {
+            for item in db.iter(&self.txn)? {
+                let (k, v) = item?;
+                add(k, v, &mut out)?;
+            }
+            return Ok(out);
+        }
+        let Some((last, _)) = db.last(&self.txn)? else { return Ok(out) };
+        let max = u64::from_be_bytes(last.try_into().context("bad id bucket key")?);
+        let mut x = seed | 1;
+        let mut seen = BTreeSet::new();
+        for _ in 0..n {
+            // xorshift64
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            if let Some((k, v)) = db.get_greater_than_or_equal_to(&self.txn, &(x % (max + 1)).to_be_bytes())? {
+                if seen.insert(k.to_vec()) {
+                    add(k, v, &mut out)?;
+                }
+            }
+        }
+        out.sort_unstable();
+        Ok(out)
+    }
+
+    /// Ways recorded as waiting for the node `node`.
+    pub fn pending_ways(&self, node: Id) -> Result<Vec<Id>> {
+        let mut out = Vec::new();
+        for item in self.db.pending.prefix_iter(&self.txn, &node.to_be_bytes()[..])? {
+            let (k, _) = item?;
+            out.extend(k.get(8..16).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes));
+        }
+        Ok(out)
+    }
+
     /// Relations having one of the given elements as member.
     pub fn relations_with_members(&self, mtype: ElemType, ids: &[Id]) -> Result<Vec<Id>> {
         let mut sorted = ids.to_vec();
@@ -1106,7 +1152,7 @@ impl<'e> WriteTxn<'e> {
         while i < sorted.len() {
             let bucket = sorted[i] >> codec::ID_BUCKET_BITS;
             let entries = match db.get(&self.txn, &bucket.to_be_bytes())? {
-                Some(v) => codec::decode_id_bucket(v)?,
+                Some(v) => codec::decode_id_bucket(v).with_context(|| format!("decoding the {kind:?} id bucket {bucket}"))?,
                 None => Vec::new(),
             };
             let delta = self.id_delta.get(&(kind, bucket));
@@ -1151,7 +1197,7 @@ impl<'e> WriteTxn<'e> {
     /// Entries of a relation member bucket, with buffered changes applied.
     fn member_bucket(&self, mtype: u8, bucket: u64) -> Result<BTreeSet<(u8, Id)>> {
         let mut set: BTreeSet<(u8, Id)> = match self.db.relmembers.get(&self.txn, &member_key(ElemType::from_code(mtype), bucket))? {
-            Some(v) => codec::decode_member_bucket(v)?.into_iter().collect(),
+            Some(v) => codec::decode_member_bucket(v).with_context(|| format!("decoding the relation member bucket {mtype}/{bucket}"))?.into_iter().collect(),
             None => BTreeSet::new(),
         };
         if let Some(d) = self.member_delta.get(&(mtype, bucket)) {
@@ -1187,7 +1233,7 @@ impl<'e> WriteTxn<'e> {
         let mut out = Vec::new();
         for item in self.db.pending.prefix_iter(&self.txn, &node.to_be_bytes()[..])? {
             let (k, _) = item?;
-            out.push(u64::from_be_bytes(k[8..16].try_into().unwrap()));
+            out.extend(k.get(8..16).and_then(|b| b.try_into().ok()).map(u64::from_be_bytes));
         }
         Ok(out)
     }
@@ -1245,7 +1291,7 @@ impl<'e> WriteTxn<'e> {
             let db = self.db.k(kind).ids;
             let key = bucket.to_be_bytes();
             let mut entries: BTreeMap<u16, Cell> = match db.get(&self.txn, &key)? {
-                Some(v) => codec::decode_id_bucket(v)?.into_iter().collect(),
+                Some(v) => codec::decode_id_bucket(v).with_context(|| format!("decoding the {kind:?} id bucket {bucket}"))?.into_iter().collect(),
                 None => BTreeMap::new(),
             };
             for (lo, cell) in changes {
@@ -1265,7 +1311,7 @@ impl<'e> WriteTxn<'e> {
         for ((mtype, bucket), changes) in member_delta {
             let key = member_key(ElemType::from_code(mtype), bucket);
             let mut set: BTreeSet<(u8, Id)> = match self.db.relmembers.get(&self.txn, &key)? {
-                Some(v) => codec::decode_member_bucket(v)?.into_iter().collect(),
+                Some(v) => codec::decode_member_bucket(v).with_context(|| format!("decoding the relation member bucket {mtype}/{bucket}"))?.into_iter().collect(),
                 None => BTreeSet::new(),
             };
             for (e, add) in changes {
@@ -1300,7 +1346,7 @@ impl<'e> WriteTxn<'e> {
             probe.extend_from_slice(&changes[i].0.to_bytes());
             // The entry holding this cell, and where the next one starts.
             let (stored, mut groups): (Option<Vec<u8>>, BTreeMap<Cell, Vec<Id>>) = match db.get_lower_than_or_equal_to(&self.txn, &probe)? {
-                Some((k, v)) if own(k) => (Some(k.to_vec()), codec::decode_tag_entry(Cell::from_bytes(&k[p.len()..]), v)?.into_iter().collect()),
+                Some((k, v)) if own(k) => (Some(k.to_vec()), codec::decode_tag_entry(Cell::from_bytes(&k[p.len()..]), v).with_context(|| format!("decoding the {kind:?} tag index entry {}", String::from_utf8_lossy(k)))?.into_iter().collect()),
                 _ => (None, BTreeMap::new()),
             };
             let next: Option<Cell> = match db.get_greater_than(&self.txn, &probe)? {

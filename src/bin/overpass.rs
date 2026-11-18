@@ -82,6 +82,17 @@ enum Cmd {
     },
     /// Show the database state (timestamps, replication, size).
     Info,
+    /// Check the box and flags of ways against their nodes (a random
+    /// sample of id buckets; 0 = all ways) and optionally compute the
+    /// ways with problems again.
+    CheckWays {
+        #[arg(long, default_value_t = 1000)]
+        sample: usize,
+        #[arg(long, default_value_t = 1)]
+        seed: u64,
+        #[arg(long)]
+        repair: bool,
+    },
     /// Rewrite the database file without unused pages.
     Compact,
     /// Serve the Overpass API over HTTP.
@@ -170,6 +181,24 @@ fn main() -> Result<()> {
             }
             let (used, size) = db.usage()?;
             println!("size: {} MiB ({} MiB in use)", size >> 20, used >> 20);
+        }
+        Cmd::CheckWays { sample, seed, repair } => {
+            let db = Db::open(&cli.db)?;
+            db.check_complete(&cli.db)?;
+            let (n, problems) = overpass::update::check::check_ways(&db, sample, seed)?;
+            for p in &problems {
+                println!("way {}: {}", p.way, p.what);
+            }
+            println!("{n} ways checked, {} with problems", problems.len());
+            if repair && !problems.is_empty() {
+                let mut ids: Vec<u64> = problems.iter().map(|p| p.way).collect();
+                ids.dedup();
+                overpass::update::check::repair_ways(&db, &ids)?;
+                println!("{} ways computed again", ids.len());
+            }
+            if !problems.is_empty() && !repair {
+                std::process::exit(1);
+            }
         }
         Cmd::MakeAreas { memory, quiet } => {
             let db = Db::open(&cli.db)?;

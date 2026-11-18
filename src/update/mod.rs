@@ -1,6 +1,7 @@
 //! Applying element changes (import and OSC diffs) to the store.
 
 pub mod areas;
+pub mod check;
 pub mod osm_xml;
 pub mod pbf;
 
@@ -8,7 +9,7 @@ use crate::geo::{Cell, Pt, Rect, anchor_cell, level_ranges, MAX_LEVEL};
 use crate::model::*;
 use crate::store::codec::{self, MetaRec, Pick};
 use crate::store::{ChunkKey, Kind, Table, WriteTxn, chunk_key};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 /// One element version from an input file.
@@ -137,7 +138,7 @@ impl<T: Chunked> ChunkEditor<T> {
         }
         let span = txn.chunk_span(self.table, &k)?;
         let items = match &span.value {
-            Some(v) => T::decode(v, Pick::All)?.into_iter().map(|e| (e.key(), e)).collect(),
+            Some(v) => T::decode(v, Pick::All).with_context(|| format!("decoding {:?} chunk {}", self.table, chunk_name(span.key.as_ref())))?.into_iter().map(|e| (e.key(), e)).collect(),
             None => BTreeMap::new(),
         };
         let lk = span.key.unwrap_or([0; 13]);
@@ -209,6 +210,14 @@ impl<T: Chunked> ChunkEditor<T> {
     }
 }
 
+/// A chunk key for messages: level, cell code and first id.
+pub fn chunk_name(k: Option<&ChunkKey>) -> String {
+    match k {
+        Some(k) => format!("{}/{:08x}/{}", k[0], u32::from_be_bytes([k[1], k[2], k[3], k[4]]), u64::from_be_bytes(k[5..13].try_into().unwrap_or([0; 8]))),
+        None => "(before the first chunk)".into(),
+    }
+}
+
 /// Edits elements of one kind with their meta data, keeping the id and tag
 /// indexes up to date.
 pub struct ElemEditor<T: Stored> {
@@ -275,7 +284,7 @@ pub struct Stats {
 fn node_positions(txn: &WriteTxn, ids: &[Id]) -> Result<HashMap<Id, Pt>> {
     let mut out = HashMap::with_capacity(ids.len());
     for (v, want) in txn.chunks_with_ids(Kind::Node, ids)? {
-        for n in codec::decode_nodes(v, Pick::Ids(&want), false)? {
+        for n in codec::decode_nodes(v, Pick::Ids(&want), false).with_context(|| format!("decoding the node chunk of node {}", want[0]))? {
             out.insert(n.id, n.pos);
         }
     }
@@ -305,7 +314,7 @@ pub(crate) fn way_geometry(way: &Way, mut pos: impl FnMut(Id) -> Option<Pt>) -> 
 fn way_bboxes(txn: &WriteTxn, ids: &[Id]) -> Result<HashMap<Id, (Rect, u32, bool)>> {
     let mut out = HashMap::new();
     for (v, want) in txn.chunks_with_ids(Kind::Way, ids)? {
-        for w in codec::decode_ways(v, Pick::Ids(&want), false)? {
+        for w in codec::decode_ways(v, Pick::Ids(&want), false).with_context(|| format!("decoding the way chunk of way {}", want[0]))? {
             out.insert(w.id, (w.bbox, w.idx, !w.missing));
         }
     }
@@ -359,6 +368,13 @@ pub fn checked_pos(id: Id, lat: f64, lon: f64) -> Result<crate::geo::Pt> {
 }
 
 pub fn apply(txn: &mut WriteTxn, changes: Vec<Change>) -> Result<Stats> {
+    apply_with(txn, changes, &[])
+}
+
+/// `apply`, with the stored ways `rederive` computed again from their nodes
+/// as if a node of each had moved (box, flags, pending entries, and the
+/// relations they are members of): the repair of `check::check_ways`.
+pub fn apply_with(txn: &mut WriteTxn, changes: Vec<Change>, rederive: &[Id]) -> Result<Stats> {
     let mut stats = Stats::default();
     let mut nodes = Vec::new();
     let mut ways = Vec::new();
@@ -375,10 +391,15 @@ pub fn apply(txn: &mut WriteTxn, changes: Vec<Change>) -> Result<Stats> {
             Elem::Relation(_) => rels.push(c),
         }
     }
-    // Later versions of the same element win.
+    // Later versions of the same element win: the higher version, and of
+    // equal versions (or without meta data) the later one in the input.
     fn last_wins(v: Vec<Change>) -> Vec<Change> {
         let mut m: BTreeMap<Id, Change> = BTreeMap::new();
         for c in v {
+            let older = |p: &Change| matches!((&p.meta, &c.meta), (Some(p), Some(n)) if n.version < p.version);
+            if m.get(&c.elem.id()).is_some_and(older) {
+                continue;
+            }
             m.insert(c.elem.id(), c);
         }
         m.into_values().collect()
@@ -429,7 +450,7 @@ pub fn apply(txn: &mut WriteTxn, changes: Vec<Change>) -> Result<Stats> {
         }
         let ranges = crate::geo::merge_ranges(ranges);
         for v in txn.chunks_in_ranges(Kind::Way, &ranges)? {
-            for w in codec::decode_ways(v, Pick::Cells(&ranges), false)? {
+            for w in codec::decode_ways(v, Pick::Cells(&ranges), false).context("decoding a way chunk near a moved node")? {
                 if w.nodes.iter().any(|n| moved_ids.contains(n)) {
                     touched_ways.insert(w.id);
                 }
@@ -440,6 +461,7 @@ pub fn apply(txn: &mut WriteTxn, changes: Vec<Change>) -> Result<Stats> {
     for id in &created {
         touched_ways.extend(txn.pending_ways(*id)?);
     }
+    touched_ways.extend(rederive);
     touched_ways.retain(|id| !way_changes.contains_key(id));
     stats.cascaded_ways = touched_ways.len();
     let all_way_ids: Vec<Id> = way_changes.keys().copied().chain(touched_ways.iter().copied()).collect();

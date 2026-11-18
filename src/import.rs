@@ -18,6 +18,9 @@ pub struct ImportReport {
     pub max_timestamp: i64,
     /// Replication state from a PBF header.
     pub replication: Option<PbfHeader>,
+    /// Elements of a diff that could not be read and were left out, with
+    /// the reason (`apply_reader`).
+    pub skipped: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -93,16 +96,27 @@ fn apply_batch(txn: &mut crate::store::WriteTxn, batch: &mut Vec<Change>, report
     txn.flush_indexes()
 }
 
-/// Apply changes read from `input` within `txn` (in batches).
+/// Apply a replication diff read from `input` within `txn` (in batches).
+/// The input must be a complete OsmChange document; elements that cannot
+/// be read are left out and listed in `report.skipped`.
 pub fn apply_reader(txn: &mut crate::store::WriteTxn, input: impl BufRead, report: &mut ImportReport) -> Result<()> {
     let mut batch: Vec<Change> = Vec::new();
-    update::osm_xml::read(input, |c| {
-        batch.push(c);
-        if batch.len() >= BATCH {
-            apply_batch(txn, &mut batch, report)?;
-        }
-        Ok(())
-    })?;
+    let mut skipped = Vec::new();
+    let mut skip = |s: String| skipped.push(s);
+    let r = update::osm_xml::read_with(
+        input,
+        true,
+        |c| {
+            batch.push(c);
+            if batch.len() >= BATCH {
+                apply_batch(txn, &mut batch, report)?;
+            }
+            Ok(())
+        },
+        Some(&mut skip),
+    );
+    report.skipped.append(&mut skipped);
+    r?;
     apply_batch(txn, &mut batch, report)
 }
 

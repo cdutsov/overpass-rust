@@ -3,6 +3,38 @@
 Changes of overpass-rust, newest first. "Overpass API" is the C++ server
 (0.7.62) whose answers overpass-rust reproduces.
 
+## 0.2.4 (2026-11-18)
+
+Fixed: replication
+- An element of a diff that cannot be read (a number that does not parse,
+  coordinates out of range, a node without a position, an unknown member type)
+  is left out, logged as `replicate: left out ...` and counted in the info key
+  `replicate_skipped`; the rest of the diff is applied. Such an element stopped
+  the updates: the same diffs failed on every attempt.
+- A file that is not one complete `<osmChange>` document (cut short, empty, an
+  error page) fails and is fetched again. It was applied as a diff with fewer
+  changes, and its sequence counted as done.
+- A panic while applying diffs ends that attempt with an error, not the
+  replication process; the start script of the container starts a stopped
+  replication again after 60 s, while the server goes on answering queries.
+- Within one diff the higher version of an element wins, also when a lower
+  version follows it in the file.
+
+Changed: replication
+- After a failed attempt the wait doubles from the interval (30 s) up to 10
+  minutes, and the diffs of the next batch go in one transaction each, so the
+  diffs before a failing one are kept.
+- Only the state file of the last diff of a batch is read. When it is missing
+  (a gap in the feed), the newest element timestamp of the diffs is the data
+  timestamp.
+- A feed that is behind the database is an error, logged on every attempt.
+- `replicate.status` in the database directory, written after every attempt
+  for monitoring: time, sequence, data timestamp, failed attempts in a row, the
+  last error and the number of elements left out.
+- An error when stored data cannot be decoded names the chunk or index entry.
+- `overpass check-ways [--sample N] [--repair]` compares the box and the flags
+  of ways with their nodes and computes the ways with problems again.
+
 ## 0.2.3 (2026-11-15)
 
 Faster
