@@ -10,6 +10,7 @@ use crate::model::{format_timestamp, parse_timestamp};
 use crate::store::Db;
 use anyhow::{Context, Result, bail};
 use std::io::{BufReader, Read};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Debug)]
@@ -24,6 +25,9 @@ pub struct ReplicateOptions {
     pub interval: Duration,
     /// Diffs applied in one transaction.
     pub batch: usize,
+    /// Longest time for one download (a state file or a diff) with its
+    /// body; at most 30 s of it may pass without data.
+    pub timeout: Duration,
 }
 
 /// State of a replication sequence: number and timestamp (seconds).
@@ -33,8 +37,51 @@ pub struct State {
     pub timestamp: i64,
 }
 
-fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout_connect(Duration::from_secs(30)).timeout_read(Duration::from_secs(600)).user_agent(concat!("overpass-rust/", env!("CARGO_PKG_VERSION"))).build()
+/// HTTP client of the replication. `timeout` bounds each request with its
+/// body: a download that stops sending data, or sends it very slowly, fails
+/// and is tried again, instead of holding up the updates.
+fn agent(timeout: Duration) -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(timeout.min(Duration::from_secs(15)))
+        .timeout_read(timeout.min(Duration::from_secs(30)))
+        .timeout(timeout)
+        .user_agent(concat!("overpass-rust/", env!("CARGO_PKG_VERSION")))
+        .build()
+}
+
+/// Unix seconds of the last progress of the replication loop (`beat`).
+static PROGRESS: AtomicI64 = AtomicI64::new(0);
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
+}
+
+fn beat() {
+    PROGRESS.store(now_secs(), Ordering::Relaxed);
+}
+
+/// Without progress for this long, the replication process exits, whatever
+/// held it up; the start script of the container starts it again. Longer
+/// than the longest wait between attempts (10 minutes) and than the wait
+/// for the write lock while the areas are stored.
+pub const STALL_LIMIT: Duration = Duration::from_secs(15 * 60);
+
+/// Whether the loop, last seen making progress at `last` (unix seconds),
+/// has stalled at `now`.
+pub fn stalled(last: i64, now: i64, limit: Duration) -> bool {
+    last > 0 && now - last > limit.as_secs() as i64
+}
+
+fn watchdog(limit: Duration) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(limit.min(Duration::from_secs(30)));
+            if stalled(PROGRESS.load(Ordering::Relaxed), now_secs(), limit) {
+                eprintln!("replicate: no progress for {} s; exiting, the replication starts again", limit.as_secs());
+                std::process::exit(75);
+            }
+        }
+    });
 }
 
 fn seq_path(url: &str, seq: u64, ext: &str) -> String {
@@ -115,7 +162,7 @@ pub fn sequence_for(agent: &ureq::Agent, url: &str, ts: i64) -> Result<u64> {
 
 /// Apply available diffs; returns the number applied.
 pub fn step(db: &Db, opts: &ReplicateOptions) -> Result<usize> {
-    let agent = agent();
+    let agent = agent(opts.timeout);
     let (url, current) = {
         let snap = db.snapshot()?;
         let url = match &opts.url {
@@ -157,6 +204,7 @@ pub fn step(db: &Db, opts: &ReplicateOptions) -> Result<usize> {
     let mut bytes = 0;
     for seq in current + 1..=last {
         let diff = fetch_diff(&agent, &url, seq)?;
+        beat();
         bytes += diff.len();
         diffs.push(diff);
         if bytes >= 256 << 20 {
@@ -174,6 +222,7 @@ pub fn step(db: &Db, opts: &ReplicateOptions) -> Result<usize> {
     for (i, gz) in diffs.iter().enumerate() {
         let seq = current + 1 + i as u64;
         apply_reader(&mut txn, BufReader::new(flate2::read::MultiGzDecoder::new(&gz[..])), &mut report).with_context(|| format!("sequence {seq}"))?;
+        beat();
         skipped.extend(report.skipped.drain(..).map(|s| format!("sequence {seq}: {s}")));
     }
     let ts = match state {
@@ -254,7 +303,12 @@ pub fn run(db: &Db, opts: &ReplicateOptions) -> Result<()> {
     // After a failure, diffs go one per transaction for a whole batch: the
     // diffs before a failing one are kept, and a retry fetches only it.
     let mut single = 0usize;
+    if !opts.once {
+        beat();
+        watchdog(STALL_LIMIT);
+    }
     loop {
+        beat();
         let batch = if single > 0 { 1 } else { opts.batch.max(1) };
         let o = ReplicateOptions { batch, ..opts.clone() };
         let wait = match guarded(|| step(db, &o)) {

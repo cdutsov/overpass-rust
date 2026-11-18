@@ -69,6 +69,9 @@ enum Cmd {
         /// Diffs applied per transaction.
         #[arg(long, default_value_t = 60)]
         batch: usize,
+        /// Seconds one download (a state file or a diff) may take.
+        #[arg(long, default_value_t = 180)]
+        timeout: u64,
     },
     /// Build areas from multipolygon/boundary relations (C++ areas.osm3s rules),
     /// replacing the stored ones.
@@ -165,10 +168,10 @@ fn main() -> Result<()> {
             overpass::import::update_files(&db, &files, timestamp.as_deref(), &mut report)?;
             eprintln!("applied {} elements in {:.2?}", report.elements, start.elapsed());
         }
-        Cmd::Replicate { url, sequence, once, interval, batch } => {
+        Cmd::Replicate { url, sequence, once, interval, batch, timeout } => {
             let db = Db::open(&cli.db)?;
             db.check_complete(&cli.db)?;
-            let opts = overpass::replicate::ReplicateOptions { url, sequence, once, interval: std::time::Duration::from_secs(interval), batch };
+            let opts = overpass::replicate::ReplicateOptions { url, sequence, once, interval: std::time::Duration::from_secs(interval), batch, timeout: std::time::Duration::from_secs(timeout) };
             overpass::replicate::run(&db, &opts)?;
         }
         Cmd::Info => {

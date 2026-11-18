@@ -3,6 +3,18 @@
 Changes of overpass-rust, newest first. "Overpass API" is the C++ server
 (0.7.62) whose answers overpass-rust reproduces.
 
+## 0.2.5 (2026-11-18)
+
+Fixed: replication
+- A download of a state file or a diff that stops sending data held up the
+  updates for up to 10 minutes (only each read had a time limit), and one that
+  sends data very slowly could hold them up for longer. Each download now has a
+  limit of 180 s (`replicate --timeout`) with at most 30 s without data; then
+  the attempt fails and is tried again.
+- When the replication loop makes no progress for 15 minutes, whatever the
+  cause, the process exits; the start script of the container starts it again
+  after 60 s while the server goes on answering queries.
+
 ## 0.2.4 (2026-11-18)
 
 Fixed: replication
