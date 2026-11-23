@@ -125,7 +125,9 @@ pub fn make_areas_with(db: &Db, tmp: &std::path::Path, memory: usize) -> Result<
     for t in [Raw::Chunks(Table::Data(Kind::Area)), Raw::Chunks(Table::Meta(Kind::Area)), Raw::Ids(Kind::Area), Raw::Tags(Kind::Area), Raw::AreaBlocks] {
         txn.clear(t)?;
     }
-    let mut app = Appender::new(txn);
+    // One transaction: with a commit in between, queries would read area
+    // tables that are empty or half written.
+    let mut app = Appender::one_transaction(txn);
     crate::bulk::write_ids(&mut app, Kind::Area, &mut ids_s.finish()?)?;
     crate::bulk::write_chunks(&mut app, Table::Data(Kind::Area), &mut data.finish()?, crate::bulk::area_from)?;
     crate::bulk::write_tags(&mut app, Kind::Area, &mut tags.finish()?)?;
@@ -179,4 +181,94 @@ fn build(f: &Fetch, rel: Relation, report: &mut AreaReport) -> Result<Option<(Ar
     }
     let bbox = tiles_rect(&used);
     Ok(Some((Area { id, tags: rel.tags, used, idx, bbox }, blocks)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::codec::Pick;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// Areas stored, and blocks found for the tiles they list.
+    fn stored(db: &Db) -> (usize, usize) {
+        let snap = db.snapshot().unwrap();
+        let (mut areas, mut blocks) = (0, 0);
+        for v in snap.all_chunks(Kind::Area).unwrap() {
+            for a in codec::decode_areas(v, Pick::All).unwrap() {
+                areas += 1;
+                blocks += a.used.iter().filter(|t| snap.area_blocks(**t, a.id as u32).unwrap().is_some()).count();
+            }
+        }
+        (areas, blocks)
+    }
+
+    /// `area` with `(pivot)` or a recursion clause gives no areas (it read
+    /// every area of the database).
+    #[test]
+    fn area_statement_with_pivot_or_recursion_gives_no_areas() {
+        let dir = std::env::temp_dir().join(format!("areas-pivot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("db")).unwrap();
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("compat/data/monaco.osm.gz");
+        crate::import::import_file(&db, &file, &mut Default::default()).unwrap();
+        make_areas(&db).unwrap();
+        let types = |q: &str| -> Vec<String> {
+            let p = match crate::exec::run(&db, &format!("[out:csv(::type;false)];{q}"), Vec::new(), &Default::default()) {
+                Ok(p) => p,
+                Err((_, e)) => panic!("{q}: {e}"),
+            };
+            String::from_utf8(p.w).unwrap().lines().map(String::from).collect()
+        };
+        // the closed ways with the tags and the areas of the database
+        let areas = types("area[name];out ids;").iter().filter(|t| *t == "area").count();
+        assert!(areas > 20, "{areas} areas");
+        for q in ["area(pivot);out ids;", "area[name];area(pivot);out ids;", "area[name]->.a;area(pivot.a);out ids;", "rel[type];area(>);out ids;", "node[name];area(<);out ids;", "rel[type];area(<<);out ids;"] {
+            let got = types(q);
+            assert!(!got.iter().any(|t| t == "area"), "{q}: {} areas", got.len());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn commits(db: &Db) -> u64 {
+        db.snapshot().unwrap().info("commits").unwrap().unwrap().parse().unwrap()
+    }
+
+    /// The areas are replaced in one transaction: a query never sees the
+    /// tables empty or half written, whatever their size.
+    #[test]
+    fn rebuild_is_one_transaction() {
+        let dir = std::env::temp_dir().join(format!("areas-one-txn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("db")).unwrap();
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("compat/data/monaco.osm.gz");
+        crate::import::import_file(&db, &file, &mut Default::default()).unwrap();
+        make_areas(&db).unwrap();
+        let full = stored(&db);
+        assert!(full.0 > 20 && full.1 >= full.0, "{full:?}");
+        // as if the area tables were larger than the checkpoint size of the appender (1 GiB)
+        crate::bulk::CHECKPOINT_BYTES_TEST.set(Some(4096));
+        let before = commits(&db);
+        let stop = AtomicBool::new(false);
+        let seen = std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut seen = std::collections::BTreeSet::new();
+                while !stop.load(Ordering::Relaxed) {
+                    seen.insert(stored(&db));
+                }
+                seen
+            });
+            for _ in 0..3 {
+                make_areas(&db).unwrap();
+            }
+            stop.store(true, Ordering::Relaxed);
+            reader.join().unwrap()
+        });
+        crate::bulk::CHECKPOINT_BYTES_TEST.set(None);
+        assert_eq!(stored(&db), full);
+        assert_eq!(commits(&db) - before, 3, "commits of 3 rebuilds");
+        assert_eq!(seen.into_iter().collect::<Vec<_>>(), vec![full], "what a reader saw during the rebuilds");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

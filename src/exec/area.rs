@@ -32,7 +32,7 @@ pub struct AreaCtx {
     tiles: BTreeMap<u32, Vec<(u32, Vec<Block>)>>,
     /// Closed ways of the input set.
     implicit: Tilewise,
-    /// Rectangles around the closed ways of the input set (`bulge_rect`).
+    /// Rectangles around the closed ways of the input set (`ring_rects`).
     implicit_rects: Vec<Rect>,
     /// Bounding rectangles for candidate selection.
     pub rects: Vec<Rect>,
@@ -58,6 +58,46 @@ fn bulge_rect(g: &[IC]) -> Rect {
         r.extend(Pt::from_ll((hi + 1e-4).min(90.0), w[0].lon()));
     }
     r
+}
+
+/// Rectangles that hold the implicit area of a closed way: the
+/// `bulge_rect`, with the longitudes followed along the ring. An edge more
+/// than 180 degrees wide crosses the antimeridian (`make_entries`). A ring
+/// that crosses it there and back lies at both ends of the key space, where
+/// the box of its vertices does not reach, and gets a rectangle at each end.
+/// A ring that crosses it once goes around a pole: its area is every tile
+/// row from its southernmost one north, at all longitudes
+/// (`Tilewise::build`), and it gets the whole width north of that row.
+fn ring_rects(g: &[IC]) -> Vec<Rect> {
+    const HALF: i64 = 1_800_000_000;
+    let r = bulge_rect(g);
+    // longitude along the ring, without the jumps at the antimeridian
+    let mut u = g[0].1 as i64;
+    let (mut lo, mut hi) = (u, u);
+    for w in g.windows(2) {
+        let d = w[1].1 as i64 - w[0].1 as i64;
+        u += if d > HALF {
+            d - 2 * HALF
+        } else if d < -HALF {
+            d + 2 * HALF
+        } else {
+            d
+        };
+        lo = lo.min(u);
+        hi = hi.max(u);
+    }
+    let x = |ilon: i64| crate::geo::x_of_ilon(ilon as i32);
+    if u != g[0].1 as i64 {
+        vec![Rect { y0: r.y0 & !0xffff, x0: 0, y1: u32::MAX, x1: u32::MAX }]
+    } else if hi - lo >= 2 * HALF {
+        vec![Rect { x0: 0, x1: u32::MAX, ..r }]
+    } else if hi > HALF {
+        vec![Rect { x0: x(lo), x1: x(HALF), ..r }, Rect { x0: x(-HALF), x1: x(hi - 2 * HALF), ..r }]
+    } else if lo < -HALF {
+        vec![Rect { x0: x(lo + 2 * HALF), x1: x(HALF), ..r }, Rect { x0: x(-HALF), x1: x(hi), ..r }]
+    } else {
+        vec![r]
+    }
 }
 
 /// `geo::arc_bulge` (the way test of implicit areas follows great-circle
@@ -194,12 +234,16 @@ impl<'s, W: Write> Engine<'s, W> {
     fn tilewise_of(&self, ways: &[&Way]) -> Result<(Tilewise, Vec<Rect>)> {
         let mut input = Vec::new();
         let mut rects = Vec::new();
-        for w in ways {
+        for (i, w) in ways.iter().enumerate() {
             if !is_closed(w) {
                 continue;
             }
+            // the vertices of each way are looked up on their own
+            if i % 256 == 255 {
+                self.check()?;
+            }
             if let Some(g) = self.complete_geom(w)? {
-                rects.push(bulge_rect(&g));
+                rects.extend(ring_rects(&g));
                 input.push((w.idx, w.id, g));
             }
         }
@@ -247,6 +291,8 @@ impl<'s, W: Write> Engine<'s, W> {
         let mut out = Vec::with_capacity(ways.len());
         for part in ways.chunks(BATCH) {
             self.check()?;
+            // the positions are dropped with the batch
+            let _scope = self.f.limits.mem_scope();
             let ids: Vec<Id> = part.iter().flat_map(|w| w.nodes.iter().copied()).collect();
             let pos = self.f.node_positions(&ids)?;
             let keep = |w: &&Way| -> bool {
@@ -311,7 +357,9 @@ impl<'s, W: Write> Engine<'s, W> {
 
     /// DB areas of an `area` query (spatial clauses never filter areas).
     pub fn query_areas(&mut self, plan: &Plan) -> Result<Vec<Area>> {
-        if !plan.newer.is_empty() || !plan.users.is_empty() || !plan.uids.is_empty() {
+        // `(pivot)` and the recursion clauses give elements, never areas:
+        // without this, `area(pivot.a)` read every area of the database.
+        if !plan.newer.is_empty() || !plan.users.is_empty() || !plan.uids.is_empty() || !plan.pivots.is_empty() || !plan.recurse_ops.is_empty() {
             return Ok(Vec::new());
         }
         let mut cands: Vec<Area> = if let Some(ids) = &plan.ids {
@@ -372,6 +420,9 @@ impl<'s, W: Write> Engine<'s, W> {
         if points.is_empty() {
             return Ok(out);
         }
+        // of the closed ways read below and their vertices, only the ways
+        // around a point stay
+        let _scope = self.f.limits.mem_scope();
         // DB areas: any block hit or odd parity in the point's block tile.
         let mut found: FxHashSet<u32> = FxHashSet::default();
         let mut by_tile: BTreeMap<u32, Vec<IC>> = BTreeMap::new();
@@ -379,8 +430,13 @@ impl<'s, W: Write> Engine<'s, W> {
             by_tile.entry(areageom::block_tile(p.0, p.1)).or_default().push(*p);
         }
         for (tile, pts) in &by_tile {
+            self.check()?;
             let blocks = self.f.snap.area_blocks_in_tile(*tile)?;
-            for p in pts {
+            for (i, p) in pts.iter().enumerate() {
+                // a tile of a city holds the blocks of hundreds of areas
+                if i % 256 == 255 {
+                    self.check()?;
+                }
                 for (aid, bs) in &blocks {
                     let mut st = 0u8;
                     let mut hit = false;
@@ -412,11 +468,16 @@ impl<'s, W: Write> Engine<'s, W> {
         ranges.dedup();
         // No bbox prefilter: stored boxes of antimeridian-crossing ways do
         // not contain points next to the antimeridian.
+        self.check()?;
         let cands = self.f.in_ranges::<Way>(&ranges, is_closed)?;
+        self.check()?;
         let refs: Vec<&Way> = cands.iter().collect();
         let (tw, _) = self.tilewise_of(&refs)?;
         let mut hit: FxHashSet<Id> = FxHashSet::default();
-        for p in &points {
+        for (i, p) in points.iter().enumerate() {
+            if i % 1024 == 1023 {
+                self.check()?;
+            }
             hit.extend(tw.covering(p.0, p.1));
         }
         out.ways = cands.into_iter().filter(|w| hit.contains(&w.id)).collect();

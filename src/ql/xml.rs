@@ -118,6 +118,10 @@ fn line_offset(src: &str) -> usize {
     usize::from(!decl) + usize::from(!body.starts_with("<osm-script"))
 }
 
+/// Deepest nesting of elements: more than the QL parser takes as nested
+/// statements (1023; a `union` counts two levels there).
+const MAX_DEPTH: usize = 1024;
+
 /// Parse into elements, with expat's messages for the common errors. An
 /// unfinished document is closed at its end, as C++ runs what it read.
 fn parse_tree(src: &str) -> Result<Vec<El>> {
@@ -126,13 +130,19 @@ fn parse_tree(src: &str) -> Result<Vec<El>> {
     let decl = src.starts_with("<?xml");
     let has_root = usize::from(!decl) == offset;
     // The reader stands before the whitespace that precedes an element.
-    let line_at = |pos: usize| {
+    // Positions only grow: the line breaks are counted once.
+    let (mut counted, mut breaks) = (0usize, 0usize);
+    let mut line_at = |pos: usize| {
         let b = src.as_bytes();
         let mut p = pos.min(b.len());
         while p < b.len() && b[p].is_ascii_whitespace() {
             p += 1;
         }
-        src[..p].bytes().filter(|c| *c == b'\n').count() + 1 + offset
+        if p > counted {
+            breaks += b[counted..p].iter().filter(|c| **c == b'\n').count();
+            counted = p;
+        }
+        breaks + 1 + offset
     };
     let mut reader = Reader::from_str(src);
     reader.config_mut().trim_text(true);
@@ -155,6 +165,8 @@ fn parse_tree(src: &str) -> Result<Vec<El>> {
             bail!("line {line}: parse error: junk after document element");
         }
         match ev {
+            // `stmt` and `check_sets` recurse over the elements
+            Ok(Event::Start(_)) if stack.len() > MAX_DEPTH => bail!("line {line}: parse error: Nesting of statements is limited to 1023 levels"),
             Ok(Event::Start(b)) => stack.push(start(&b, line)?),
             Ok(Event::Empty(b)) => {
                 let el = start(&b, line)?;
@@ -214,11 +226,11 @@ pub fn to_ql(src: &str) -> Result<String> {
             &wrapped
         }
     };
-    let mut ql = settings(script)?;
+    let mut ql = Ql { text: settings(script)?, ..Default::default() };
     for c in &script.children {
         stmt(c, &mut ql)?;
     }
-    Ok(ql)
+    Ok(ql.text)
 }
 
 fn settings(s: &El) -> Result<String> {
@@ -257,19 +269,39 @@ fn settings(s: &El) -> Result<String> {
     Ok(out)
 }
 
-/// Pad with newlines so that the next statement starts on `line`.
-fn to_line(ql: &mut String, line: usize) {
-    let cur = ql.bytes().filter(|b| *b == b'\n').count() + 1;
-    for _ in cur..line {
-        ql.push('\n');
+/// The QL text with its count of line breaks, kept while the text grows.
+#[derive(Default)]
+struct Ql {
+    text: String,
+    /// Bytes of `text` whose line breaks are in `breaks`.
+    counted: usize,
+    breaks: usize,
+}
+
+impl Ql {
+    fn push(&mut self, c: char) {
+        self.text.push(c);
     }
+    fn push_str(&mut self, s: &str) {
+        self.text.push_str(s);
+    }
+}
+
+/// Pad with newlines so that the next statement starts on `line`.
+fn to_line(ql: &mut Ql, line: usize) {
+    ql.breaks += ql.text.as_bytes()[ql.counted..].iter().filter(|b| **b == b'\n').count();
+    for _ in ql.breaks + 1..line {
+        ql.text.push('\n');
+        ql.breaks += 1;
+    }
+    ql.counted = ql.text.len();
 }
 
 const QUERY_TYPES: &str = "\"node\", \"way\", \"relation\", \"nwr\", \"nw\", \"wr\", \"nr\", or \"area\"";
 const RECURSE_TYPES: &str = "\"relation-relation\", \"relation-backwards\",\"relation-way\", \"relation-node\", \"way-node\", \"way-relation\",\"node-relation\", \"node-way\", \"down\", \"down-rel\", \"up\", or \"up-rel\"";
 
 /// One statement.
-fn stmt(e: &El, ql: &mut String) -> Result<()> {
+fn stmt(e: &El, ql: &mut Ql) -> Result<()> {
     to_line(ql, e.line);
     match e.name.as_str() {
         "query" => {
@@ -482,6 +514,26 @@ fn criterion(c: &El) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::to_ql;
+
+    /// Nesting 200,000 deep overflowed the stack (`stmt` recurses), and
+    /// the line of every element was counted from the start of the text:
+    /// 1 MB of `<print/>` took 45 s.
+    #[test]
+    fn deep_and_long_documents() {
+        let e = crate::ql::parse(&"<union>".repeat(300_000)).unwrap_err().to_string();
+        assert!(e.contains("Nesting of statements is limited to 1023 levels"), "{e}");
+        let e = crate::ql::parse(&format!("{}{}", "<union>".repeat(1000), "</union>".repeat(1000))).unwrap_err().to_string();
+        assert!(e.contains("Nesting of statements is limited to 1023 levels"), "{e}");
+        assert!(crate::ql::parse(&format!("{}<id-query type=\"node\" ref=\"1\"/>{}", "<union>".repeat(100), "</union>".repeat(100))).is_ok());
+        let start = std::time::Instant::now();
+        let long = format!("<osm-script>{}</osm-script>", "<print/>\n".repeat(120_000));
+        let script = crate::ql::parse(&long).unwrap();
+        assert_eq!(script.stmts.len(), 120_000);
+        assert_eq!(script.stmts[119_999].line, 120_001);
+        assert!(start.elapsed() < std::time::Duration::from_secs(10), "{:?}", start.elapsed());
+        // lines as before: one statement per line of the document
+        assert_eq!(to_ql("<osm-script>\n<print/>\n\n<print/><print/>\n</osm-script>").unwrap(), "\n\n._ out body;\n\n._ out body;._ out body;");
+    }
 
     fn check(xml: &str, ql: &str) {
         assert_eq!(to_ql(xml).unwrap(), ql);

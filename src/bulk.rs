@@ -24,6 +24,20 @@ use std::path::{Path, PathBuf};
 /// Bytes appended before a transaction is committed and a new one begun.
 const CHECKPOINT_BYTES: usize = 1 << 30;
 
+fn checkpoint_bytes() -> usize {
+    #[cfg(test)]
+    if let Some(n) = CHECKPOINT_BYTES_TEST.get() {
+        return n;
+    }
+    CHECKPOINT_BYTES
+}
+
+#[cfg(test)]
+thread_local! {
+    /// `CHECKPOINT_BYTES` of the appenders of this thread, for tests.
+    pub static CHECKPOINT_BYTES_TEST: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
 /// Raw record bytes collected before chunks are packed.
 const WINDOW_BYTES: usize = 4 << 20;
 
@@ -43,11 +57,22 @@ pub struct BulkOptions {
 pub struct Appender<'d> {
     txn: Option<WriteTxn<'d>>,
     written: usize,
+    /// Commit every `CHECKPOINT_BYTES` (the bulk import, whose database
+    /// is marked as incomplete meanwhile).
+    checkpoints: bool,
 }
 
 impl<'d> Appender<'d> {
     pub fn new(txn: WriteTxn<'d>) -> Self {
-        Appender { txn: Some(txn), written: 0 }
+        Appender { txn: Some(txn), written: 0, checkpoints: true }
+    }
+
+    /// An appender that writes everything in the transaction it got: readers
+    /// see the tables as they were until `commit`, then all of the new ones
+    /// (a rebuild of tables that queries read). LMDB writes the pages of a
+    /// large transaction to the file as it goes.
+    pub fn one_transaction(txn: WriteTxn<'d>) -> Self {
+        Appender { txn: Some(txn), written: 0, checkpoints: false }
     }
 
     pub fn txn(&mut self) -> &mut WriteTxn<'d> {
@@ -57,7 +82,7 @@ impl<'d> Appender<'d> {
     pub fn append(&mut self, t: Raw, key: &[u8], value: &[u8]) -> Result<()> {
         self.txn().append(t, key, value)?;
         self.written += key.len() + value.len();
-        if self.written >= CHECKPOINT_BYTES {
+        if self.checkpoints && self.written >= checkpoint_bytes() {
             self.checkpoint()?;
         }
         Ok(())

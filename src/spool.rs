@@ -9,7 +9,10 @@
 //! does not count against `[timeout:]` (as with the C++ server, whose web
 //! server buffers the answer).
 //!
-//! The files of all queries share a byte budget (`serve --spool-max`). When it
+//! The files of all queries share a byte budget (`serve --spool-max`): the
+//! bytes they take on disk. What the client has read is given back to the
+//! file system as it goes (a hole at the start of the file), so the file of
+//! a client that keeps reading takes about what still waits. When the budget
 //! is used up, the query thread waits for its client until its deadline, as
 //! when there was no spool. A client that takes nothing for a while, or does
 //! not finish reading in time, loses its answer; its memory, file and budget
@@ -30,8 +33,23 @@ use std::time::{Duration, Instant};
 pub const MEM_LIMIT: usize = 1 << 20;
 /// Largest piece read back from the file at a time.
 const READ_CHUNK: u64 = 256 << 10;
+/// Bytes read from the file before their disk space is given back.
+const FREE_STEP: u64 = 1 << 20;
 
-/// Bytes in spool files over all queries, against a maximum.
+/// Gives the disk space of `len` bytes at `offset` of the file back to the
+/// file system (a hole; the file keeps its length). False when the file
+/// system cannot do that.
+fn punch_hole(f: &File, offset: u64, len: u64) -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe extern "C" {
+        fn fallocate(fd: i32, mode: i32, offset: i64, len: i64) -> i32;
+    }
+    const FALLOC_FL_KEEP_SIZE: i32 = 1;
+    const FALLOC_FL_PUNCH_HOLE: i32 = 2;
+    unsafe { fallocate(f.as_raw_fd(), FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, offset as i64, len as i64) == 0 }
+}
+
+/// Bytes that spool files take on disk over all queries, against a maximum.
 pub struct Budget {
     used: AtomicU64,
     max: u64,
@@ -50,7 +68,7 @@ impl Budget {
         self.used.fetch_sub(n, Ordering::AcqRel);
     }
 
-    /// Bytes in spool files now.
+    /// Bytes spool files take on disk now.
     pub fn used(&self) -> u64 {
         self.used.load(Ordering::Acquire)
     }
@@ -64,6 +82,9 @@ struct State {
     /// Bytes written to the file, and bytes of it taken by the client.
     file_len: u64,
     file_pos: u64,
+    /// Bytes at the start of the file whose disk space was given back; the
+    /// budget holds the rest (`file_len - file_freed`).
+    file_freed: u64,
     /// The query thread has finished, at this time.
     done: Option<Instant>,
     /// Why the answer was given up (client gone, too slow, file error).
@@ -96,7 +117,7 @@ pub struct Spool {
 impl Spool {
     pub fn new(budget: Arc<Budget>, dir: PathBuf) -> Arc<Spool> {
         Arc::new(Spool {
-            st: Mutex::new(State { mem: VecDeque::new(), mem_bytes: 0, file: None, file_len: 0, file_pos: 0, done: None, failed: None, waker: None, last_take: Instant::now() }),
+            st: Mutex::new(State { mem: VecDeque::new(), mem_bytes: 0, file: None, file_len: 0, file_pos: 0, file_freed: 0, done: None, failed: None, waker: None, last_take: Instant::now() }),
             room: Condvar::new(),
             budget,
             dir,
@@ -183,14 +204,23 @@ impl Spool {
                 return Poll::Ready(Some(Err(e)));
             }
             st.file_pos += n;
-            self.budget.release(n);
             if st.file_pos == st.file_len {
                 // all read: give the disk space back
+                self.budget.release(st.file_len - st.file_freed);
                 if st.file.as_ref().unwrap().set_len(0).is_err() {
                     st.file = None;
                 }
                 st.file_pos = 0;
                 st.file_len = 0;
+                st.file_freed = 0;
+            } else if st.file_pos - st.file_freed >= FREE_STEP {
+                // The blocks read so far. Where the file system cannot free
+                // them, the budget keeps them until the file is read.
+                let upto = st.file_pos & !4095;
+                if punch_hole(st.file.as_ref().unwrap(), st.file_freed, upto - st.file_freed) {
+                    self.budget.release(upto - st.file_freed);
+                    st.file_freed = upto;
+                }
             }
             st.last_take = Instant::now();
             self.room.notify_all();
@@ -211,12 +241,21 @@ impl Spool {
         }
         st.mem.clear();
         st.mem_bytes = 0;
-        self.budget.release(st.file_len - st.file_pos);
+        self.budget.release(st.file_len - st.file_freed);
         st.file = None;
         st.file_pos = 0;
         st.file_len = 0;
+        st.file_freed = 0;
         st.wake();
         self.room.notify_all();
+    }
+
+    /// The query thread stops writing before the end of the answer (it
+    /// waited for its client until its deadline): the response body ends
+    /// with an error, as an answer that only ends would look complete.
+    pub fn give_up(&self, why: &str) {
+        let mut st = self.lock();
+        self.fail(&mut st, why.into());
     }
 
     /// The client went away.
@@ -262,12 +301,19 @@ impl Spool {
         let st = self.lock();
         st.file_len - st.file_pos
     }
+
+    /// Bytes the spool file takes on disk.
+    #[cfg(test)]
+    fn on_disk(&self) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        self.lock().file.as_ref().map_or(0, |f| f.metadata().unwrap().blocks() * 512)
+    }
 }
 
 impl Drop for Spool {
     fn drop(&mut self) {
         let st = self.st.get_mut().unwrap_or_else(|e| e.into_inner());
-        self.budget.release(st.file_len - st.file_pos);
+        self.budget.release(st.file_len - st.file_freed);
     }
 }
 
@@ -436,5 +482,34 @@ mod tests {
         s.close();
         assert_eq!(b.used(), 0);
         assert_eq!(s.push(chunk(0, 10), far()).unwrap_err().kind(), io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn file_stays_within_the_budget_while_the_client_reads() {
+        // a client that keeps reading, slower than the query writes: 200 MiB pass
+        // through a spool of 4 MiB
+        let max = 4 << 20;
+        let b = Budget::new(max);
+        let s = Spool::new(b.clone(), std::env::temp_dir());
+        let w = Waker::from(Arc::new(Noop));
+        let mut cx = Context::from_waker(&w);
+        let mut take = || match s.poll_take(&mut cx) {
+            Poll::Ready(Some(Ok(c))) => c.len(),
+            _ => panic!("no chunk"),
+        };
+        let mut largest = 0;
+        for i in 0..3200 {
+            // the query waits for room in the budget, as `push` does
+            while b.used() + (64 << 10) > max {
+                take();
+            }
+            s.push(chunk(i, 64 << 10), far()).unwrap();
+            // the client takes a piece (256 KiB of the file) for five chunks written (320 KiB)
+            if i % 5 == 4 {
+                take();
+            }
+            largest = largest.max(s.on_disk());
+        }
+        assert!(largest <= max + (2 << 20), "the spool file took {} MiB on disk with a budget of {} MiB", largest >> 20, max >> 20);
     }
 }

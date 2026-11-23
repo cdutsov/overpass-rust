@@ -159,6 +159,13 @@ pub struct Evaluator<'e, 's, W: Write> {
     set_keys_cache: RefCell<FxHashMap<String, Rc<Vec<String>>>>,
     /// Aggregator sets as they were when the evaluator was created.
     sets: RefCell<FxHashMap<String, Option<Rc<Set>>>>,
+    /// Steps of the loops over elements and members (`tick`).
+    ticks: std::cell::Cell<u32>,
+}
+
+/// Bytes of a string held in a list, for the memory limit.
+fn held(s: &str) -> u64 {
+    (std::mem::size_of::<String>() + s.len()) as u64
 }
 
 fn i_str(v: i64) -> String {
@@ -175,6 +182,35 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
             way_cache: RefCell::new(FxHashMap::default()),
             set_keys_cache: RefCell::new(FxHashMap::default()),
             sets: RefCell::new(FxHashMap::default()),
+            ticks: std::cell::Cell::new(0),
+        }
+    }
+
+    /// One step of a loop over elements or members: every 256 steps the
+    /// timeout and the cancellation are checked. The loops nest
+    /// (`per_member` in `per_member`, an aggregator in `(if:)`), so a
+    /// statement can take any number of steps.
+    pub fn tick(&self) -> Result<()> {
+        let n = self.ticks.get().wrapping_add(1);
+        self.ticks.set(n);
+        if n & 0xFF == 0 {
+            self.eng.check()?;
+        }
+        Ok(())
+    }
+
+    /// Count values an evaluator holds in a list against the memory limit
+    /// of the query; `release` them when the list is dropped.
+    fn hold(&self, bytes: u64) -> Result<()> {
+        match &self.eng.f.limits.mem {
+            Some(m) => m.add(0, bytes),
+            None => Ok(()),
+        }
+    }
+
+    fn release(&self, bytes: u64) {
+        if let Some(m) = &self.eng.f.limits.mem {
+            m.release(bytes);
         }
     }
 
@@ -235,6 +271,8 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
         if !nids.is_empty() {
             nids.sort_unstable();
             nids.dedup();
+            // only the position cache keeps them (it has its own limit)
+            let _scope = self.eng.f.limits.mem_scope();
             self.eng.f.node_positions(&nids)?;
         }
         Ok(())
@@ -294,6 +332,9 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
         if let Some(g) = self.geom_cache.borrow().get(&key) {
             return Ok(g.clone());
         }
+        // What is looked up here is dropped again; the geometry stays in
+        // the cache and is counted as what it holds.
+        let scope = self.eng.f.limits.mem_scope();
         let g = match el {
             El::N(n) => DGeom::Point((n.pos.lat(), n.pos.lon())),
             El::W(w) => {
@@ -371,6 +412,8 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
             El::A(_) => DGeom::Null,
             El::D(d) => d.geom.clone().unwrap_or(DGeom::Null),
         };
+        drop(scope);
+        self.hold(48 + 24 * g.points() as u64)?;
         self.geom_cache.borrow_mut().insert(key, g.clone());
         Ok(g)
     }
@@ -468,6 +511,7 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
         if name == "gcat" {
             let mut parts = Vec::new();
             for el in &els {
+                self.tick()?;
                 if let Some(V::G(g)) = self.eval(arg, Cx { el: Some(*el), pos: None, key: cx.key })? {
                     parts.push(g);
                 }
@@ -475,9 +519,15 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
             return Ok(if parts.is_empty() { None } else { Some(V::G(DGeom::Collection(parts))) });
         }
         let mut vals = Vec::with_capacity(els.len());
+        let mut bytes = 0u64;
         for el in &els {
-            vals.push(self.s(arg, Cx { el: Some(*el), pos: None, key: cx.key })?);
+            self.tick()?;
+            let v = self.s(arg, Cx { el: Some(*el), pos: None, key: cx.key })?;
+            bytes += held(&v);
+            self.hold(held(&v))?;
+            vals.push(v);
         }
+        self.release(bytes);
         Ok(Some(V::S(match name {
             "u" => {
                 let mut res: Option<&str> = None;
@@ -621,9 +671,17 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
                 };
                 let mut parts = Vec::with_capacity(positions.len());
                 let Some(arg) = args.first() else { return s(String::new()) };
+                // Nested calls multiply: three levels on a way of 2000 nodes
+                // are 8 x 10^9 values.
+                let mut bytes = 0u64;
                 for p in positions {
-                    parts.push(self.s(arg, Cx { pos: Some(p), ..cx })?);
+                    self.tick()?;
+                    let v = self.s(arg, Cx { pos: Some(p), ..cx })?;
+                    bytes += held(&v);
+                    self.hold(held(&v))?;
+                    parts.push(v);
                 }
+                self.release(bytes);
                 s(parts.join(";"))
             }
             "pos" => s(cx.pos.map(|p| (p + 1).to_string()).unwrap_or_default()),
@@ -688,6 +746,8 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
                 })))
             }
             "lstr" | "poly" | "center" | "trace" | "hull" => {
+                // what the algorithms hold while they run (`thread_hold`)
+                let scope = self.eng.f.limits.mem_scope();
                 let mut gs = Vec::new();
                 for a in args {
                     if let Some(V::G(g)) = self.eval(a, cx)? {
@@ -710,8 +770,11 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
                         Some(g) => geomfn::hull(g),
                     },
                 };
-                // Geometry algorithms stop early when the query runs out of time.
+                // Geometry algorithms stop early when the query runs out of
+                // time or memory.
                 self.eng.check()?;
+                self.hold(0)?;
+                drop(scope);
                 Ok(Some(V::G(g)))
             }
             _ => Err(self.eng.abort(format!("Function \"{name}\" not known"))),
@@ -952,6 +1015,7 @@ impl<'s, W: Write> Engine<'s, W> {
             ev.prefetch(&els, exprs)?;
             let mut keep = Vec::with_capacity(cands.len());
             for el in &els {
+                ev.tick()?;
                 let mut ok = true;
                 for e in exprs {
                     if !truthy(&ev.s(e, Cx { el: Some(*el), pos: None, key: None })?) {
@@ -1067,12 +1131,23 @@ impl<'s, W: Write> Engine<'s, W> {
             let ev = Evaluator::new(self);
             let els = ordered(&src);
             ev.prefetch(&els, [key])?;
+            use super::fetch::MemSize;
             for el in els {
+                ev.tick()?;
                 let vals: Vec<String> = match ev.eval(key, Cx { el: Some(el), pos: None, key: None })? {
                     Some(V::L(l)) => l,
                     Some(v) => vec![v.into_string()],
                     None => vec![String::new()],
                 };
+                // `for (keys())` holds an element once for each of its keys
+                let copy = match el {
+                    El::N(n) => n.mem_size().1,
+                    El::W(w) => w.mem_size().1,
+                    El::R(r) => r.mem_size().1,
+                    El::A(a) => a.mem_size().1,
+                    El::D(d) => d.approx_bytes(),
+                };
+                ev.hold(copy * vals.len() as u64)?;
                 for v in vals {
                     let g = groups.entry(v.into_bytes()).or_default();
                     match el {
@@ -1122,6 +1197,7 @@ impl<'s, W: Write> Engine<'s, W> {
                 let ev = Evaluator::new(self);
                 let mut keep = Vec::new();
                 for d in &cands {
+                    ev.tick()?;
                     let mut ok = true;
                     for e in &plan.ifs {
                         if !truthy(&ev.s(e, Cx { el: Some(El::D(d)), pos: None, key: None })?) {

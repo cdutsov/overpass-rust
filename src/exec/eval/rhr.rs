@@ -248,6 +248,11 @@ fn sort_heap<T: Copy, F: Fn(&T, &T) -> bool>(v: &mut [T], first: usize, mut last
 // Densification along great circles (`interpolation_point`,
 // `Interpolation_Collector`, `interpolate_segment`).
 
+/// Memory an interpolated point takes while a polygon is built: the point,
+/// its segment in the cell index, its place in the rings (measured: 100 MB
+/// to 800 MB for the 7 x 10^6 points of one edge through a pole).
+const POINT_BYTES: u64 = 128;
+
 fn interpolation_point(ox: f64, oy: f64, oz: f64, lgx: f64, lgz: f64, factor: f64, lhs_lon: f64) -> P {
     let d = deg_to_arc();
     let sin_factor = factor.sin();
@@ -317,6 +322,12 @@ impl<'a> Collector<'a> {
 
     fn sequence(&mut self, from: f64, to: f64, max_step: f64) {
         let num_sections = to_i32((to - from) / max_step).wrapping_add(1);
+        // An edge through a pole gets 7 x 10^6 points (the step there is
+        // 10^-9 degrees), and a ring can have many: the points count
+        // against the memory limit of the query before they are made.
+        if num_sections > 1 && !crate::exec::fetch::thread_hold((num_sections - 1) as u64 * POINT_BYTES) {
+            return;
+        }
         for j in 1..num_sections {
             let p = self.point(from + (to - from) * (j as f64) / (num_sections as f64));
             self.target.push(p);
@@ -1280,6 +1291,10 @@ pub fn rhr_polygon(rings: &[Vec<(f64, f64)>]) -> Vec<Vec<(f64, f64)>> {
             interpolate_segment(l[i - 1].lat, l[i - 1].lon, l[i].lat, l[i].lon, &mut a);
         }
         gaps.push(a.len());
+    }
+    // out of time or memory: the evaluator reports it, nothing to build
+    if crate::exec::fetch::thread_expired() || !crate::exec::fetch::thread_hold(0) {
+        return Vec::new();
     }
 
     let mut m: Idx = BTreeMap::new();

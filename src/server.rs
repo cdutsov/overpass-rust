@@ -43,6 +43,9 @@ pub struct ServerConfig {
     pub client_stall: Duration,
     /// Time a client has to read the rest of the answer after the query ended.
     pub client_max: Duration,
+    /// Time past its `[timeout:]` that a query waits for its client when the
+    /// spool budget is used up.
+    pub client_grace: Duration,
 }
 
 impl Default for ServerConfig {
@@ -58,6 +61,7 @@ impl Default for ServerConfig {
             spool_dir: std::env::temp_dir(),
             client_stall: Duration::from_secs(60),
             client_max: Duration::from_secs(1800),
+            client_grace: Duration::from_secs(30),
         }
     }
 }
@@ -173,9 +177,10 @@ impl Write for ChannelWriter {
             return Ok(());
         }
         let chunk = Bytes::from(std::mem::take(&mut self.buf));
-        if self.spool.push(chunk, self.deadline).is_ok() {
-            return Ok(());
-        }
+        let Err(e) = self.spool.push(chunk, self.deadline) else { return Ok(()) };
+        // The rest of the answer is not written: the client must not take
+        // what it has for all of it.
+        self.spool.give_up(&e.to_string());
         self.cancel.store(true, Ordering::Relaxed);
         Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "client went away"))
     }
@@ -183,6 +188,10 @@ impl Write for ChannelWriter {
 
 impl Drop for ChannelWriter {
     fn drop(&mut self) {
+        // Dropped by a panic of the query thread: the answer is cut.
+        if std::thread::panicking() {
+            self.spool.give_up("the query failed");
+        }
         self.spool.finish();
     }
 }
@@ -198,10 +207,12 @@ fn substitute_bbox(q: &str, bbox: Option<&String>) -> String {
     q.replace("(bbox)", &format!("({s},{w},{n},{e})")).replace("[bbox]", &format!("[bbox:{s},{w},{n},{e}]"))
 }
 
-/// Request parameters like the C++ CGI: the query string wins; otherwise a
-/// form-encoded body, or the raw body when it has no `data` field.
-fn request_params(query_string: Option<&str>, body: &[u8]) -> HashMap<String, String> {
-    if let Some(q) = query_string.filter(|q| !q.is_empty()) {
+/// Request parameters like the C++ CGI: the query string wins, except for
+/// a POST with a body (C++ reads the query string of GET, HEAD and OPTIONS
+/// only); otherwise a form-encoded body, or the raw body when it has no
+/// `data` field.
+fn request_params(method: &Method, query_string: Option<&str>, body: &[u8]) -> HashMap<String, String> {
+    if let Some(q) = query_string.filter(|q| !q.is_empty() && (*method != Method::POST || body.is_empty())) {
         return form_urlencoded::parse(q.as_bytes()).into_owned().collect();
     }
     let mut params: HashMap<String, String> = form_urlencoded::parse(body).into_owned().collect();
@@ -212,7 +223,7 @@ fn request_params(query_string: Option<&str>, body: &[u8]) -> HashMap<String, St
 }
 
 async fn interpreter(State(st): State<Arc<AppState>>, method: Method, headers: HeaderMap, uri: axum::http::Uri, body: Bytes) -> Response {
-    let params = request_params(uri.query(), &body);
+    let params = request_params(&method, uri.query(), &body);
     let mut query = params.get("data").cloned().unwrap_or_default();
     if method == Method::OPTIONS && query.is_empty() {
         query = "out;".into();
@@ -298,7 +309,7 @@ async fn run_request(st: Arc<AppState>, method: Method, query: String, jsonp: Op
         }
         st2.served.fetch_add(1, Ordering::Relaxed);
         let timeout = max_timeout.unwrap_or(u32::MAX).min(script.settings.timeout);
-        let mut w = ChannelWriter { spool: spool2, buf: Vec::new(), cancel: cancel2, deadline: Instant::now() + Duration::from_secs(timeout as u64 + 30) };
+        let mut w = ChannelWriter { spool: spool2, buf: Vec::new(), cancel: cancel2, deadline: Instant::now() + Duration::from_secs(timeout as u64) + st2.cfg.client_grace };
         let jsonp = jsonp.filter(|j| !j.is_empty() && matches!(script.settings.out, OutFormat::Json));
         if let Some(j) = &jsonp {
             let _ = w.write_all(format!("{j}(").as_bytes());
@@ -387,3 +398,38 @@ async fn timestamp(State(st): State<Arc<AppState>>) -> Response {
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], format!("{ts}\n")).into_response()
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::task::{Context, Poll, Waker};
+
+    /// A query thread that panics while it writes must not leave an answer
+    /// that ends as a complete one.
+    #[test]
+    fn panic_of_the_query_thread_fails_the_answer() {
+        let spool = Spool::new(Budget::new(1 << 20), std::env::temp_dir());
+        let s2 = spool.clone();
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let mut w = ChannelWriter { spool: s2, buf: Vec::new(), cancel: Arc::new(AtomicBool::new(false)), deadline: Instant::now() + Duration::from_secs(5) };
+            w.write_all(b"<osm>").unwrap();
+            w.flush().unwrap();
+            panic!("a panic of the query thread, for the test");
+        }));
+        assert!(r.is_err());
+        let mut cx = Context::from_waker(Waker::noop());
+        let mut regular_end = false;
+        loop {
+            match spool.poll_take(&mut cx) {
+                Poll::Ready(Some(Ok(_))) => {}
+                Poll::Ready(Some(Err(_))) => break,
+                Poll::Ready(None) => {
+                    regular_end = true;
+                    break;
+                }
+                Poll::Pending => panic!("the answer neither ends nor fails"),
+            }
+        }
+        assert!(!regular_end, "the cut answer ends like a complete one");
+    }
+}

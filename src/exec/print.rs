@@ -223,6 +223,8 @@ impl<'s, W: Write> Engine<'s, W> {
         let by_box = |w: &Way| boxes && !w.missing && !w.bbox.is_empty();
         let mut metas = HashMap::default();
         for (i, win) in ways.chunks(WINDOW).enumerate() {
+            // the vertices of a window are dropped with it
+            let _scope = self.f.limits.mem_scope();
             let mut verts = if need_geom { way_vertices(&self.f, &win.iter().copied().filter(|w| !by_box(w)).collect::<Vec<&Way>>())? } else { HashMap::default() };
             if want_meta && i % META_WINDOWS == 0 {
                 metas = self.f.meta(Kind::Way, &meta_span(&ways, i).iter().map(|w| w.id).collect::<Vec<_>>())?;
@@ -252,6 +254,7 @@ impl<'s, W: Write> Engine<'s, W> {
         remaining -= rels.len() as u64;
         let mut metas = HashMap::default();
         for (i, win) in rels.chunks(WINDOW).enumerate() {
+            let _scope = self.f.limits.mem_scope();
             if want_meta && i % META_WINDOWS == 0 {
                 metas = self.f.meta(Kind::Relation, &meta_span(&rels, i).iter().map(|r| r.id).collect::<Vec<_>>())?;
             }

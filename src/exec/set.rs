@@ -16,18 +16,8 @@ pub struct Derived {
 impl Derived {
     /// Approximate heap size, for the memory limit.
     pub fn approx_bytes(&self) -> u64 {
-        fn points(g: &DGeom) -> usize {
-            match g {
-                DGeom::Null => 0,
-                DGeom::Point(_) => 1,
-                DGeom::LineString(v) => v.len(),
-                DGeom::PartialWay(v) => v.len(),
-                DGeom::Polygon(r) => r.iter().map(Vec::len).sum(),
-                DGeom::Collection(c) | DGeom::PartialRel(c) => c.iter().map(points).sum(),
-            }
-        }
         let tags: usize = self.tags.iter().map(|(k, v)| 48 + k.len() + v.len()).sum();
-        (96 + self.tname.len() + tags + self.geom.as_ref().map_or(0, |g| 24 * points(g))) as u64
+        (96 + self.tname.len() + tags + self.geom.as_ref().map_or(0, |g| 24 * g.points())) as u64
     }
 }
 

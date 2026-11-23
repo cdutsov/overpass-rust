@@ -3,6 +3,53 @@
 Changes of overpass-rust, newest first. "Overpass API" is the C++ server
 (0.7.62) whose answers overpass-rust reproduces.
 
+## 0.2.7 (2026-11-23)
+
+Fixed: queries that stopped the server or escaped its limits
+- An expression with a long chain of operators (`1+1+…`, `a||b||…`, `?:`) of
+  about 400 KB overflowed the stack and ended the server process, with every
+  query it was running. Expressions are limited to 1024 nested operators and
+  XML queries to 1023 levels of nesting; deeper ones are a parse error.
+- Parsing an XML query took time growing with the square of its length (1 MB
+  of `<print/>`: 45 s, outside any timeout). It is linear.
+- The candidates a tag index read collects (`way["highway"]`) did not count
+  against the memory limit of the query, so one query could take tens of GB.
+  They count, and such a query ends with "Query run out of memory".
+- Polygon edges through a pole were interpolated into millions of points that
+  did not count against the memory limit. They count.
+- `union` held all its parts until the end without counting them: thousands of
+  parts could take tens of GB. The parts count against the memory limit and
+  merge early when there are many.
+- `per_member`, `per_vertex`, the aggregators, `(if:)` and `for` checked
+  neither the timeout nor the memory limit while they ran. They do.
+- `is_in` did not check the timeout, and `around` over a set checked it only
+  between statements.
+- Geometry tests (`poly`, `around`, and boxes on ways and relations) built the
+  geometry of all candidates at once and counted every node position until the
+  statement ended: a large region failed with "out of memory" where the same
+  region as a box answered. They work in batches.
+- CSV output with more than 10,000 columns is a parse error (400,000 columns
+  used up the memory of the server). Compiling the regular expressions of a
+  query may take 5 s at most.
+- `area(pivot.a)` and `area` with a recursion clause (`area(<)`) returned
+  every area of the database. They return no areas.
+- `(area)` with a closed way that crosses the antimeridian, or goes around a
+  pole, missed elements inside it that `is_in` puts inside: its candidates
+  were taken from the box of its vertices. They cover its whole area; for a
+  way around a pole that is everything north of it, as with `is_in`.
+
+Fixed: server
+- The area rebuild committed its tables every 1 GiB, so queries during the
+  rebuild (about two minutes a day) could see part of the areas. The tables
+  are replaced in one transaction.
+- The spool file of a client that kept reading, slower than the query wrote,
+  grew to the size of the whole answer. Parts the client has read are given
+  back to the file system, and `serve --spool-max` counts the bytes on disk.
+- An answer cut short because the client was too slow, or because the query
+  failed, ended like a complete one. The response ends with an error.
+- A POST with a query string in the URL ignored its body. The body is used, as
+  in the C++ server.
+
 ## 0.2.6 (2026-11-18)
 
 Fixed: server

@@ -100,6 +100,9 @@ pub struct Engine<'s, W: Write> {
     pub derived_counter: u64,
     pub area_level: bool,
     cur_stmt: (&'static str, usize),
+    /// Size (as `Slot::bytes`) of the sets that running `union` statements
+    /// hold outside the frames: their parts and what they merged so far.
+    held_bytes: u64,
     pub cli: bool,
     pub messages: Vec<String>,
 }
@@ -312,6 +315,7 @@ pub fn run_script<W: Write>(snap: &Snapshot, script: Script, w: W, opts: &RunOpt
         derived_counter: 0,
         area_level,
         cur_stmt: ("", 0),
+        held_bytes: 0,
         cli: opts.cli,
         messages: Vec::new(),
     };
@@ -420,7 +424,7 @@ impl<'s, W: Write> Engine<'s, W> {
         if let Some(m) = &self.f.limits.mem {
             let size: u64 = self.frames.iter().flat_map(|f| f.values()).map(|s| s.size).sum();
             let bytes: u64 = self.frames.iter().flat_map(|f| f.values()).map(|s| s.bytes).sum();
-            m.reset(size, bytes);
+            m.reset(size, bytes.saturating_add(self.held_bytes));
         }
     }
 
@@ -428,7 +432,7 @@ impl<'s, W: Write> Engine<'s, W> {
     /// exceed the memory limit.
     pub fn check_memory(&self, extra: u64) -> Result<()> {
         let bytes: u64 = self.frames.iter().flat_map(|f| f.values()).map(|s| s.bytes).sum();
-        if bytes.saturating_add(extra) > self.memory_limit() {
+        if bytes.saturating_add(self.held_bytes).saturating_add(extra) > self.memory_limit() {
             return Err(Abort(format!("Query run out of memory using about {} MB of RAM.", self.memory_limit() >> 20)).into());
         }
         Ok(())
@@ -470,7 +474,7 @@ impl<'s, W: Write> Engine<'s, W> {
                     self.set_rc(&s.into, v);
                 }
             }
-            StmtKind::Union(stmts) => self.union(stmts, &s.into)?,
+            StmtKind::Union(stmts) => self.union(stmts, &s.into, s.line)?,
             StmtKind::Difference(a, b) => self.difference(a, b, &s.into)?,
             StmtKind::Recurse { op, input } => {
                 let inp = self.get(input);
@@ -547,18 +551,76 @@ impl<'s, W: Write> Engine<'s, W> {
         }
     }
 
-    fn union(&mut self, stmts: &[Stmt], into: &str) -> Result<()> {
+    /// The parts of a union are merged at its end, in one pass. They are
+    /// held outside the frames, so their size is counted in `held_bytes`.
+    /// Two cases merge earlier, into `acc`: many parts (64 and more, when
+    /// they outgrow twice the merged ones: `(.a; .b; .a; .b; ...)` with a
+    /// million parts would hold a million copies), and large parts: once
+    /// they take a quarter of the memory limit, or once they and the stored
+    /// sets take half of it as the limits count them. A set that follows
+    /// itself (`(.a; .a;)`) is taken once. Once the merged parts alone pass
+    /// `maxsize` the statement fails, as it would at its end.
+    fn union(&mut self, stmts: &[Stmt], into: &str, line: usize) -> Result<()> {
+        const MANY_PARTS: usize = 64;
         self.frames.push(HashMap::new());
         self.take_into_frame(into);
-        let mut parts: Vec<Rc<Set>> = Vec::with_capacity(stmts.len());
+        let mut acc: Option<Rc<Set>> = None;
+        let (mut acc_len, mut acc_bytes) = (0usize, 0u64);
+        let mut parts: Vec<Rc<Set>> = Vec::with_capacity(stmts.len().min(64));
+        let (mut parts_len, mut parts_bytes) = (0usize, 0u64);
+        // what the parts take in memory: a node counts 8 bytes in
+        // `Slot::bytes` and takes 50 and more
+        let mut parts_real = 0u64;
+        let mut last: Option<Rc<Set>> = None;
         for st in stmts {
             self.exec(st)?;
-            if let Some(r) = self.lookup(&st.into) {
-                parts.push(r.clone());
+            let Some((set, bytes)) = self.frames.iter().rev().find_map(|f| f.get(&st.into)).map(|s| (s.set.clone(), s.bytes)) else { continue };
+            if last.as_ref().is_some_and(|l| Rc::ptr_eq(l, &set)) {
+                continue;
             }
+            last = Some(set.clone());
+            parts_len += set.len();
+            parts_bytes += bytes;
+            parts_real += set.approx_bytes();
+            self.held_bytes += bytes;
+            parts.push(set);
+            let many = parts.len() >= MANY_PARTS && parts_len > 2 * acc_len + 100_000;
+            // Past half the limit the parts are merged once they are a
+            // quarter of the merged ones or 256 MiB: the next statement may
+            // then store a set of `maxsize` without passing the limit, and
+            // parts that add little do not each cost a merge.
+            let stored: u64 = self.frames.iter().flat_map(|f| f.values()).map(|s| s.bytes).sum();
+            let large = stored.saturating_add(self.held_bytes) > self.memory_limit() / 2 && (parts_bytes >= acc_bytes / 4 || parts_bytes >= 256 << 20);
+            if !many && !large && parts_real <= self.memory_limit() / 4 {
+                continue;
+            }
+            let mut all: Vec<Rc<Set>> = acc.take().into_iter().collect();
+            all.append(&mut parts);
+            let merged = Set::union_all(&all);
+            drop(all);
+            self.held_bytes -= acc_bytes + parts_bytes;
+            let size = merged.counted_size();
+            acc_len = merged.len();
+            acc_bytes = size + derived_bytes(&merged);
+            (parts_len, parts_bytes, parts_real) = (0, 0, 0);
+            self.held_bytes += acc_bytes;
+            acc = Some(Rc::new(merged));
+            if size > self.settings.maxsize {
+                return Err(Abort(format!("Query ran out of memory in \"union\" at line {line}. It would need at least {} MB of RAM to continue.", size >> 20)).into());
+            }
+            self.check_memory(0)?;
+            self.check()?;
         }
-        let acc = Set::union_all(&parts);
-        drop(parts);
+        drop(last);
+        let acc = match (acc, parts.is_empty()) {
+            (Some(a), true) => Rc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()),
+            (a, _) => {
+                let mut all: Vec<Rc<Set>> = a.into_iter().collect();
+                all.append(&mut parts);
+                Set::union_all(&all)
+            }
+        };
+        self.held_bytes -= acc_bytes + parts_bytes;
         self.pop_and_leak(Some(into));
         self.set(into, acc);
         Ok(())

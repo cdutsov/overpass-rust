@@ -374,6 +374,11 @@ Per element type (expensive filter, 262-392):
 - Candidate ranges (coarse, no semantic effect apart from the ref quirk): block-tile node ranges `[t, t+0x100)` of the DB areas,
   plus (from input only) the index ranges covered by all input ways. Ways and relations whose indices fall outside the parents of those ranges are
   dropped early.
+  Rust: the block tiles of the DB areas, and rectangles around each closed way (`area.rs` `ring_rects`) that hold its whole
+  implicit area (§5.2). A closed way with an edge across the antimeridian (Δlon > 180°) has its area at both ends of the
+  longitude range, outside the box of its nodes: it gets a rectangle at each end. A closed way that crosses it once goes
+  around a pole, and every tile row from its southernmost one north is inside it at all longitudes (the westmost column
+  carries the parity north): it gets that whole band.
 - Strategy hint only: with fewer than 12 tiles (ref) or ≤12 used indices (input), ranges are preferred, otherwise ids.
 
 ## 7. `area` queries and area ids (`statements/query.cc`, `statements/id_query.cc`)

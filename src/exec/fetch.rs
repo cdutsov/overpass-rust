@@ -120,6 +120,16 @@ impl MemBudget {
         }
         Ok(())
     }
+
+    /// Take bytes off the memory estimate that `add` counted for data
+    /// since dropped (lists of an evaluator).
+    pub fn release(&self, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let mut cur = self.bytes.load(Relaxed);
+        while let Err(now) = self.bytes.compare_exchange_weak(cur, cur.saturating_sub(bytes), Relaxed, Relaxed) {
+            cur = now;
+        }
+    }
 }
 
 /// Size of a decoded element for the memory limits: the C++ counted size
@@ -187,6 +197,58 @@ impl Limits {
     }
 }
 
+/// Gives back, when dropped, what was counted against the memory estimate
+/// since it was made (`Limits::mem_scope`).
+pub struct MemScope {
+    mem: Option<std::sync::Arc<MemBudget>>,
+    mark: u64,
+}
+
+impl Drop for MemScope {
+    fn drop(&mut self) {
+        if let Some(m) = &self.mem {
+            m.bytes.fetch_min(self.mark, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+impl Limits {
+    /// For lookups whose results are dropped before the statement ends
+    /// (the vertices of a batch of ways for a geometry test or a print
+    /// window): the memory estimate returns to its present value when the
+    /// scope is dropped. Without it every decoded node stays counted (64
+    /// bytes) until the statement ends, and a statement that looks at the
+    /// geometry of 3 x 10^6 ways runs out of the 2 GiB of the default
+    /// `maxsize` while it holds a few MB.
+    pub fn mem_scope(&self) -> MemScope {
+        MemScope { mark: self.mem.as_ref().map_or(0, |m| m.bytes.load(std::sync::atomic::Ordering::Relaxed)), mem: self.mem.clone() }
+    }
+}
+
+/// Bytes of one candidate pair of a tag index read.
+const PAIR_BYTES: u64 = std::mem::size_of::<(Cell, Id)>() as u64;
+
+impl Limits {
+    /// Account for candidate pairs of a tag index read against the memory
+    /// budget: their list is held while the elements are decoded, and a
+    /// key alone can list most elements of the planet.
+    fn account_pairs(&self, n: usize) -> Result<()> {
+        match &self.mem {
+            Some(m) => m.add(0, n as u64 * PAIR_BYTES),
+            None => Ok(()),
+        }
+    }
+
+    /// Candidate pairs the memory budget has room for.
+    fn pairs_room(&self) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        match &self.mem {
+            Some(m) => (m.max_bytes.load(Relaxed).saturating_sub(m.bytes.load(Relaxed)) / PAIR_BYTES) as usize,
+            None => usize::MAX,
+        }
+    }
+}
+
 thread_local! {
     /// Limits of the query running on this thread, for code without access
     /// to the engine (geometry algorithms).
@@ -202,6 +264,16 @@ pub fn set_thread_limits(l: Limits) {
 /// Long computations stop early; the engine reports the timeout afterwards.
 pub fn thread_expired() -> bool {
     THREAD_LIMITS.with(|t| t.borrow().expired())
+}
+
+/// Count bytes that a geometry algorithm holds for the query running on
+/// this thread. False when the query is past its memory limit: the
+/// algorithm stops, and the evaluator reports the limit afterwards.
+pub fn thread_hold(bytes: u64) -> bool {
+    THREAD_LIMITS.with(|t| match &t.borrow().mem {
+        Some(m) => m.add(0, bytes).is_ok(),
+        None => true,
+    })
 }
 
 /// Entries kept in the node position cache before it is reset.
@@ -565,6 +637,7 @@ impl<'s> Fetch<'s> {
             if n % 4096 == 0 {
                 self.limits.check()?;
             }
+            self.limits.account_pairs(ids.len())?;
             out.extend(ids.iter().map(|id| (cell, *id)));
             Ok(Scan::Next)
         })?;
@@ -678,6 +751,7 @@ impl<'s> Fetch<'s> {
                 self.limits.check()?;
             }
             if within.is_none_or(|r| cell_in_ranges(cell, r)) {
+                self.limits.account_pairs(ids.len())?;
                 out.extend(ids.iter().map(|id| (cell, *id)));
                 if out.len() > max {
                     over = true;
@@ -726,7 +800,12 @@ impl<'s> Fetch<'s> {
         let limits = &self.limits;
         // Values failing the regex are skipped as a whole (`scan_candidates`).
         let accept = |val: &[u8]| re.is_none_or(|re| val.contains(&1) || std::str::from_utf8(val).is_ok_and(|s| re.is_match(s)));
-        let out = self.snap.scan_tags_par(kind, &k, prefixes, ranges, SCAN_THREADS, max, || limits.expired(), accept, keep)?;
+        // The threads stop past the pairs the memory budget has room for;
+        // more than that is then an error.
+        let out = self.snap.scan_tags_par(kind, &k, prefixes, ranges, SCAN_THREADS, max.min(limits.pairs_room()), || limits.expired(), accept, keep)?;
+        if let Some(out) = &out {
+            limits.account_pairs(out.len())?;
+        }
         #[cfg(test)]
         PAR_SCANS.set(PAR_SCANS.get() + out.is_some() as usize);
         Ok(out)
@@ -915,6 +994,46 @@ impl<'s> Fetch<'s> {
 mod tests {
     use super::*;
 
+    /// A key alone lists every element that has it: the list counts
+    /// against the memory limit of the query, on one thread and on several.
+    #[test]
+    fn tag_index_candidates_count_against_the_memory_limit() {
+        let dir = std::env::temp_dir().join(format!("fetch-candidates-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut osm = String::from("<osm version=\"0.6\">\n");
+        for i in 1..=5000u64 {
+            osm += &format!("<node id=\"{i}\" lat=\"{:.4}\" lon=\"{:.4}\"><tag k=\"k\" v=\"v{}\"/></node>\n", 10.0 + (i % 70) as f64 * 0.01, 20.0 + (i / 70) as f64 * 0.01, i % 50);
+        }
+        let file = dir.join("in.osm");
+        std::fs::write(&file, osm + "</osm>\n").unwrap();
+        let db = crate::store::Db::open(&dir.join("db")).unwrap();
+        crate::import::import_file(&db, &file, &mut Default::default()).unwrap();
+        let snap = db.snapshot().unwrap();
+        let mut f = Fetch::new(&snap);
+        let t = TagFilter::HasKey("k".into());
+        for par in [false, true] {
+            // more than one value: the scan on several threads
+            PAR_SCAN_VALUES.set(par.then_some(1));
+            PAR_SCANS.set(0);
+            f.limits.mem = Some(std::sync::Arc::new(MemBudget::new(u64::MAX, 1 << 30)));
+            assert_eq!(f.tag_candidates(Kind::Node, &t, None).unwrap().len(), 5000);
+            assert_eq!(f.tag_candidates_in(Kind::Node, &t, None, usize::MAX).unwrap().unwrap().len(), 5000);
+            assert_eq!(PAR_SCANS.get() > 0, par);
+            // room for 1000 pairs
+            for run in 0..2 {
+                f.limits.mem = Some(std::sync::Arc::new(MemBudget::new(u64::MAX, 1000 * PAIR_BYTES)));
+                let r = if run == 0 { f.tag_candidates(Kind::Node, &t, None).map(|p| p.len()) } else { f.tag_candidates_in(Kind::Node, &t, None, usize::MAX).map(|p| p.map_or(0, |p| p.len())) };
+                match r {
+                    Err(e) => assert!(e.downcast_ref::<OutOfMemory>().is_some(), "{e}"),
+                    Ok(n) => panic!("{n} candidates read with room for 1000 (several threads: {par})"),
+                }
+            }
+        }
+        PAR_SCAN_VALUES.set(None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Whether a cell may hold an element of the kind that meets one of the
     /// rectangles: its tile (nodes) or its loose extent (ways, relations).
     fn cell_meets(kind: Kind, c: Cell, rects: &[Rect]) -> bool {
@@ -1065,5 +1184,119 @@ mod tests {
         let each: Vec<CodeRange> = small.iter().flat_map(|r| arc_ranges(Kind::Way, std::slice::from_ref(r))).collect();
         assert!(covers(&arc_ranges(Kind::Way, &small), &each));
         assert_eq!(arc_ranges(Kind::Node, &small), ranges_for(Kind::Node, &small));
+    }
+
+    /// The ranges hold every cell that may hold an element meeting one of
+    /// the rectangles (`cell_meets`), computed cell by cell: random sets of
+    /// 1 to 300 rectangles (alone through `level_ranges`, more than 32
+    /// through `tile_runs`, `join_rows` and `level_ranges_many`), from points
+    /// to the whole key space, many at its ends in longitude (the
+    /// antimeridian, boxes across it as two rectangles) and bands of the
+    /// whole width. Every cell of the levels up to 7; above, the cells around
+    /// the corners of 40 rectangles and random ones inside and anywhere.
+    /// Each `level_ranges` and `level_ranges_many` holds the cells of its
+    /// rectangles as well.
+    #[test]
+    fn ranges_hold_every_cell_of_the_rectangles() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) % n.max(1)
+        };
+        let cell = |level: u8, cy: u32, cx: u32| -> Cell {
+            if level == 0 {
+                return Cell { level: 0, code: 0 };
+            }
+            let s = 16 - level as u32;
+            Cell { level, code: crate::geo::morton(cy << s, cx << s) }
+        };
+        for case in 0..48u64 {
+            let n = [1, 3, 20, 33, 60, 300][(case % 6) as usize];
+            let mut rects: Vec<Rect> = Vec::new();
+            while rects.len() < n {
+                let size = |rnd: &mut dyn FnMut(u64) -> u64| -> u64 { (1u64 << rnd(33)) - 1 + rnd(2) };
+                let (h, w) = (size(&mut rnd), size(&mut rnd));
+                let y0 = rnd(u32::MAX as u64 + 1);
+                let y1 = (y0 + h).min(u32::MAX as u64);
+                let (x0, x1) = match rnd(6) {
+                    // at the west or east end
+                    0 => (0, w.min(u32::MAX as u64)),
+                    1 => ((u32::MAX as u64).saturating_sub(w), u32::MAX as u64),
+                    // the whole width
+                    2 => (0, u32::MAX as u64),
+                    _ => {
+                        let x0 = rnd(u32::MAX as u64 + 1);
+                        (x0, (x0 + w).min(u32::MAX as u64))
+                    }
+                };
+                let r = Rect { y0: y0 as u32, x0: x0 as u32, y1: y1 as u32, x1: x1 as u32 };
+                if rnd(4) == 0 {
+                    // a box across the antimeridian
+                    let (s, wl, d) = (rnd(170) as f64 - 85.0, 180.0 - rnd(30_000) as f64 / 1000.0, rnd(5_000) as f64 / 1000.0);
+                    rects.extend(crate::geo::BBox { south: s, west: wl, north: s + d, east: -180.0 + d }.rects());
+                } else {
+                    rects.push(r);
+                }
+            }
+            if case % 5 == 0 {
+                rects.push(Rect::EMPTY);
+            }
+            for kind in [Kind::Node, Kind::Way] {
+                let ranges = ranges_for(kind, &rects);
+                let levels: Vec<u8> = if kind == Kind::Node { vec![MAX_LEVEL] } else { (0..=MAX_LEVEL).collect() };
+                for &level in &levels {
+                    let loose = kind != Kind::Node;
+                    let many = level_ranges_many(level, &rects, loose);
+                    let each: Vec<Vec<CodeRange>> = rects.iter().map(|r| level_ranges(level, r, loose)).collect();
+                    let check = |c: Cell| {
+                        if !cell_meets(kind, c, &rects) {
+                            return;
+                        }
+                        let ok = cell_in_ranges(c, &ranges) && cell_in_ranges(c, &many);
+                        assert!(ok, "case {case} {kind:?} {c:?} ranges_for {} many {}", cell_in_ranges(c, &ranges), cell_in_ranges(c, &many));
+                        for (r, e) in rects.iter().zip(&each) {
+                            if cell_meets(kind, c, std::slice::from_ref(r)) {
+                                assert!(cell_in_ranges(c, e), "case {case} {kind:?} {c:?} {r:?}");
+                            }
+                        }
+                    };
+                    if level <= 7 {
+                        for cy in 0..1u32 << level {
+                            for cx in 0..1u32 << level {
+                                check(cell(level, cy, cx));
+                            }
+                        }
+                        continue;
+                    }
+                    let shift = 32 - level as u32;
+                    let top = (1u64 << level) - 1;
+                    let mut cells = Vec::new();
+                    for r in rects.iter().filter(|r| !r.is_empty()).take(40) {
+                        for (y, x) in [(r.y0, r.x0), (r.y0, r.x1), (r.y1, r.x0), (r.y1, r.x1)] {
+                            for dy in -2i64..=2 {
+                                for dx in -2i64..=2 {
+                                    let cy = ((y >> shift) as i64 + dy).clamp(0, top as i64) as u32;
+                                    let cx = ((x >> shift) as i64 + dx).clamp(0, top as i64) as u32;
+                                    cells.push((cy, cx));
+                                }
+                            }
+                        }
+                        for _ in 0..8 {
+                            let cy = (r.y0 >> shift) as u64 + rnd(((r.y1 >> shift) - (r.y0 >> shift)) as u64 + 1);
+                            let cx = (r.x0 >> shift) as u64 + rnd(((r.x1 >> shift) - (r.x0 >> shift)) as u64 + 1);
+                            cells.push((cy as u32, cx as u32));
+                        }
+                    }
+                    for _ in 0..200 {
+                        cells.push((rnd(top + 1) as u32, rnd(top + 1) as u32));
+                    }
+                    for (cy, cx) in cells {
+                        check(cell(level, cy, cx));
+                    }
+                }
+            }
+        }
     }
 }

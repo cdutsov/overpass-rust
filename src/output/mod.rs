@@ -340,6 +340,18 @@ impl DGeom {
         }
     }
 
+    /// Number of positions held, missing ones included.
+    pub fn points(&self) -> usize {
+        match self {
+            DGeom::Null => 0,
+            DGeom::Point(_) => 1,
+            DGeom::LineString(v) => v.len(),
+            DGeom::PartialWay(v) => v.len(),
+            DGeom::Polygon(r) => r.iter().map(Vec::len).sum(),
+            DGeom::Collection(c) | DGeom::PartialRel(c) => c.iter().map(DGeom::points).sum(),
+        }
+    }
+
     pub fn center(&self) -> Option<LatLon> {
         match self {
             DGeom::Null => None,

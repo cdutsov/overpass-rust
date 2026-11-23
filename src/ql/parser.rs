@@ -24,7 +24,7 @@ pub fn parse(src: &str) -> Result<Script> {
 
 fn parse_ql(src: &str) -> Result<Script> {
     let toks = tokenize(src)?;
-    let mut p = Parser { toks, pos: 0, global_bbox: false, expr_depth: 0, ectx: ECtx::Set };
+    let mut p = Parser { toks, pos: 0, global_bbox: false, expr_depth: 0, depth: 0, ectx: ECtx::Set, regex_time: std::time::Duration::ZERO };
     p.script()
 }
 
@@ -34,11 +34,24 @@ struct Parser {
     global_bbox: bool,
     /// Current expression nesting, bounded to keep recursion off the stack limit.
     expr_depth: usize,
+    /// Height of the tree of the expression parsed last (a literal: 1).
+    /// Operator chains such as `1+1+1` nest without parentheses, and the
+    /// evaluator, `Clone` and `Drop` recurse over the tree.
+    depth: usize,
     /// What the expression being parsed can evaluate.
     ectx: ECtx,
+    /// Time spent compiling regular expressions (`check_regex`).
+    regex_time: std::time::Duration,
 }
 
 const MAX_EXPR_DEPTH: usize = 256;
+
+/// Largest height of an expression tree. The evaluator takes less than
+/// 1 kB of stack per level; query threads have 64 MB.
+const MAX_EXPR_HEIGHT: usize = 1024;
+
+/// Most fields of `[out:csv(...)]`.
+const MAX_CSV_FIELDS: usize = 10_000;
 
 const AGGREGATORS: &[&str] = &["u", "set", "min", "max", "sum", "count", "gcat"];
 
@@ -399,6 +412,11 @@ impl Parser {
             }
             if !self.eat_p(",") {
                 break;
+            }
+            // Every element is a line with all fields: with 400,000 of them,
+            // the lines that are formatted at a time (8192) took 3 GB.
+            if spec.fields.len() >= MAX_CSV_FIELDS {
+                return self.static_err(self.line(), format!("The CSV format takes at most {MAX_CSV_FIELDS} fields."));
             }
         }
         if self.eat_p(";") {
@@ -801,13 +819,13 @@ impl Parser {
                 if neg {
                     return self.static_err(line, "In the element \"has-kv\" regular expressions on keys cannot be combined with negation.");
                 }
-                check_regex(line, &key)?;
-                check_regex(line, &re)?;
+                self.check_regex(line, &key)?;
+                self.check_regex(line, &re)?;
                 Some(Filter::KeyRegex { key, value: re, ci })
             } else if re.is_empty() {
                 Some(Filter::HasKey(key))
             } else {
-                check_regex(line, &re)?;
+                self.check_regex(line, &re)?;
                 Some(Filter::Regex { key, re, ci, neg })
             }
         } else {
@@ -1175,7 +1193,9 @@ impl Parser {
     fn expr_inner(&mut self) -> Result<Expr> {
         let mut c = self.or_expr()?;
         while self.eat_p("?") {
+            let dc = self.depth;
             let a = self.or_expr()?;
+            let da = self.depth;
             if !self.eat_p(":") {
                 return self.err("Operator \"?\" must have a \":\" operator as right-hand-side argument");
             }
@@ -1183,6 +1203,7 @@ impl Parser {
             self.want(&c, Ty::Str, "string")?;
             let t = ty_of(&a);
             self.want(&b, t, t.name())?;
+            self.grow(dc.max(da))?;
             c = Expr::Ternary(Box::new(c), Box::new(a), Box::new(b));
         }
         Ok(c)
@@ -1191,8 +1212,9 @@ impl Parser {
     fn or_expr(&mut self) -> Result<Expr> {
         let mut l = self.and_expr()?;
         while self.eat_p("||") {
+            let dl = self.depth;
             let r = self.and_expr()?;
-            l = self.binary(BinOp::Or, l, r)?;
+            l = self.binary(BinOp::Or, l, dl, r)?;
         }
         Ok(l)
     }
@@ -1200,8 +1222,9 @@ impl Parser {
     fn and_expr(&mut self) -> Result<Expr> {
         let mut l = self.eq_expr()?;
         while self.eat_p("&&") {
+            let dl = self.depth;
             let r = self.eq_expr()?;
-            l = self.binary(BinOp::And, l, r)?;
+            l = self.binary(BinOp::And, l, dl, r)?;
         }
         Ok(l)
     }
@@ -1216,8 +1239,9 @@ impl Parser {
             } else {
                 break;
             };
+            let dl = self.depth;
             let r = self.rel_expr()?;
-            l = self.binary(op, l, r)?;
+            l = self.binary(op, l, dl, r)?;
         }
         Ok(l)
     }
@@ -1236,8 +1260,9 @@ impl Parser {
             } else {
                 break;
             };
+            let dl = self.depth;
             let r = self.add_expr()?;
-            l = self.binary(op, l, r)?;
+            l = self.binary(op, l, dl, r)?;
         }
         Ok(l)
     }
@@ -1266,22 +1291,36 @@ impl Parser {
             } else {
                 break;
             };
+            let dl = self.depth;
             let r = self.mul_expr()?;
-            l = self.binary(op, l, r)?;
+            l = self.binary(op, l, dl, r)?;
         }
         Ok(l)
     }
 
     /// Operators take strings.
-    fn binary(&self, op: BinOp, l: Expr, r: Expr) -> Result<Expr> {
+    /// `dl`: the height of `l`; `r` is the expression parsed last.
+    fn binary(&mut self, op: BinOp, l: Expr, dl: usize, r: Expr) -> Result<Expr> {
         self.want(&l, Ty::Str, "string")?;
         self.want(&r, Ty::Str, "string")?;
+        self.grow(dl)?;
         Ok(Expr::Binary(op, Box::new(l), Box::new(r)))
     }
 
-    fn unary(&self, op: UnOp, e: Expr) -> Result<Expr> {
+    fn unary(&mut self, op: UnOp, e: Expr) -> Result<Expr> {
         self.want(&e, Ty::Str, "string")?;
+        self.grow(0)?;
         Ok(Expr::Unary(op, Box::new(e)))
+    }
+
+    /// A node over the expression parsed last and others of height `other`
+    /// at most: its height becomes the height of the expression parsed last.
+    fn grow(&mut self, other: usize) -> Result<()> {
+        self.depth = self.depth.max(other) + 1;
+        if self.depth > MAX_EXPR_HEIGHT {
+            return self.err(format!("Expressions are limited to {MAX_EXPR_HEIGHT} nested operators"));
+        }
+        Ok(())
     }
 
     fn add_operand(&mut self) -> Result<Expr> {
@@ -1311,8 +1350,9 @@ impl Parser {
             } else {
                 break;
             };
+            let dl = self.depth;
             let r = self.unary_expr()?;
-            l = self.binary(op, l, r)?;
+            l = self.binary(op, l, dl, r)?;
         }
         Ok(l)
     }
@@ -1337,15 +1377,21 @@ impl Parser {
         self.expect_p("(")?;
         let mut args = Vec::new();
         if self.eat_p(")") {
+            self.depth = 1;
             return Ok(args);
         }
+        let mut deepest = 0;
         loop {
             args.push(self.expr()?);
+            deepest = deepest.max(self.depth);
             if !self.eat_p(",") {
                 break;
             }
         }
         self.expect_p(")")?;
+        // the call or aggregator over its arguments
+        self.depth = 0;
+        self.grow(deepest)?;
         Ok(args)
     }
 
@@ -1353,10 +1399,12 @@ impl Parser {
         match self.peek().clone() {
             Tok::Str(s) => {
                 self.next();
+                self.depth = 1;
                 Ok(Expr::Lit(s))
             }
             Tok::Num(n) => {
                 self.next();
+                self.depth = 1;
                 Ok(Expr::Lit(n))
             }
             Tok::P("(") => {
@@ -1374,6 +1422,7 @@ impl Parser {
                     let w = w.clone();
                     return self.err(format!("\"::\" cannot be used as unary operator; use {w}() instead of ::{w}"));
                 }
+                self.depth = 1;
                 Ok(Expr::Generic)
             }
             Tok::Word(w) => {
@@ -1384,6 +1433,7 @@ impl Parser {
                     let k = self.expr()?;
                     self.want(&k, Ty::Str, "string")?;
                     self.expect_p("]")?;
+                    self.grow(0)?;
                     return Ok(match k {
                         Expr::Lit(s) => Expr::Tag(s),
                         other => Expr::Call("t".into(), vec![other]),
@@ -1409,6 +1459,7 @@ impl Parser {
                         if args.is_empty() && matches!(w.as_str(), "count_by_role" | "count_distinct_by_role") {
                             return self.err(format!("{w}() must have the name of the wanted role as argument"));
                         }
+                        self.depth = 2;
                         return Ok(Expr::Call(w, args));
                     }
                     let line = self.line();
@@ -1432,6 +1483,7 @@ impl Parser {
                         let set = if w == "_" { None } else { Some(w) };
                         return Ok(Expr::Agg { set, name, args });
                     }
+                    self.depth = 1;
                     return Ok(Expr::SetProp { set: w, prop: name });
                 }
                 bail!("line {}: parse error: Put quotation marks around \"{w}\" if it should be a constant and not a tag evaluation.", self.line())
@@ -1461,6 +1513,7 @@ impl Parser {
                 bail!("line {}: parse error: \"count\" accepts only one of \"nodes\", \"ways\", \"relations\", \"deriveds\", \"nwr\", \"nw\", \"wr\", or \"nr\" as type argument.", self.line());
             }
             self.expect_p(")")?;
+            self.depth = 2;
             return Ok(vec![Expr::Lit(w)]);
         }
         let args = self.args_in(ECtx::Elem)?;
@@ -1511,16 +1564,57 @@ fn check_call(line: usize, name: &str, n: usize) -> Result<()> {
     Ok(())
 }
 
-fn check_regex(line: usize, re: &str) -> Result<()> {
-    if crate::exec::filter::compile_regex(re, false).is_err() {
-        bail!("line {line}: static error: Invalid regular expression: \"{re}\"");
+/// Time the regular expressions of one query may take to compile while it
+/// is parsed. A large one (`\w{250}`: 250 Unicode classes) takes 0.04 s,
+/// the word searches of clients with 60 classes 0.02 s; a query can hold
+/// 60,000 of them per MB, and nothing else stops the parser.
+const REGEX_BUDGET: std::time::Duration = std::time::Duration::from_secs(5);
+
+impl Parser {
+    fn check_regex(&mut self, line: usize, re: &str) -> Result<()> {
+        #[cfg(test)]
+        let budget = tests::REGEX_BUDGET_MS.get().map_or(REGEX_BUDGET, std::time::Duration::from_millis);
+        #[cfg(not(test))]
+        let budget = REGEX_BUDGET;
+        if self.regex_time > budget {
+            bail!("line {line}: static error: The regular expressions of this query take too long to compile.");
+        }
+        let start = std::time::Instant::now();
+        let ok = crate::exec::filter::compile_regex(re, false).is_ok();
+        self.regex_time += start.elapsed();
+        if !ok {
+            bail!("line {line}: static error: Invalid regular expression: \"{re}\"");
+        }
+        Ok(())
     }
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Operator chains nest without parentheses: `1+1+...` with 200,000
+    /// terms overflowed the stack of the query thread (the process aborts).
+    #[test]
+    fn expression_height_is_limited() {
+        let chain = |op: &str, n: usize| format!("make x v=1{};out;", format!("{op}1").repeat(n));
+        for op in ["+", "-", "*", "/", "||", "&&", "==", "<", "?1:"] {
+            assert!(parse(&chain(op, 1000)).is_ok(), "{op}");
+            let e = parse(&chain(op, 1024)).unwrap_err().to_string();
+            assert!(e.contains("Expressions are limited to 1024 nested operators"), "{op}: {e}");
+            assert!(parse(&chain(op, 300_000)).is_err(), "{op}");
+        }
+        // a chain inside calls and parentheses counts with them
+        let inner = format!("1{}", "+1".repeat(1000));
+        assert!(parse(&format!("make x v=number(({inner}));out;")).is_ok());
+        assert!(parse(&format!("make x v=number(abs(suffix(number(abs(suffix(number(abs(suffix(number(abs(suffix(number(abs(suffix(number(abs(suffix(number(abs(suffix(number(abs(suffix({inner})))))))))))))))))))))))));out;")).is_err());
+        assert!(parse(&format!("node(1)(if:{inner});out;")).is_ok());
+        assert!(parse(&format!("node(1)(if:{inner}+1{});out;", "+1".repeat(30))).is_err());
+        // arguments side by side do not add up
+        let args = vec![inner.as_str(); 40].join(",1),pt(");
+        assert!(parse(&format!("make x ::geom=lstr(pt({args},1));out;")).is_ok());
+        assert!(parse(&format!("make x v={};out;", "-".repeat(200) + "1")).is_ok());
+    }
 
     #[test]
     fn parses_basic_query() {
@@ -1546,6 +1640,90 @@ mod tests {
             assert_eq!(parse(q).unwrap_err().to_string(), msg, "{q}");
         }
         assert!(parse("make x \" \"=1;out;").is_ok());
+    }
+
+    /// Inputs that overflowed the stack of the query thread (the process
+    /// aborts) are parse errors, on a thread with a stack of 2 MB; the
+    /// tallest and longest inputs that pass parse there too.
+    #[test]
+    fn deep_inputs_are_rejected_on_a_small_stack() {
+        std::thread::Builder::new()
+            .stack_size(2 << 20)
+            .spawn(|| {
+                let n = 300_000;
+                for q in [
+                    format!("make x a=1{};out;", "+1".repeat(n)),
+                    format!("make x a=1{};out;", "?1:1".repeat(n)),
+                    format!("node(1)(if:1{});out;", "&&1".repeat(n)),
+                    format!("node(1)(if:1{});out;", "||1==1".repeat(n)),
+                    format!("make x a={}1;out;", "!".repeat(n)),
+                    format!("make x a={}1;out;", "-".repeat(n)),
+                    format!("make x a={}1;out;", "!-".repeat(n)),
+                    format!("make x a={}1{};out;", "(".repeat(n), ")".repeat(n)),
+                    format!("make x a={}1{};out;", "number(".repeat(n), ")".repeat(n)),
+                    format!("make x a={}1{};out;", "u(".repeat(n), ")".repeat(n)),
+                    format!("make x a={}\"k\"{};out;", "t[".repeat(n), "]".repeat(n)),
+                    format!("if({}1{}){{out;}}", "(".repeat(n), ")".repeat(n)),
+                    format!("for(1{}){{out;}}", "+1".repeat(n)),
+                    format!("{}node(1);{}out;", "(".repeat(n), ");".repeat(n)),
+                    format!("{}out;{}", "foreach{".repeat(n), "}".repeat(n)),
+                    format!("{}out;{}", "if(1){".repeat(n), "}".repeat(n)),
+                    format!("{}out;{}", "complete{".repeat(n), "}".repeat(n)),
+                    "<union>".repeat(n),
+                    format!("{}{}", "<union>".repeat(n), "</union>".repeat(n)),
+                    "<a>".repeat(2 * n),
+                    format!("<osm-script>{}</osm-script>", "<foreach>".repeat(n)),
+                    format!("<query type=\"node\">{}", "<query type=\"node\">".repeat(n)),
+                ] {
+                    assert!(parse(&q).is_err(), "{}", &q[..40]);
+                }
+                // the tallest that pass
+                for q in [
+                    format!("make x a=1{};out;", "+1".repeat(1000)),
+                    format!("node(1)(if:1{});out;", "?1:1".repeat(1000)),
+                    format!("make x a={}1{};out;", "(".repeat(250), ")".repeat(250)),
+                    format!("make x a={}1{};out;", "-(".repeat(120), ")".repeat(120)),
+                    format!("{}node(1);{}out;", "(".repeat(500), ");".repeat(500)),
+                    format!("{}<id-query type=\"node\" ref=\"1\"/>{}", "<union>".repeat(500), "</union>".repeat(500)),
+                ] {
+                    assert!(parse(&q).is_ok(), "{}", &q[..40]);
+                }
+            })
+            .unwrap()
+            .join()
+            .unwrap();
+    }
+
+    /// Long queries of the ordinary kind parse as before.
+    #[test]
+    fn long_queries_still_parse() {
+        let poly: String = (0..20_000).map(|i| format!("{:.5} {:.5} ", 46.0 + (i % 100) as f64 * 0.001, 7.0 + (i / 100) as f64 * 0.001)).collect();
+        let ids: String = (1..=9000).map(|i| i.to_string()).collect::<Vec<_>>().join(",");
+        let words: String = (0..2000).map(|i| format!("word{i}")).collect::<Vec<_>>().join("|");
+        for q in [
+            format!("[out:json];way(poly:\"{}\");out geom;", poly.trim_end()),
+            format!("({});out;", (0..5000).map(|i| format!("node[amenity=cafe]({},7,{},8);", 46 + i % 2, 47 + i % 2)).collect::<String>()),
+            format!("node(id:{ids});out;"),
+            format!("node[name~\"^({words})$\",i](46,7,47,8);out;"),
+            format!("node(46,7,47,8)(if:{});out;", (0..500).map(|i| format!("t[\"k{i}\"]==\"{i}\"")).collect::<Vec<_>>().join("||")),
+            format!("node(46,7,47,8)(if:{});out;", (0..300).map(|i| format!("(t[\"k{i}\"]==\"{i}\"&&is_tag(\"x\"))")).collect::<Vec<_>>().join("||")),
+            format!("make x {};out;", (0..2000).map(|i| format!("k{i}=count(nodes)+{i}")).collect::<Vec<_>>().join(",")),
+            format!("node(around:100,{});out;", (0..3000).map(|i| format!("46.{:04},7.{:04}", i, i)).collect::<Vec<_>>().join(",")),
+            format!("<osm-script><union>{}</union><print/></osm-script>", "<query type=\"node\"><has-kv k=\"amenity\" v=\"cafe\"/><bbox-query s=\"46\" w=\"7\" n=\"47\" e=\"8\"/></query>\n".repeat(2000)),
+            format!("{}out;", "node(1)->.a;foreach.a{out;}if(count(nodes)>0){out;}".repeat(800)),
+        ] {
+            if let Err(e) = parse(&q) {
+                panic!("{}: {e}", &q[..60]);
+            }
+        }
+    }
+
+    #[test]
+    fn csv_fields_are_limited() {
+        let q = |n: usize| format!("[out:csv({}::id)];node(1);out;", "a,".repeat(n - 1));
+        assert!(parse(&q(10_000)).is_ok());
+        assert_eq!(parse(&q(10_001)).unwrap_err().to_string(), "line 1: static error: The CSV format takes at most 10000 fields.");
+        assert!(parse(&q(400_000)).is_err());
     }
 
     #[test]
@@ -1610,5 +1788,22 @@ mod tests {
             StmtKind::Query { filters, .. } => assert!(matches!(filters[0], Filter::Regex { neg: true, .. })),
             _ => panic!(),
         }
+    }
+
+    thread_local! {
+        /// The time regular expressions may take to compile, in place of `REGEX_BUDGET`.
+        pub(super) static REGEX_BUDGET_MS: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    }
+
+    /// A query can hold tens of thousands of regular expressions that take
+    /// 0.04 s each to compile; the parser stops when they took 5 s.
+    #[test]
+    fn regex_compile_time_is_limited() {
+        let q = |n: usize| format!("node(1){};out;", (0..n).map(|i| format!("[k{i}~\"\\\\w{{250}}\"]")).collect::<String>());
+        assert!(parse(&q(3)).is_ok());
+        REGEX_BUDGET_MS.set(Some(20));
+        let e = parse(&q(200)).unwrap_err().to_string();
+        REGEX_BUDGET_MS.set(None);
+        assert_eq!(e, "line 1: static error: The regular expressions of this query take too long to compile.");
     }
 }
