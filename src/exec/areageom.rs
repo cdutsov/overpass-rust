@@ -1017,6 +1017,13 @@ pub struct Tilewise {
 const MAX_SOUTH: u32 = 1_810_000_000;
 
 impl Tilewise {
+    /// Heap bytes, roughly: the segments, the tile maps and the inside runs.
+    pub fn approx_bytes(&self) -> u64 {
+        let blocks: usize = self.tiles.values().flat_map(|m| m.values()).map(|b| 64 + b.segs.capacity() * std::mem::size_of::<TSeg>()).sum();
+        let fills: usize = self.fills.values().map(|v| 32 + v.capacity() * std::mem::size_of::<(i64, i64, TKey)>()).sum();
+        (blocks + fills + self.tiles.len() * 48) as u64
+    }
+
     /// `ways`: (C++ index, way id, vertex coordinates) of closed ways.
     pub fn build(ways: &[(u32, u64, Vec<IC>)]) -> Tilewise {
         let mut t = Tilewise::default();

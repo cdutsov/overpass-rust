@@ -161,6 +161,10 @@ pub struct Evaluator<'e, 's, W: Write> {
     sets: RefCell<FxHashMap<String, Option<Rc<Set>>>>,
     /// Steps of the loops over elements and members (`tick`).
     ticks: std::cell::Cell<u32>,
+    /// `lat()` and `lon()` of the node last compared, as numbers (`cmp_fast`).
+    node_ll: std::cell::Cell<Option<(Id, f64, f64)>>,
+    /// Literals as numbers, by the address of their expression (`cmp_fast`).
+    lit_dbl: RefCell<FxHashMap<usize, Option<f64>>>,
 }
 
 /// Bytes of a string held in a list, for the memory limit.
@@ -183,6 +187,8 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
             set_keys_cache: RefCell::new(FxHashMap::default()),
             sets: RefCell::new(FxHashMap::default()),
             ticks: std::cell::Cell::new(0),
+            node_ll: std::cell::Cell::new(None),
+            lit_dbl: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -328,6 +334,10 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
 
     /// Geometry of an element (docs/spec/evaluators.md §10.1).
     pub fn geom(&self, el: El) -> Result<DGeom> {
+        // a node is its own geometry: nothing to keep
+        if let El::N(n) = el {
+            return Ok(DGeom::Point((n.pos.lat(), n.pos.lon())));
+        }
         let key = el.key();
         if let Some(g) = self.geom_cache.borrow().get(&key) {
             return Ok(g.clone());
@@ -418,6 +428,66 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
         Ok(g)
     }
 
+    /// The result of a comparison between `lat()` or `lon()` of a node and
+    /// a literal number, without building the strings: grid keys such as
+    /// `lat()<40.48?0:(lat()<40.49?1:...)` run a hundred of them per
+    /// node. `binary` compares such a pair as numbers: the coordinate
+    /// printed with 7 decimals is never an integer for `int`, and both read
+    /// as doubles. The coordinate is the number its printed form reads as.
+    /// None for every other comparison.
+    fn cmp_fast(&self, op: BinOp, a: &Expr, b: &Expr, cx: Cx) -> Option<bool> {
+        if !matches!(op, BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+            return None;
+        }
+        let coord = |e: &Expr| -> Option<f64> {
+            let Expr::Call(name, args) = e else { return None };
+            let lat = match name.as_str() {
+                "lat" => true,
+                "lon" => false,
+                _ => return None,
+            };
+            let Some(El::N(n)) = cx.el else { return None };
+            if !args.is_empty() {
+                return None;
+            }
+            let (id, la, lo) = match self.node_ll.get() {
+                Some(c) if c.0 == n.id => c,
+                _ => {
+                    let c = (n.id, dbl(&fix(n.pos.lat(), 7))?, dbl(&fix(n.pos.lon(), 7))?);
+                    self.node_ll.set(Some(c));
+                    c
+                }
+            };
+            debug_assert_eq!(id, n.id);
+            Some(if lat { la } else { lo })
+        };
+        let lit = |e: &Expr| -> Option<f64> {
+            let Expr::Lit(s) = e else { return None };
+            let key = e as *const Expr as usize;
+            if let Some(v) = self.lit_dbl.borrow().get(&key) {
+                return *v;
+            }
+            let v = dbl(s);
+            self.lit_dbl.borrow_mut().insert(key, v);
+            v
+        };
+        let (l, r) = match (coord(a), coord(b)) {
+            (Some(l), None) => (l, lit(b)?),
+            (None, Some(r)) => (lit(a)?, r),
+            _ => return None,
+        };
+        use std::cmp::Ordering::*;
+        Some(match (op, l.partial_cmp(&r)) {
+            (_, None) => op == BinOp::Ne,
+            (BinOp::Eq, Some(o)) => o == Equal,
+            (BinOp::Ne, Some(o)) => o != Equal,
+            (BinOp::Lt, Some(o)) => o == Less,
+            (BinOp::Le, Some(o)) => o != Greater,
+            (BinOp::Gt, Some(o)) => o == Greater,
+            (_, Some(o)) => o != Less,
+        })
+    }
+
     /// Evaluate to a string; null tasks become "".
     pub fn s(&self, e: &Expr, cx: Cx) -> Result<String> {
         Ok(self.eval(e, cx)?.map(V::into_string).unwrap_or_default())
@@ -446,13 +516,26 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
                 })
             }
             Expr::Binary(op, a, b) => {
+                if let Some(t) = self.cmp_fast(*op, a, b, cx) {
+                    return Ok(Some(V::S(if t { "1" } else { "0" }.into())));
+                }
                 let l = self.s(a, cx)?;
                 let r = self.s(b, cx)?;
                 V::S(binary(*op, &l, &r))
             }
             Expr::Ternary(c, a, b) => {
-                let Some(cv) = self.eval(c, cx)? else { return Ok(Some(V::S("0".into()))) };
-                let branch = if truthy(&cv.into_string()) { a } else { b };
+                let fast = match &**c {
+                    Expr::Binary(op, l, r) => self.cmp_fast(*op, l, r, cx),
+                    _ => None,
+                };
+                let t = match fast {
+                    Some(t) => t,
+                    None => {
+                        let Some(cv) = self.eval(c, cx)? else { return Ok(Some(V::S("0".into()))) };
+                        truthy(&cv.into_string())
+                    }
+                };
+                let branch = if t { a } else { b };
                 return Ok(Some(self.eval(branch, cx)?.unwrap_or(V::S(String::new()))));
             }
             Expr::Agg { set, name, args } => return self.aggregate(e, set.as_deref().unwrap_or("_"), name, args, cx),
@@ -613,7 +696,7 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
                 Some(El::W(_)) => "way".into(),
                 Some(El::R(_)) => "relation".into(),
                 Some(El::A(_)) => "area".into(),
-                Some(El::D(d)) => d.tname.clone(),
+                Some(El::D(d)) => d.tname.to_string(),
                 None => String::new(),
             }),
             "version" | "timestamp" | "changeset" | "uid" | "user" => {
@@ -1037,7 +1120,8 @@ impl<'s, W: Write> Engine<'s, W> {
     }
 
     fn build_derived(&self, ev: &Evaluator<'_, 's, W>, name: &str, entries: &[MakeEntry], el: Option<El>, counter: &mut u64) -> Result<Derived> {
-        let mut d = Derived { tname: name.to_string(), id: 0, tags: Vec::new(), geom: None };
+        let mut d = Derived { tname: name.into(), id: 0, tags: Default::default(), geom: None };
+        let mut tags: Vec<(String, String)> = Vec::new();
         let mut id_set = false;
         let declared: Vec<&str> = entries
             .iter()
@@ -1052,7 +1136,7 @@ impl<'s, W: Write> Engine<'s, W> {
             match &entry.key {
                 MakeKey::Tag(k) => {
                     if let Some(v) = ev.eval(value, cx)? {
-                        d.tags.push((k.clone(), v.into_string()));
+                        tags.push((k.clone(), v.into_string()));
                     }
                 }
                 MakeKey::Remove(_) => {}
@@ -1079,7 +1163,7 @@ impl<'s, W: Write> Engine<'s, W> {
                             continue;
                         }
                         if let Some(v) = ev.eval(value, Cx { key: Some(&k), ..cx })? {
-                            d.tags.push((k.clone(), v.into_string()));
+                            tags.push((k.clone(), v.into_string()));
                         }
                     }
                 }
@@ -1089,6 +1173,7 @@ impl<'s, W: Write> Engine<'s, W> {
             *counter += 1;
             d.id = *counter;
         }
+        d.tags = std::sync::Arc::new(tags);
         Ok(d)
     }
 

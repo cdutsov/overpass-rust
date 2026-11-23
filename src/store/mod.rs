@@ -221,16 +221,12 @@ pub enum Scan {
 fn visit_entry(p: &[u8], vstart: usize, k: &[u8], v: &[u8], ranges: Option<&[CodeRange]>, f: &mut impl FnMut(&[u8], Cell, &[Id]) -> Result<Scan>) -> Result<Scan> {
     let val = &p[vstart..p.len() - 1];
     let base = Cell::from_bytes(&k[p.len()..]);
-    for (cell, ids) in codec::decode_tag_entry(base, v)? {
-        if ranges.is_some_and(|r| !cell_in_ranges(cell, r)) {
-            continue;
-        }
-        match f(val, cell, &ids)? {
-            Scan::Next => {}
-            s => return Ok(s),
-        }
-    }
-    Ok(Scan::Next)
+    let mut end = Scan::Next;
+    codec::visit_tag_entry(base, v, |cell| ranges.is_none_or(|r| cell_in_ranges(cell, r)), |cell, ids| {
+        end = f(val, cell, ids)?;
+        Ok(end == Scan::Next)
+    })?;
+    Ok(end)
 }
 
 /// Address space reserved for the memory map (sparse; the file grows as needed).

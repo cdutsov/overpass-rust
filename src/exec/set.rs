@@ -6,10 +6,13 @@ use crate::output::DGeom;
 /// An element produced by `make`, `convert` or `out count`.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Derived {
-    pub tname: String,
+    /// Shared with the copies of the element: a copy costs two counters.
+    /// A loop that collects one element per round in a set
+    /// (`(.acc;.x;)->.acc;`) copies the whole set each round.
+    pub tname: std::sync::Arc<str>,
     pub id: Id,
-    /// Tags in their defined order (not sorted).
-    pub tags: Vec<(String, String)>,
+    /// Tags in their defined order (not sorted); shared like the name.
+    pub tags: std::sync::Arc<Vec<(String, String)>>,
     pub geom: Option<DGeom>,
 }
 

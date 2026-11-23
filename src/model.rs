@@ -73,6 +73,13 @@ impl Tags {
         Tags { data: String::with_capacity(bytes), ends: Vec::with_capacity(n) }
     }
 
+    /// Make room for `n` more tags with `bytes` bytes of keys and values.
+    #[inline]
+    pub fn reserve(&mut self, n: usize, bytes: usize) {
+        self.data.reserve_exact(bytes);
+        self.ends.reserve_exact(n);
+    }
+
     /// Append a tag; callers keep keys sorted (see `from_pairs`).
     pub fn push(&mut self, k: &str, v: &str) {
         self.data.push_str(k);

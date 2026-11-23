@@ -251,14 +251,73 @@ pub enum Pick<'a> {
     Cells(&'a [CodeRange]),
 }
 
-impl Pick<'_> {
-    #[inline]
-    fn test(&self, cell: Cell, id: Id) -> bool {
-        match self {
+/// Tests the elements of a chunk head against a `Pick`, in the order of
+/// the head: sorted by (cell, id), so the cell stays the same and the ids
+/// ascend over a run of elements. A cell is looked up in the ranges once
+/// per run; an id is searched from the place of the previous one of its
+/// run (a node chunk holds thousands of ids in a few runs).
+struct Picker<'a> {
+    pick: Pick<'a>,
+    /// `cell_value` of the cell of the previous element (u64::MAX before
+    /// the first: no cell has that value).
+    cell: u64,
+    /// Id of the previous element.
+    id: Id,
+    /// `Cells`: whether the cell lies in the ranges.
+    cell_ok: bool,
+    /// `Ids`: the ids before this place are below `id`.
+    at: usize,
+    /// `Ids`: the id at `at` (Id::MAX past the end).
+    next: Id,
+}
+
+impl<'a> Picker<'a> {
+    fn new(pick: Pick<'a>) -> Picker<'a> {
+        Picker { pick, cell: u64::MAX, id: 0, cell_ok: false, at: 0, next: 0 }
+    }
+
+    #[inline(always)]
+    fn test(&mut self, cell: Cell, id: Id) -> bool {
+        let key = cell_value(cell);
+        match self.pick {
             Pick::All => true,
-            Pick::Ids(ids) => ids.binary_search(&id).is_ok(),
-            Pick::Cells(r) => cell_in_ranges(cell, r),
+            Pick::Ids(ids) => {
+                // within a run, below the next wanted id: most elements
+                if key == self.cell && id >= self.id && id < self.next {
+                    self.id = id;
+                    return false;
+                }
+                self.seek(ids, key, id)
+            }
+            Pick::Cells(r) => {
+                if key != self.cell {
+                    self.cell = key;
+                    self.cell_ok = cell_in_ranges(cell, r);
+                }
+                self.cell_ok
+            }
         }
+    }
+
+    /// `Ids`: move `at` to the first id not below `id`; whether it is `id`.
+    #[inline(never)]
+    fn seek(&mut self, ids: &[Id], key: u64, id: Id) -> bool {
+        if key != self.cell || id < self.id {
+            self.cell = key;
+            self.at = ids.partition_point(|x| *x < id);
+        } else if self.at < ids.len() && ids[self.at] < id {
+            // gallop: the next wanted id is mostly close
+            let mut step = 1;
+            while self.at + step < ids.len() && ids[self.at + step] < id {
+                self.at += step;
+                step *= 2;
+            }
+            let end = (self.at + step).min(ids.len());
+            self.at += 1 + ids[self.at + 1..end].partition_point(|x| *x < id);
+        }
+        self.id = id;
+        self.next = ids.get(self.at).copied().unwrap_or(Id::MAX);
+        self.at < ids.len() && self.next == id
     }
 }
 
@@ -368,6 +427,23 @@ enum Lazy<'a> {
 }
 
 impl<'a> Lazy<'a> {
+    /// The stored bytes; equal to those of a valid string only for it.
+    #[inline]
+    fn bytes(&self) -> &'a [u8] {
+        match *self {
+            Lazy::Str(s) => s.as_bytes(),
+            Lazy::Raw(b) => b,
+        }
+    }
+
+    #[inline]
+    fn len(&self) -> usize {
+        match *self {
+            Lazy::Str(s) => s.len(),
+            Lazy::Raw(b) => b.len(),
+        }
+    }
+
     #[inline]
     fn get(&mut self) -> &'a str {
         match *self {
@@ -405,6 +481,17 @@ fn tag_tables<'a>(r: &mut Reader<'a>, n: usize) -> Result<(Vec<Lazy<'a>>, Vec<La
 /// Append the `c` tags at `r` to `t`.
 #[inline]
 fn push_tags<'a>(r: &mut Reader<'a>, c: usize, keys: &mut [Lazy<'a>], vals: &mut [Lazy<'a>], t: &mut Tags) -> Result<()> {
+    // A first pass over the references sums the string lengths, so the
+    // buffer of the tags is allocated once instead of growing by doubling.
+    let start = r.pos;
+    let mut bytes = 0;
+    for _ in 0..c {
+        let (ki, vi) = (r.varint()? as usize, r.varint()? as usize);
+        let (Some(k), Some(v)) = (keys.get(ki), vals.get(vi)) else { bail!("corrupt tag reference") };
+        bytes += k.len() + v.len();
+    }
+    r.pos = start;
+    t.reserve(c, bytes);
     for _ in 0..c {
         let (ki, vi) = (r.varint()? as usize, r.varint()? as usize);
         let (Some(k), Some(v)) = (keys.get_mut(ki).map(Lazy::get), vals.get_mut(vi).map(Lazy::get)) else { bail!("corrupt tag reference") };
@@ -423,7 +510,7 @@ fn read_tags(r: &mut Reader, n: usize, picked: &[usize], mut set: impl FnMut(usi
     let mut p = 0;
     for (i, &c) in counts.iter().enumerate() {
         if picked[p] == i {
-            let mut t = Tags::with_capacity(c.min(r.remaining()), 0);
+            let mut t = Tags::new();
             push_tags(r, c, &mut keys, &mut vals, &mut t)?;
             set(p, t);
             p += 1;
@@ -445,28 +532,65 @@ fn read_tags(r: &mut Reader, n: usize, picked: &[usize], mut set: impl FnMut(usi
 pub struct TagTest<'a> {
     pub chunk: &'a (dyn Fn(&[u8]) -> bool + Sync),
     pub keep: &'a (dyn Fn(&Tags) -> bool + Sync),
+    /// Keys that every element passing `keep` has (may be empty). A chunk
+    /// without one of them in its key table is not read further, and the
+    /// tags of an element are built only when its references hold them
+    /// all: `nwr["shop"]["name"~"x"]` over a region builds the tags of the
+    /// shops, not of every tagged element.
+    pub keys: &'a [&'a str],
 }
 
 /// The picked elements (positions among `n`, ascending) whose tags pass
 /// `keep`, with their tags, from the tag section at `r`. The tags of each
 /// are tested in one reused buffer and copied when they pass.
-fn tags_passing(r: &mut Reader, n: usize, picked: &[usize], keep: &dyn Fn(&Tags) -> bool) -> Result<Vec<(usize, Tags)>> {
+fn tags_passing(r: &mut Reader, n: usize, picked: &[usize], test: TagTest) -> Result<Vec<(usize, Tags)>> {
+    let keep = test.keep;
     let mut out = Vec::new();
     if picked.is_empty() {
         return Ok(out);
     }
     let (mut keys, mut vals, counts) = tag_tables(r, n)?;
+    // The places of the required keys in the key table (each key is in it
+    // once); an element has a key at most once.
+    let mut need: Vec<usize> = Vec::with_capacity(test.keys.len());
+    for k in test.keys {
+        match keys.iter().position(|l| l.bytes() == k.as_bytes()) {
+            Some(i) if !need.contains(&i) => need.push(i),
+            Some(_) => {}
+            None => return Ok(out),
+        }
+    }
     let mut t = Tags::new();
+    let mut empty: Option<bool> = None;
     let mut p = 0;
     for (i, &c) in counts.iter().enumerate() {
         if picked[p] != i {
             r.skip_varints(2 * c)?;
             continue;
         }
-        t.clear();
-        push_tags(r, c, &mut keys, &mut vals, &mut t)?;
-        if keep(&t) {
-            out.push((i, t.clone()));
+        if c == 0 {
+            // most nodes: the test of an element without tags, made once
+            if need.is_empty() && *empty.get_or_insert_with(|| keep(&Tags::new())) {
+                out.push((i, Tags::new()));
+            }
+        } else {
+            let start = r.pos;
+            let mut found = 0;
+            if !need.is_empty() {
+                for _ in 0..c {
+                    let ki = r.varint()? as usize;
+                    r.varint()?;
+                    found += need.contains(&ki) as usize;
+                }
+            }
+            if found == need.len() {
+                r.pos = start;
+                t.clear();
+                push_tags(r, c, &mut keys, &mut vals, &mut t)?;
+                if keep(&t) {
+                    out.push((i, t.clone()));
+                }
+            }
         }
         p += 1;
         if p == picked.len() {
@@ -492,6 +616,7 @@ pub fn encode_nodes(nodes: &[&Node]) -> Vec<u8> {
 }
 
 pub fn decode_nodes(value: &[u8], pick: Pick, with_tags: bool) -> Result<Vec<Node>> {
+    let mut pick = Picker::new(pick);
     let data = payload(value)?;
     let mut r = Reader::new(&data);
     let head = read_head(&mut r)?;
@@ -515,8 +640,58 @@ pub fn decode_nodes(value: &[u8], pick: Pick, with_tags: bool) -> Result<Vec<Nod
     Ok(out)
 }
 
+/// The positions of the nodes with the given ids (sorted) in a node chunk,
+/// as (id, position): `decode_nodes` without tags for `Pick::Ids`, without
+/// building the nodes or the list of the head (way geometry reads a few
+/// nodes out of the thousands of a chunk).
+pub fn decode_node_positions(value: &[u8], ids: &[Id]) -> Result<Vec<(Id, Pt)>> {
+    let data = payload(value)?;
+    let mut r = Reader::new(&data);
+    let n = r.count()?;
+    let nruns = r.count()?;
+    let mut runs = Vec::with_capacity(nruns.min(n));
+    let mut prev = 0u64;
+    let mut total = 0usize;
+    for _ in 0..nruns {
+        prev = prev.wrapping_add(r.varint()?);
+        let len = r.varint()? as usize;
+        total = total.saturating_add(len);
+        runs.push((cell_from_value(prev), len));
+    }
+    if total != n {
+        bail!("corrupt chunk head");
+    }
+    let mut pick = Picker::new(Pick::Ids(ids));
+    // place in the chunk, cell and id of the nodes found
+    let mut found: Vec<(usize, Cell, Id)> = Vec::with_capacity(ids.len().min(n));
+    let mut prev_id = 0u64;
+    let mut i = 0;
+    for (cell, len) in runs {
+        for j in 0..len {
+            let id = if j == 0 { prev_id.wrapping_add(r.zigzag()? as u64) } else { prev_id.wrapping_add(r.varint()?) };
+            if pick.test(cell, id) {
+                found.push((i, cell, id));
+            }
+            prev_id = id;
+            i += 1;
+        }
+    }
+    let coords = r.take(4 * n)?;
+    Ok(found
+        .into_iter()
+        .map(|(i, cell, id)| {
+            let (ty, tx) = unmorton(cell.code);
+            let c = &coords[4 * i..4 * i + 4];
+            let ly = u16::from_le_bytes([c[0], c[1]]) as u32;
+            let lx = u16::from_le_bytes([c[2], c[3]]) as u32;
+            (id, Pt { y: (ty << 16) | ly, x: (tx << 16) | lx })
+        })
+        .collect())
+}
+
 /// `decode_nodes` with tags of the picked nodes whose tags pass `keep`.
 pub fn decode_nodes_where(value: &[u8], pick: Pick, test: TagTest) -> Result<Vec<Node>> {
+    let mut pick = Picker::new(pick);
     let data = payload(value)?;
     if !(test.chunk)(&data) {
         return Ok(Vec::new());
@@ -525,7 +700,7 @@ pub fn decode_nodes_where(value: &[u8], pick: Pick, test: TagTest) -> Result<Vec
     let head = read_head(&mut r)?;
     let coords = r.take(4 * head.len())?;
     let picked: Vec<usize> = head.iter().enumerate().filter(|(_, (cell, id))| pick.test(*cell, *id)).map(|(i, _)| i).collect();
-    let pass = tags_passing(&mut r, head.len(), &picked, test.keep)?;
+    let pass = tags_passing(&mut r, head.len(), &picked, test)?;
     Ok(pass
         .into_iter()
         .map(|(i, tags)| {
@@ -597,6 +772,7 @@ pub fn encode_ways(ways: &[&Way]) -> Vec<u8> {
 }
 
 pub fn decode_ways(value: &[u8], pick: Pick, with_tags: bool) -> Result<Vec<Way>> {
+    let mut pick = Picker::new(pick);
     let data = payload(value)?;
     let mut r = Reader::new(&data);
     let head = read_head(&mut r)?;
@@ -635,6 +811,7 @@ pub fn decode_ways(value: &[u8], pick: Pick, with_tags: bool) -> Result<Vec<Way>
 /// candidates of a tag index read with another tag filter), most of the
 /// chunk is not decoded.
 pub fn decode_ways_where(value: &[u8], pick: Pick, test: TagTest) -> Result<Vec<Way>> {
+    let mut pick = Picker::new(pick);
     let data = payload(value)?;
     if !(test.chunk)(&data) {
         return Ok(Vec::new());
@@ -653,7 +830,7 @@ pub fn decode_ways_where(value: &[u8], pick: Pick, test: TagTest) -> Result<Vec<
             picked.push(i);
         }
     }
-    let pass = tags_passing(&mut r, head.len(), &picked, test.keep)?;
+    let pass = tags_passing(&mut r, head.len(), &picked, test)?;
     let Some(&(last, _)) = pass.last() else { return Ok(Vec::new()) };
     let mut r = Reader { buf: &data, pos: body };
     let mut out = Vec::with_capacity(pass.len());
@@ -723,6 +900,7 @@ pub fn encode_relations(rels: &[&Relation]) -> Vec<u8> {
 }
 
 pub fn decode_relations(value: &[u8], pick: Pick, with_tags: bool) -> Result<Vec<Relation>> {
+    let mut pick = Picker::new(pick);
     let data = payload(value)?;
     let mut r = Reader::new(&data);
     let head = read_head(&mut r)?;
@@ -768,6 +946,7 @@ pub fn decode_relations(value: &[u8], pick: Pick, with_tags: bool) -> Result<Vec
 /// `keep`, as `decode_ways_where` (member ids are deltas across
 /// relations).
 pub fn decode_relations_where(value: &[u8], pick: Pick, test: TagTest) -> Result<Vec<Relation>> {
+    let mut pick = Picker::new(pick);
     let data = payload(value)?;
     if !(test.chunk)(&data) {
         return Ok(Vec::new());
@@ -792,7 +971,7 @@ pub fn decode_relations_where(value: &[u8], pick: Pick, test: TagTest) -> Result
             picked.push(i);
         }
     }
-    let pass = tags_passing(&mut r, head.len(), &picked, test.keep)?;
+    let pass = tags_passing(&mut r, head.len(), &picked, test)?;
     let Some(&(last, _)) = pass.last() else { return Ok(Vec::new()) };
     let mut r = Reader { buf: &data, pos: roles_at };
     let mut roles: Vec<std::sync::Arc<str>> = Vec::with_capacity(nroles);
@@ -853,6 +1032,7 @@ pub fn encode_areas(areas: &[&Area]) -> Vec<u8> {
 }
 
 pub fn decode_areas(value: &[u8], pick: Pick) -> Result<Vec<Area>> {
+    let mut pick = Picker::new(pick);
     let data = payload(value)?;
     let mut r = Reader::new(&data);
     let head = read_head(&mut r)?;
@@ -881,6 +1061,7 @@ pub fn decode_areas(value: &[u8], pick: Pick) -> Result<Vec<Area>> {
 /// `decode_areas` of the picked areas whose tags pass `keep`, as
 /// `decode_ways_where`; the tile lists of the others are stepped over.
 pub fn decode_areas_where(value: &[u8], pick: Pick, test: TagTest) -> Result<Vec<Area>> {
+    let mut pick = Picker::new(pick);
     let data = payload(value)?;
     if !(test.chunk)(&data) {
         return Ok(Vec::new());
@@ -905,7 +1086,7 @@ pub fn decode_areas_where(value: &[u8], pick: Pick, test: TagTest) -> Result<Vec
             at.push((start, pidx));
         }
     }
-    let pass = tags_passing(&mut r, head.len(), &picked, test.keep)?;
+    let pass = tags_passing(&mut r, head.len(), &picked, test)?;
     let mut out = Vec::with_capacity(pass.len());
     let mut k = 0;
     for (i, tags) in pass {
@@ -1003,6 +1184,7 @@ pub fn encode_meta(recs: &[&MetaRec]) -> Vec<u8> {
 }
 
 pub fn decode_meta(value: &[u8], pick: Pick) -> Result<Vec<MetaRec>> {
+    let mut pick = Picker::new(pick);
     let data = payload(value)?;
     let mut r = Reader::new(&data);
     let head = read_head(&mut r)?;
@@ -1283,6 +1465,45 @@ pub fn decode_tag_entry(base: Cell, value: &[u8]) -> Result<Vec<(Cell, Vec<Id>)>
     Ok(out)
 }
 
+/// The groups of a tag index entry in turn, as `decode_tag_entry` gives
+/// them, without building the list: `f(cell, ids)` gets the ids of the
+/// cells that pass `want` (the ids of the others are stepped over) and
+/// returns false to stop. Returns false if `f` stopped.
+pub fn visit_tag_entry(base: Cell, value: &[u8], mut want: impl FnMut(Cell) -> bool, mut f: impl FnMut(Cell, &[Id]) -> Result<bool>) -> Result<bool> {
+    let mut r = Reader::new(value);
+    let mut pc = cell_value(base);
+    let mut pfirst = 0u64;
+    let mut ids: Vec<Id> = Vec::new();
+    while !r.at_end() {
+        pc = pc.wrapping_add(r.varint()?);
+        let n = r.count()?;
+        let cell = cell_from_value(pc);
+        if n == 0 {
+            if want(cell) && !f(cell, &[])? {
+                return Ok(false);
+            }
+            continue;
+        }
+        pfirst = pfirst.wrapping_add(r.zigzag()? as u64);
+        if !want(cell) {
+            r.skip_varints(n - 1)?;
+            continue;
+        }
+        ids.clear();
+        ids.reserve(n);
+        ids.push(pfirst);
+        let mut prev = pfirst;
+        for _ in 1..n {
+            prev = prev.wrapping_add(r.varint()?);
+            ids.push(prev);
+        }
+        if !f(cell, &ids)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Encoded size of `encode_tag_entry` for one more group, for packing.
 pub fn tag_group_size(ids: &[Id]) -> usize {
     let mut s = 6 + varint_len(ids.len() as u64) + 5;
@@ -1343,6 +1564,39 @@ mod tests {
     use crate::geo::anchor_cell;
 
     #[test]
+    fn node_positions_match_decode_nodes() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut nodes: Vec<Node> = (0..3000)
+            .map(|_| {
+                let tile = rnd() % 7;
+                let pos = Pt { y: (1000 + tile as u32) << 16 | (rnd() as u32 & 0xffff), x: (2000 + (tile as u32 * 3) % 5) << 16 | (rnd() as u32 & 0xffff) };
+                Node { id: rnd() % 20_000, pos, tags: if rnd() % 5 == 0 { Tags::from_pairs([("k", "v")]) } else { Tags::new() } }
+            })
+            .collect();
+        nodes.sort_by_key(|n| n.id);
+        nodes.dedup_by_key(|n| n.id);
+        nodes.sort_by_key(|n| (n.cell(), n.id));
+        let enc = encode_nodes(&nodes.iter().collect::<Vec<_>>());
+        for step in [1usize, 2, 3, 17, 400, 5000] {
+            for off in [0u64, 1, 7] {
+                let mut ids: Vec<Id> = (0..20_000u64).filter(|i| (i + off) % step as u64 == 0).collect();
+                ids.push(1 << 40);
+                let want: Vec<(Id, Pt)> = decode_nodes(&enc, Pick::Ids(&ids), false).unwrap().into_iter().map(|n| (n.id, n.pos)).collect();
+                let all: Vec<(Id, Pt)> = nodes.iter().filter(|n| ids.binary_search(&n.id).is_ok()).map(|n| (n.id, n.pos)).collect();
+                assert_eq!(want, all, "step {step} off {off}");
+                assert_eq!(decode_node_positions(&enc, &ids).unwrap(), all, "step {step} off {off}");
+            }
+        }
+        assert!(decode_node_positions(&enc, &[]).unwrap().is_empty());
+    }
+
+    #[test]
     fn nodes_roundtrip() {
         let p = Pt::from_ll(51.0125, 7.0125);
         let q = Pt::from_ll(-33.5, 151.2);
@@ -1401,6 +1655,24 @@ mod tests {
         assert_eq!(decode_id_bucket(&encode_id_bucket(&b)).unwrap(), b);
         let g = vec![(Cell::tile(9), vec![4, 7, 100]), (Cell::tile(11), vec![2]), (Cell::NONE, vec![1 << 40])];
         assert_eq!(decode_tag_entry(Cell::tile(8), &encode_tag_entry(Cell::tile(8), &g)).unwrap(), g);
+        // visit_tag_entry: the same groups, for every choice of cells and stop
+        let g = vec![(Cell::tile(9), vec![4, 7, 100]), (Cell::tile(10), vec![]), (Cell::tile(11), vec![2]), (Cell::tile(500), vec![50, 51, 1 << 33]), (Cell::NONE, vec![1 << 40])];
+        let enc = encode_tag_entry(Cell::tile(8), &g);
+        assert_eq!(decode_tag_entry(Cell::tile(8), &enc).unwrap(), g);
+        for mask in 0u32..32 {
+            for stop in 0..=g.len() {
+                let wanted: Vec<&(Cell, Vec<Id>)> = g.iter().enumerate().filter(|(i, _)| mask >> i & 1 == 1).map(|(_, x)| x).collect();
+                let mut seen: Vec<(Cell, Vec<Id>)> = Vec::new();
+                let done = visit_tag_entry(Cell::tile(8), &enc, |c| wanted.iter().any(|w| w.0 == c), |c, ids| {
+                    seen.push((c, ids.to_vec()));
+                    Ok(seen.len() != stop)
+                })
+                .unwrap();
+                let expect: Vec<(Cell, Vec<Id>)> = wanted.iter().take(if stop == 0 { usize::MAX } else { stop }).map(|x| (*x).clone()).collect();
+                assert_eq!(seen, expect, "mask {mask} stop {stop}");
+                assert_eq!(done, stop == 0 || wanted.len() < stop, "mask {mask} stop {stop}");
+            }
+        }
         let mb = vec![(0u8, 9u64), (0, 12), (200, 3)];
         assert_eq!(decode_member_bucket(&encode_member_bucket(&mb)).unwrap(), mb);
     }
@@ -1554,8 +1826,12 @@ mod tests {
             let cell = ways[0].cell();
             let cells = [CodeRange { level: cell.level, lo: cell.code, hi: cell.code }];
             for (k, keep) in keeps.iter().enumerate() {
-                let all = TagTest { chunk: &|_| true, keep: *keep };
-                let none = TagTest { chunk: &|_| false, keep: *keep };
+                // the third test needs the key "name"; a key no element has leaves nothing
+                let keys: &[&str] = if k == 2 { &["name"] } else { &[] };
+                let all = TagTest { chunk: &|_| true, keep: *keep, keys };
+                let none = TagTest { chunk: &|_| false, keep: *keep, keys: &[] };
+                let absent = TagTest { chunk: &|_| true, keep: *keep, keys: &["no such key"] };
+                assert!(decode_ways_where(&enc_w, Pick::All, absent).unwrap().is_empty() && decode_nodes_where(&enc_n, Pick::All, absent).unwrap().is_empty());
                 let at = format!("case {case} keep {k}");
                 for (pw, pr, pa, pn) in [(Pick::All, Pick::All, Pick::All, Pick::All), (Pick::Ids(&iw), Pick::Ids(&ir), Pick::Ids(&ia), Pick::Ids(&inn)), (Pick::Cells(&cells), Pick::Cells(&cells), Pick::Cells(&cells), Pick::Cells(&cells))] {
                     let mut w = decode_ways(&enc_w, pw, true).unwrap();

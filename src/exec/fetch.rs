@@ -47,6 +47,8 @@ pub enum Source<'a> {
 pub struct Fetch<'s> {
     pub snap: &'s Snapshot<'s>,
     pos_cache: RefCell<FxHashMap<Id, Option<Pt>>>,
+    /// The DB areas of the last `(area)` clause, by their ids (`Engine::area_ctx`).
+    pub(super) area_db: RefCell<Option<(Vec<Id>, std::sync::Arc<super::area::AreaDb>)>>,
     user_cache: RefCell<FxHashMap<u32, Option<String>>>,
     pub limits: Limits,
 }
@@ -145,6 +147,19 @@ pub fn tags_bytes(t: &Tags) -> u64 {
 impl MemSize for Node {
     fn mem_size(&self) -> (u64, u64) {
         (8, std::mem::size_of::<Node>() as u64 + tags_bytes(&self.tags))
+    }
+}
+
+/// A node position read for way geometry; counted as the untagged node
+/// it is read from.
+struct NodePos {
+    id: Id,
+    pos: Pt,
+}
+
+impl MemSize for NodePos {
+    fn mem_size(&self) -> (u64, u64) {
+        (8, std::mem::size_of::<Node>() as u64)
     }
 }
 
@@ -274,6 +289,17 @@ pub fn thread_hold(bytes: u64) -> bool {
         Some(m) => m.add(0, bytes).is_ok(),
         None => true,
     })
+}
+
+/// The keys an element has when it passes all of the filters.
+pub fn required_keys<'a>(filters: impl IntoIterator<Item = &'a TagFilter>) -> Vec<&'a str> {
+    filters
+        .into_iter()
+        .filter_map(|f| match f {
+            TagFilter::HasKey(k) | TagFilter::Eq(k, _) | TagFilter::Regex { key: k, neg: false, .. } => Some(k.as_str()),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Entries kept in the node position cache before it is reset.
@@ -491,7 +517,7 @@ fn par_flat_map<I: Sync, T: Send + MemSize>(limits: &Limits, items: &[I], f: imp
 
 impl<'s> Fetch<'s> {
     pub fn new(snap: &'s Snapshot<'s>) -> Fetch<'s> {
-        Fetch { snap, pos_cache: RefCell::new(FxHashMap::default()), user_cache: RefCell::new(FxHashMap::default()), limits: Limits::default() }
+        Fetch { snap, pos_cache: RefCell::new(FxHashMap::default()), area_db: RefCell::new(None), user_cache: RefCell::new(FxHashMap::default()), limits: Limits::default() }
     }
 
     /// Elements with the given ids, sorted by id.
@@ -535,6 +561,22 @@ impl<'s> Fetch<'s> {
             es.shrink_to_fit();
             Ok(es)
         })?;
+        out.sort_unstable_by_key(|e| e.id());
+        out.dedup_by_key(|e| e.id());
+        Ok(out)
+    }
+
+    /// `in_ranges` for a test on the tags alone: the elements that fail it
+    /// are not decoded whole (`Stored::decode_where`). Most elements of a
+    /// region fail a tag filter: their node lists, members and tag strings
+    /// are stepped over. `filters`: tag filters that `keep` includes (their
+    /// keys are looked up before any tags are built, `TagTest::keys`);
+    /// `chunk`: a test of the whole chunk (`TagTest::chunk`).
+    pub fn in_ranges_tagged<T: Stored>(&self, ranges: &[CodeRange], filters: &[TagFilter], chunk: &(dyn Fn(&[u8]) -> bool + Sync), keep: &(dyn Fn(&Tags) -> bool + Sync)) -> Result<Vec<T>> {
+        let chunks = self.snap.chunks_in_ranges(T::KIND, ranges)?;
+        let keys = required_keys(filters);
+        let test = codec::TagTest { chunk, keep, keys: &keys };
+        let mut out = decode_chunks(&self.limits, &chunks, |v| *v, |v| T::decode_where(v, Pick::Cells(ranges), test))?;
         out.sort_unstable_by_key(|e| e.id());
         out.dedup_by_key(|e| e.id());
         Ok(out)
@@ -908,11 +950,12 @@ impl<'s> Fetch<'s> {
         missing.sort_unstable();
         missing.dedup();
         let chunks = self.snap.chunks_with_ids(Kind::Node, &missing)?;
-        let found = decode_chunks(&self.limits, &chunks, |(v, _)| *v, |(v, want)| codec::decode_nodes(v, Pick::Ids(want), false))?;
+        let found = decode_chunks(&self.limits, &chunks, |(v, _)| *v, |(v, want)| Ok(codec::decode_node_positions(v, want)?.into_iter().map(|(id, pos)| NodePos { id, pos }).collect()))?;
         let mut cache = self.pos_cache.borrow_mut();
         if cache.len() > POS_CACHE_LIMIT {
             cache.clear();
         }
+        cache.reserve(missing.len());
         for n in &found {
             cache.insert(n.id, Some(n.pos));
             out.insert(n.id, n.pos);

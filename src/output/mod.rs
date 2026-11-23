@@ -164,34 +164,108 @@ impl std::fmt::Display for Lon {
     }
 }
 
-pub fn escape_xml(s: &str, out: &mut Vec<u8>) {
-    for &b in s.as_bytes() {
-        match b {
-            b'&' => out.extend_from_slice(b"&amp;"),
-            b'"' => out.extend_from_slice(b"&quot;"),
-            b'<' => out.extend_from_slice(b"&lt;"),
-            b'>' => out.extend_from_slice(b"&gt;"),
-            b'\n' => out.extend_from_slice(b"&#x0a;"),
-            b'\t' => out.extend_from_slice(b"&#x09;"),
-            b'\r' => out.extend_from_slice(b"&#x0d;"),
-            0..=0x1f => out.push(b'?'),
-            _ => out.push(b),
+/// An unsigned integer in decimal.
+#[inline]
+fn put_u64(b: &mut Vec<u8>, mut v: u64) {
+    let mut buf = [0u8; 20];
+    let mut i = buf.len();
+    loop {
+        i -= 1;
+        buf[i] = b'0' + (v % 10) as u8;
+        v /= 10;
+        if v == 0 {
+            break;
         }
+    }
+    b.extend_from_slice(&buf[i..]);
+}
+
+/// `write_e7` into a byte buffer: a value in units of 1e-7 with 7 decimals.
+#[inline]
+fn put_e7(b: &mut Vec<u8>, v: i64) {
+    if v < 0 {
+        b.push(b'-');
+    }
+    let a = v.unsigned_abs();
+    put_u64(b, a / 10_000_000);
+    let mut f = a % 10_000_000;
+    let mut buf = [b'.'; 8];
+    for d in buf[1..].iter_mut().rev() {
+        *d = b'0' + (f % 10) as u8;
+        f /= 10;
+    }
+    b.extend_from_slice(&buf);
+}
+
+/// `F7` into a byte buffer.
+#[inline]
+fn put_f7(b: &mut Vec<u8>, v: f64) {
+    let scaled = v * 10_000_000.0;
+    let r = scaled.round();
+    if v.is_finite() && (scaled - r).abs() < 1e-3 && r.abs() < 9e15 && !(r == 0.0 && v.is_sign_negative()) {
+        put_e7(b, r as i64);
+    } else {
+        w!(b, "{:.7}", v);
     }
 }
 
-pub fn escape_json(s: &str, out: &mut Vec<u8>) {
-    for &b in s.as_bytes() {
-        match b {
-            b'"' => out.extend_from_slice(b"\\\""),
-            b'\\' => out.extend_from_slice(b"\\\\"),
-            b'\n' => out.extend_from_slice(b"\\n"),
-            b'\t' => out.extend_from_slice(b"\\t"),
-            b'\r' => out.extend_from_slice(b"\\r"),
-            0..=0x1f => out.push(b'?'),
-            _ => out.push(b),
+/// `Lat` and `Lon` of a node into a byte buffer.
+#[inline]
+fn put_lat(b: &mut Vec<u8>, y: u32) {
+    put_e7(b, y as i64 - 910_000_000);
+}
+
+#[inline]
+fn put_lon(b: &mut Vec<u8>, ilon: i32) {
+    put_e7(b, ilon as i64);
+}
+
+/// Copy `s`, with `esc(byte)` in place of each byte it names; the bytes
+/// between go as runs (most strings have nothing to replace).
+#[inline]
+fn escape_with(s: &str, out: &mut Vec<u8>, esc: impl Fn(u8) -> Option<&'static [u8]>) {
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(r) = esc(b) {
+            out.extend_from_slice(&bytes[start..i]);
+            out.extend_from_slice(r);
+            start = i + 1;
         }
     }
+    out.extend_from_slice(&bytes[start..]);
+}
+
+pub fn escape_xml(s: &str, out: &mut Vec<u8>) {
+    escape_with(s, out, |b| {
+        let r: &'static [u8] = match b {
+            b'&' => b"&amp;",
+            b'"' => b"&quot;",
+            b'<' => b"&lt;",
+            b'>' => b"&gt;",
+            b'\n' => b"&#x0a;",
+            b'\t' => b"&#x09;",
+            b'\r' => b"&#x0d;",
+            0..=0x1f => b"?",
+            _ => return None,
+        };
+        Some(r)
+    })
+}
+
+pub fn escape_json(s: &str, out: &mut Vec<u8>) {
+    escape_with(s, out, |b| {
+        let r: &'static [u8] = match b {
+            b'"' => b"\\\"",
+            b'\\' => b"\\\\",
+            b'\n' => b"\\n",
+            b'\t' => b"\\t",
+            b'\r' => b"\\r",
+            0..=0x1f => b"?",
+            _ => return None,
+        };
+        Some(r)
+    })
 }
 
 pub fn escape_csv(s: &str) -> String {
@@ -569,11 +643,17 @@ impl<W: Write> Printer<W> {
         b.extend_from_slice(b"  <");
         b.extend_from_slice(name.as_bytes());
         if fl & ID != 0 {
-            w!(b, " id=\"{id}\"");
+            b.extend_from_slice(b" id=\"");
+            put_u64(b, id);
+            b.push(b'"');
         }
         if let Item::Node(n) = item {
             if fl & ANY_POS != 0 {
-                w!(b, " lat=\"{}\" lon=\"{}\"", Lat(n.pos.y), Lon(n.pos.ilon()));
+                b.extend_from_slice(b" lat=\"");
+                put_lat(b, n.pos.y);
+                b.extend_from_slice(b"\" lon=\"");
+                put_lon(b, n.pos.ilon());
+                b.push(b'"');
             }
         }
         if !matches!(item, Item::Derived { .. }) && fl & META != 0 {
@@ -605,10 +685,15 @@ impl<W: Write> Printer<W> {
                     for (i, nd) in w.nodes.iter().enumerate() {
                         child(b, &mut open);
                         let pos = if fl & GEOMETRY != 0 { geom.way_pts.as_ref().and_then(|p| p.get(i).copied().flatten()) } else { None };
-                        match pos {
-                            Some((lat, lon)) => w!(b, "    <nd ref=\"{nd}\" lat=\"{}\" lon=\"{}\"/>\n", F7(lat), F7(lon)),
-                            None => w!(b, "    <nd ref=\"{nd}\"/>\n"),
+                        b.extend_from_slice(b"    <nd ref=\"");
+                        put_u64(b, *nd);
+                        if let Some((lat, lon)) = pos {
+                            b.extend_from_slice(b"\" lat=\"");
+                            put_f7(b, lat);
+                            b.extend_from_slice(b"\" lon=\"");
+                            put_f7(b, lon);
                         }
+                        b.extend_from_slice(b"\"/>\n");
                     }
                 }
             }
@@ -617,19 +702,33 @@ impl<W: Write> Printer<W> {
                 if fl & MEMBERS != 0 {
                     for (i, m) in r.members.iter().enumerate() {
                         child(b, &mut open);
-                        w!(b, "    <member type=\"{}\" ref=\"{}\" role=\"", m.mtype.name(), m.id);
+                        b.extend_from_slice(b"    <member type=\"");
+                        b.extend_from_slice(m.mtype.name().as_bytes());
+                        b.extend_from_slice(b"\" ref=\"");
+                        put_u64(b, m.id);
+                        b.extend_from_slice(b"\" role=\"");
                         escape_xml(&m.role, b);
                         b.push(b'"');
                         let mg = if fl & GEOMETRY != 0 { geom.members.as_ref().and_then(|v| v.get(i)) } else { None };
                         match mg {
                             Some(MemberGeom::Node(Some((lat, lon)))) => {
-                                w!(b, " lat=\"{}\" lon=\"{}\"/>\n", F7(*lat), F7(*lon));
+                                b.extend_from_slice(b" lat=\"");
+                                put_f7(b, *lat);
+                                b.extend_from_slice(b"\" lon=\"");
+                                put_f7(b, *lon);
+                                b.extend_from_slice(b"\"/>\n");
                             }
                             Some(MemberGeom::Way(pts)) if pts.len() > 1 && pts.iter().any(|p| p.is_some()) => {
                                 b.extend_from_slice(b">\n");
                                 for p in pts {
                                     match p {
-                                        Some((lat, lon)) => w!(b, "      <nd lat=\"{}\" lon=\"{}\"/>\n", F7(*lat), F7(*lon)),
+                                        Some((lat, lon)) => {
+                                            b.extend_from_slice(b"      <nd lat=\"");
+                                            put_f7(b, *lat);
+                                            b.extend_from_slice(b"\" lon=\"");
+                                            put_f7(b, *lon);
+                                            b.extend_from_slice(b"\"/>\n");
+                                        }
                                         None => b.extend_from_slice(b"      <nd/>\n"),
                                     }
                                 }
@@ -678,27 +777,36 @@ impl<W: Write> Printer<W> {
             Item::Relation(r) => ("relation", r.id),
             Item::Derived { tname, id, .. } => (tname, *id),
         };
-        w!(b, "{{\n  \"type\": \"{tname}\"");
+        b.extend_from_slice(b"{\n  \"type\": \"");
+        b.extend_from_slice(tname.as_bytes());
+        b.push(b'"');
         if fl & ID != 0 {
-            w!(b, ",\n  \"id\": {id}");
+            b.extend_from_slice(b",\n  \"id\": ");
+            put_u64(b, id);
         }
         if let Item::Node(n) = item {
             if fl & ANY_POS != 0 {
-                w!(b, ",\n  \"lat\": {},\n  \"lon\": {}", Lat(n.pos.y), Lon(n.pos.ilon()));
+                b.extend_from_slice(b",\n  \"lat\": ");
+                put_lat(b, n.pos.y);
+                b.extend_from_slice(b",\n  \"lon\": ");
+                put_lon(b, n.pos.ilon());
             }
         }
         if !matches!(item, Item::Derived { .. }) && fl & META != 0 {
             if let Some(m) = meta {
-                w!(b, ",\n  \"timestamp\": \"{}\",\n  \"version\": {},\n  \"changeset\": {}",
-                        format_timestamp(m.meta.timestamp),
-                        m.meta.version,
-                        m.meta.changeset);
+                b.extend_from_slice(b",\n  \"timestamp\": \"");
+                b.extend_from_slice(format_timestamp(m.meta.timestamp).as_bytes());
+                b.extend_from_slice(b"\",\n  \"version\": ");
+                put_u64(b, m.meta.version as u64);
+                b.extend_from_slice(b",\n  \"changeset\": ");
+                put_u64(b, m.meta.changeset);
                 if let Some(u) = m.user {
                     b.extend_from_slice(b",\n  \"user\": \"");
                     escape_json(u, b);
                     b.push(b'"');
                 }
-                w!(b, ",\n  \"uid\": {}", m.meta.uid);
+                b.extend_from_slice(b",\n  \"uid\": ");
+                put_u64(b, m.meta.uid as u64);
             }
         }
         match item {
@@ -711,7 +819,8 @@ impl<W: Write> Printer<W> {
                         if i > 0 {
                             b.push(b',');
                         }
-                        w!(b, "\n    {nd}");
+                        b.extend_from_slice(b"\n    ");
+                        put_u64(b, *nd);
                     }
                     b.extend_from_slice(b"\n  ]");
                 }
@@ -723,7 +832,13 @@ impl<W: Write> Printer<W> {
                                 b.push(b',');
                             }
                             match p {
-                                Some((lat, lon)) => w!(b, "\n    {{ \"lat\": {}, \"lon\": {} }}", F7(*lat), F7(*lon)),
+                                Some((lat, lon)) => {
+                                    b.extend_from_slice(b"\n    { \"lat\": ");
+                                    put_f7(b, *lat);
+                                    b.extend_from_slice(b", \"lon\": ");
+                                    put_f7(b, *lon);
+                                    b.extend_from_slice(b" }");
+                                }
                                 None => b.extend_from_slice(b"\n    null"),
                             }
                         }
@@ -739,13 +854,20 @@ impl<W: Write> Printer<W> {
                         if i > 0 {
                             b.push(b',');
                         }
-                        w!(b, "\n    {{\n      \"type\": \"{}\",\n      \"ref\": {},\n      \"role\": \"", m.mtype.name(), m.id);
+                        b.extend_from_slice(b"\n    {\n      \"type\": \"");
+                        b.extend_from_slice(m.mtype.name().as_bytes());
+                        b.extend_from_slice(b"\",\n      \"ref\": ");
+                        put_u64(b, m.id);
+                        b.extend_from_slice(b",\n      \"role\": \"");
                         escape_json(&m.role, b);
                         b.push(b'"');
                         let mg = if fl & GEOMETRY != 0 { geom.members.as_ref().and_then(|v| v.get(i)) } else { None };
                         match mg {
                             Some(MemberGeom::Node(Some((lat, lon)))) => {
-                                w!(b, ",\n      \"lat\": {},\n      \"lon\": {}", F7(*lat), F7(*lon));
+                                b.extend_from_slice(b",\n      \"lat\": ");
+                                put_f7(b, *lat);
+                                b.extend_from_slice(b",\n      \"lon\": ");
+                                put_f7(b, *lon);
                             }
                             Some(MemberGeom::Way(pts)) => {
                                 b.extend_from_slice(b",\n      \"geometry\": [");
@@ -755,7 +877,13 @@ impl<W: Write> Printer<W> {
                                         b.push(b',');
                                     }
                                     match p {
-                                        Some((lat, lon)) => w!(b, "\n         {{ \"lat\": {}, \"lon\": {} }}", F7(*lat), F7(*lon)),
+                                        Some((lat, lon)) => {
+                                            b.extend_from_slice(b"\n         { \"lat\": ");
+                                            put_f7(b, *lat);
+                                            b.extend_from_slice(b", \"lon\": ");
+                                            put_f7(b, *lon);
+                                            b.extend_from_slice(b" }");
+                                        }
                                         None => b.extend_from_slice(b"\n         null"),
                                     }
                                 }
@@ -1041,6 +1169,95 @@ mod tests {
         assert_eq!(F7(0.0).to_string(), "0.0000000");
         assert_eq!(F7(-7.1125).to_string(), "-7.1125000");
         assert_eq!(F7(51.0125).to_string(), "51.0125000");
+    }
+
+    #[test]
+    fn byte_writers_match_the_formatters() {
+        let mut vals: Vec<f64> = vec![0.0, -0.0, 1e-8, -1e-8, 5e-8, -5e-8, 51.0125, -7.1125, 90.0, -90.0, 180.0, -180.0, 0.00000005, 123456789.1234567, 9.1e8, -9.1e8, 1e16, f64::MAX, f64::MIN_POSITIVE];
+        let mut x = 0x2545F4914F6CDD1Du64;
+        for _ in 0..20_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            let y = (x % 1_820_000_000) as i64 - 910_000_000;
+            vals.push(y as f64 / 1e7);
+            vals.push(y as f64 * 1e-7);
+            vals.push((x % 3_600_000_000) as f64 / 1e7 - 180.0);
+            vals.push(f64::from_bits(x) % 400.0);
+            let mut b = Vec::new();
+            put_lat(&mut b, (x % 1_800_000_001) as u32);
+            assert_eq!(String::from_utf8(b).unwrap(), Lat((x % 1_800_000_001) as u32).to_string());
+            let mut b = Vec::new();
+            put_lon(&mut b, y as i32 * 2 - 1);
+            assert_eq!(String::from_utf8(b).unwrap(), Lon(y as i32 * 2 - 1).to_string());
+            let mut b = Vec::new();
+            put_u64(&mut b, x >> (x % 64));
+            assert_eq!(String::from_utf8(b).unwrap(), (x >> (x % 64)).to_string());
+        }
+        for v in vals {
+            if v.is_nan() {
+                continue;
+            }
+            let mut b = Vec::new();
+            put_f7(&mut b, v);
+            assert_eq!(String::from_utf8(b).unwrap(), F7(v).to_string(), "{v:e}");
+        }
+        let mut b = Vec::new();
+        put_u64(&mut b, 0);
+        put_u64(&mut b, u64::MAX);
+        assert_eq!(b, b"018446744073709551615");
+        for t in ["", "plain", "a\"b\\c\nd\te\rf\u{1}g", "\"", "x\"", "<&>\"'", "\u{7f}é\u{1f}"] {
+            let (mut j, mut x) = (Vec::new(), Vec::new());
+            escape_json(t, &mut j);
+            escape_xml(t, &mut x);
+            let (mut ej, mut ex) = (String::new(), String::new());
+            for c in t.chars() {
+                match c {
+                    '"' => {
+                        ej += "\\\"";
+                        ex += "&quot;";
+                    }
+                    '\\' => {
+                        ej += "\\\\";
+                        ex.push(c);
+                    }
+                    '\n' => {
+                        ej += "\\n";
+                        ex += "&#x0a;";
+                    }
+                    '\t' => {
+                        ej += "\\t";
+                        ex += "&#x09;";
+                    }
+                    '\r' => {
+                        ej += "\\r";
+                        ex += "&#x0d;";
+                    }
+                    '&' => {
+                        ej.push(c);
+                        ex += "&amp;";
+                    }
+                    '<' => {
+                        ej.push(c);
+                        ex += "&lt;";
+                    }
+                    '>' => {
+                        ej.push(c);
+                        ex += "&gt;";
+                    }
+                    c if (c as u32) < 0x20 => {
+                        ej.push('?');
+                        ex.push('?');
+                    }
+                    c => {
+                        ej.push(c);
+                        ex.push(c);
+                    }
+                }
+            }
+            assert_eq!(String::from_utf8(j).unwrap(), ej);
+            assert_eq!(String::from_utf8(x).unwrap(), ex);
+        }
     }
 
     #[test]

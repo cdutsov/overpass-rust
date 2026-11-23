@@ -3,6 +3,41 @@
 Changes of overpass-rust, newest first. "Overpass API" is the C++ server
 (0.7.62) whose answers overpass-rust reproduces.
 
+## 0.2.8 (2026-11-23)
+
+Faster
+- Real queries on the planet, against 0.2.7: 23,085 that take under 1 s use
+  1.3 times less time and 1.5 times less CPU, 263 slower ones 2.9 and 2.3
+  times less; the slowest, 28 to 43 s on 0.2.7, take about 5 s. The answers
+  are the same.
+- A region scan with tag filters (`nwr["name"](area.a)`, `node["shop"](box)`)
+  tests the tags before it decodes an element, and does not read on in a
+  chunk of the database where a key the filters need does not occur.
+- `(area)`: the region read for a database area follows the node tiles its
+  outline passes, not its block tiles (about 12 x 8 km), so the region of a
+  city shrinks to the city. Ways and relations in node tiles inside the area
+  pass without node positions; a way whose first vertex is inside passes on
+  that vertex. The member ways of relations are read in rounds, only from the
+  cells of the area.
+- Statements that follow each other with the same `(area.set)` clause build
+  its polygons and cell ranges once, while they take at most 64 MiB beyond
+  the database areas; they count against the memory limit while kept. The
+  database areas of a set are prepared once per query.
+- A statement on input sets (`nwr.s[name~"..."]`) walks the smallest set in
+  place and copies only what passes. `A->.s; B.s[tags];` runs as one
+  statement when nothing else reads `.s`: the tag filters run before the
+  spatial tests of A.
+- `lat()` and `lon()` compared with a number do not build strings; the
+  elements of `make` and `convert` share their name and tags; JSON and XML
+  output write numbers and escapes directly.
+- Decoding: elements of a chunk are picked by cell runs, tag buffers are
+  allocated once, node positions are read without whole nodes, and tag index
+  entries are visited without lists per entry.
+
+Changed
+- `A->.s; B.s[tags];` as one statement does not store `.s`: with a very small
+  `[maxsize:]` such a query answers where 0.2.7 ran out of memory.
+
 ## 0.2.7 (2026-11-23)
 
 Fixed: queries that stopped the server or escaped its limits

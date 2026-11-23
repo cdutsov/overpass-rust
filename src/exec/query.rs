@@ -344,7 +344,7 @@ impl<'s, W: Write> Engine<'s, W> {
         let mut arounds = Vec::new();
         if types.node || types.way || types.relation || types.area {
             for (set, id) in &plan.areas {
-                area_ctxs.push(self.area_ctx(set, *id)?);
+                area_ctxs.push(self.shared_area_ctx(set, *id)?);
             }
             for (input, radius, points) in &plan.arounds {
                 let mut src = self.around_source(input, points)?;
@@ -381,6 +381,68 @@ impl<'s, W: Write> Engine<'s, W> {
         Ok(out)
     }
 
+    /// The polygons of an `(area.set:id)` clause, built once for the
+    /// statements that follow each other with the same input set (the same
+    /// stored set, not only the same name) and id: the members of
+    /// `(rel(area.c)[name="x"];rel(area.c)["name:en"="x"];...)` over a
+    /// country each read the same tens of thousands of area tiles.
+    fn shared_area_ctx(&mut self, set: &str, id: Option<Id>) -> Result<std::rc::Rc<super::area::AreaCtx>> {
+        let input = self.get(set);
+        if let Some((s, i, ctx)) = &self.area_ctx_last {
+            if std::rc::Weak::ptr_eq(s, &std::rc::Rc::downgrade(&input)) && *i == id {
+                #[cfg(test)]
+                tests::AREA_CTX_SHARED.set(tests::AREA_CTX_SHARED.get() + 1);
+                return Ok(ctx.clone());
+            }
+        }
+        // the last one goes before the next is built
+        self.area_ctx_last = None;
+        self.area_ranges_last.clear();
+        self.area_kept_bytes = 0;
+        let ctx = std::rc::Rc::new(self.area_ctx(set, id)?);
+        // Kept for the statements after this one only up to AREA_KEEP_MAX
+        // and within the memory limit, and counted against it while kept:
+        // the closed ways of a large input set go with their statement.
+        let bytes = ctx.kept_bytes();
+        if bytes <= area_keep_max() && self.check_memory(bytes).is_ok() {
+            self.area_ctx_last = Some((std::rc::Rc::downgrade(&input), id, ctx.clone()));
+            self.area_kept_bytes = bytes;
+        }
+        Ok(ctx)
+    }
+
+    /// The cell ranges to read for a statement whose only spatial clause is
+    /// the shared `(area)` clause (`shared_area_ctx`), kept with it per
+    /// element kind: what `spatial_rects` and `ranges_for` give for that
+    /// single clause. The ranges of a country come from tens of thousands
+    /// of tile rectangles, and every statement of
+    /// `(rel(area.c)[name="x"];rel(area.c)["name:en"="x"];...)` needs them.
+    /// None for every other statement.
+    fn area_ranges(&mut self, kind: Kind, plan: &Plan, arounds: &[(AroundSource, f64)], area_ctxs: &[std::rc::Rc<super::area::AreaCtx>]) -> Option<Vec<CodeRange>> {
+        let [ctx] = area_ctxs else { return None };
+        if !plan.bboxes.is_empty() || !plan.polys.is_empty() || !arounds.is_empty() {
+            return None;
+        }
+        if !self.area_ctx_last.as_ref().is_some_and(|(_, _, last)| std::rc::Rc::ptr_eq(last, ctx)) {
+            return None;
+        }
+        #[cfg(test)]
+        tests::REGION.set(Some("area"));
+        let arcs = ctx.has_implicit();
+        if let Some((_, _, r)) = self.area_ranges_last.iter().find(|(k, a, _)| *k == kind && *a == arcs) {
+            #[cfg(test)]
+            tests::AREA_RANGES_SHARED.set(tests::AREA_RANGES_SHARED.get() + 1);
+            return Some(r.to_vec());
+        }
+        let r = std::rc::Rc::new(if arcs { arc_ranges(kind, &ctx.rects) } else { ranges_for(kind, &ctx.rects) });
+        let bytes = (r.capacity() * std::mem::size_of::<CodeRange>()) as u64;
+        if self.area_kept_bytes + bytes <= area_keep_max() && self.check_memory(bytes).is_ok() {
+            self.area_ranges_last.push((kind, arcs, r.clone()));
+            self.area_kept_bytes += bytes;
+        }
+        Some(r.to_vec())
+    }
+
     fn around_source(&self, input: &Option<String>, points: &[(f64, f64)]) -> Result<AroundSource> {
         let mut src = AroundSource::default();
         if !points.is_empty() {
@@ -411,6 +473,12 @@ impl<'s, W: Write> Engine<'s, W> {
     }
 
     /// Candidate ids from all clauses that collect data directly.
+    ///
+    /// Input sets (`node.a.b`) are read in place: the elements of the
+    /// smallest source that every input set holds (sets are sorted by id)
+    /// and that pass the tag filters are the only ones copied. A statement
+    /// such as `nwr.named[name~"x"]` over a large set, or `node._.stops`
+    /// inside a loop, does not copy the sets it reads.
     fn collected<T: QElem>(&mut self, plan: &Plan) -> Result<Option<Vec<T>>> {
         let mut sources: Vec<Vec<T>> = Vec::new();
         if let Some(mut given) = plan.given.lock().unwrap_or_else(|e| e.into_inner()).take() {
@@ -420,23 +488,20 @@ impl<'s, W: Write> Engine<'s, W> {
             let ids: Vec<Id> = if T::KIND == Kind::Node { ids.clone() } else { ids.iter().copied().filter(|i| *i <= u32::MAX as u64).collect() };
             sources.push(self.f.by_ids::<T>(&ids)?);
         }
-        for name in &plan.inputs {
-            sources.push(self.lookup(name).map(|s| T::from_set(s).clone()).unwrap_or_default());
-        }
         for (kind, input, role, positions, count) in &plan.recurse {
             let inp = self.get(input);
-            let r = self.recurse_filter(*kind, &inp, role.as_deref(), positions.as_deref(), *count, T::etype())?;
-            sources.push(T::from_set(&r).clone());
+            let mut r = self.recurse_filter(*kind, &inp, role.as_deref(), positions.as_deref(), *count, T::etype())?;
+            sources.push(std::mem::take(T::from_set_mut(&mut r)));
         }
         for op in &plan.recurse_ops {
             let inp = self.get("_");
-            let r = self.recurse_constraint(*op, &inp)?;
-            sources.push(T::from_set(&r).clone());
+            let mut r = self.recurse_constraint(*op, &inp)?;
+            sources.push(std::mem::take(T::from_set_mut(&mut r)));
         }
         for set in &plan.pivots {
             let inp = self.get(set);
-            let r = self.pivot(&inp)?;
-            let mut v = T::from_set(&r).clone();
+            let mut r = self.pivot(&inp)?;
+            let mut v = std::mem::take(T::from_set_mut(&mut r));
             if T::KIND == Kind::Way {
                 // `way(pivot)` passes all ways of the input set through.
                 let extra = T::from_set(&inp).clone();
@@ -446,8 +511,18 @@ impl<'s, W: Write> Engine<'s, W> {
             }
             sources.push(v);
         }
-        if sources.is_empty() {
+        let inputs: Vec<std::rc::Rc<Set>> = plan.inputs.iter().map(|name| self.get(name)).collect();
+        if sources.is_empty() && inputs.is_empty() {
             return Ok(None);
+        }
+        let mut input_vecs: Vec<&Vec<T>> = inputs.iter().map(|s| T::from_set(s)).collect();
+        debug_assert!(input_vecs.iter().all(|v| v.is_sorted_by_key(|e| e.id())));
+        let holds = |v: &Vec<T>, id: Id| v.binary_search_by_key(&id, |e| e.id()).is_ok();
+        if sources.is_empty() {
+            input_vecs.sort_by_key(|v| v.len());
+            let (base, rest) = input_vecs.split_first().unwrap();
+            let acc = base.iter().filter(|e| rest.iter().all(|v| holds(v, e.id())) && plan.tags.iter().all(|t| t.matches(e.tags_of()))).cloned().collect();
+            return Ok(Some(acc));
         }
         sources.sort_by_key(|s| s.len());
         let mut it = sources.into_iter();
@@ -456,6 +531,7 @@ impl<'s, W: Write> Engine<'s, W> {
             let ids: HashSet<Id> = s.iter().map(|e| e.id()).collect();
             acc.retain(|e| ids.contains(&e.id()));
         }
+        acc.retain(|e| input_vecs.iter().all(|v| holds(v, e.id())));
         Ok(Some(acc))
     }
 
@@ -471,7 +547,7 @@ impl<'s, W: Write> Engine<'s, W> {
     /// The rectangles of the most restrictive single spatial clause, for
     /// range selection, and whether its test follows great-circle edges
     /// (`around`, implicit areas: `arc_ranges`).
-    fn spatial_rects(&self, plan: &Plan, arounds: &[(AroundSource, f64)], area_ctxs: &[super::area::AreaCtx]) -> Result<Option<(Vec<Rect>, bool)>> {
+    fn spatial_rects(&self, plan: &Plan, arounds: &[(AroundSource, f64)], area_ctxs: &[std::rc::Rc<super::area::AreaCtx>]) -> Result<Option<(Vec<Rect>, bool)>> {
         let mut options: Vec<(&'static str, Vec<Rect>, bool)> = plan.bboxes.iter().map(|b| ("bbox", b.rects(), false)).collect();
         options.extend(plan.polys.iter().map(|p| ("poly", p.bbox().rects(), false)));
         options.extend(arounds.iter().map(|(src, r)| ("around", src.bbox_rects(*r), true)));
@@ -491,15 +567,20 @@ impl<'s, W: Write> Engine<'s, W> {
         Ok(best.map(|(_, _, r, arcs)| (r, arcs)))
     }
 
-    fn query_type<T: QElem>(&mut self, plan: &Plan, (area_ctxs, arounds): (&[super::area::AreaCtx], &[(AroundSource, f64)])) -> Result<Vec<T>> {
+    fn query_type<T: QElem>(&mut self, plan: &Plan, (area_ctxs, arounds): (&[std::rc::Rc<super::area::AreaCtx>], &[(AroundSource, f64)])) -> Result<Vec<T>> {
         let kind = T::KIND;
         let collected = self.collected::<T>(plan)?;
         let mut cands: Vec<T> = match collected {
             Some(c) => c,
             None => {
-                let rects = self.spatial_rects(plan, arounds, area_ctxs)?;
-                self.check()?;
-                let ranges: Option<Vec<CodeRange>> = rects.as_ref().map(|(r, arcs)| if *arcs { arc_ranges(kind, r) } else { ranges_for(kind, r) });
+                let ranges: Option<Vec<CodeRange>> = match self.area_ranges(kind, plan, arounds, area_ctxs) {
+                    Some(r) => Some(r),
+                    None => {
+                        let rects = self.spatial_rects(plan, arounds, area_ctxs)?;
+                        self.check()?;
+                        rects.as_ref().map(|(r, arcs)| if *arcs { arc_ranges(kind, r) } else { ranges_for(kind, r) })
+                    }
+                };
                 self.check()?;
                 if let Some((pairs, read)) = self.indexed_candidates(kind, plan, ranges.as_deref())? {
                     self.check()?;
@@ -534,7 +615,7 @@ impl<'s, W: Write> Engine<'s, W> {
                             self.check()?;
                             self.at_tagged::<T>(plan, pairs, &[t])?
                         }
-                        None => self.f.in_ranges::<T>(r, |e| plan.tags.iter().all(|t| t.matches(e.tags_of())))?,
+                        None => self.in_ranges_tagged::<T>(plan, r)?,
                     }
                 } else if let Some((pairs, t)) = self.index_candidates(kind, plan, None)? {
                     self.check()?;
@@ -1208,7 +1289,29 @@ impl<'s, W: Write> Engine<'s, W> {
         let needs = rest.iter().filter_map(|t| t.value_literals()).map(|lits| literal_search(&lits)).collect::<Result<Vec<_>>>()?;
         let chunk = |data: &[u8]| needs.iter().all(|re| re.is_match(data));
         let keep = |tags: &Tags| rest.iter().all(|t| t.matches(tags));
-        self.f.at_where::<T>(pairs, Some(TagTest { chunk: &chunk, keep: &keep }))
+        self.f.at_where::<T>(pairs, Some(TagTest { chunk: &chunk, keep: &keep, keys: &super::fetch::required_keys(rest.iter().copied()) }))
+    }
+
+    /// The elements stored in the ranges that pass the tag filters of the
+    /// plan. The tags are tested before an element is decoded whole
+    /// (`Fetch::in_ranges_tagged`): a chunk without a key the filters need
+    /// in its key table (`TagTest::keys`), or where a value they need does
+    /// not occur (`TagFilter::value_literals`, as for index candidates in
+    /// `at_tagged`), is not read further. `nwr(area.a)[name][name~"x"]`
+    /// builds the few elements with such a name, not every element of the
+    /// region.
+    fn in_ranges_tagged<T: QElem>(&self, plan: &Plan, ranges: &[CodeRange]) -> Result<Vec<T>> {
+        #[cfg(test)]
+        let plain = tests::RANGES_PLAIN.get();
+        #[cfg(not(test))]
+        let plain = false;
+        if plan.tags.is_empty() || plain {
+            return self.f.in_ranges::<T>(ranges, |e| plan.tags.iter().all(|t| t.matches(e.tags_of())));
+        }
+        let needs = plan.tags.iter().filter_map(|t| t.value_literals()).map(|lits| literal_search(&lits)).collect::<Result<Vec<_>>>()?;
+        let chunk = |data: &[u8]| needs.iter().all(|re| re.is_match(data));
+        let keep = |t: &Tags| plan.tags.iter().all(|f| f.matches(t));
+        self.f.in_ranges_tagged::<T>(ranges, &plan.tags, &chunk, &keep)
     }
 
     fn negated_tags_exist(&self, kind: Kind, plan: &Plan) -> Result<bool> {
@@ -1240,10 +1343,217 @@ fn count_cap() -> usize {
     20_000
 }
 
+/// Most bytes the polygons of an `(area)` clause (beyond its database
+/// areas) and their cell ranges hold while they are kept for the
+/// statements after it (`shared_area_ctx`): 64 MiB.
+const AREA_KEEP_MAX: u64 = 64 << 20;
+
+fn area_keep_max() -> u64 {
+    #[cfg(test)]
+    if let Some(c) = tests::AREA_KEEP_MAX.get() {
+        return c;
+    }
+    AREA_KEEP_MAX
+}
+
 /// A search for any of the byte strings.
 fn literal_search(lits: &[&[u8]]) -> Result<regex::bytes::Regex> {
     let alts: Vec<String> = lits.iter().map(|l| l.iter().map(|b| format!("\\x{b:02x}")).collect()).collect();
     Ok(regex::bytes::RegexBuilder::new(&alts.join("|")).unicode(false).build()?)
+}
+
+/// Count the reads of every set name in the statements: inputs of
+/// statements and filters, loop variables, and the sets of evaluators.
+fn count_reads(stmts: &[Stmt], reads: &mut std::collections::HashMap<String, usize>) {
+    fn expr(e: &Expr, reads: &mut std::collections::HashMap<String, usize>) {
+        match e {
+            Expr::Lit(_) | Expr::Tag(_) | Expr::Generic => {}
+            Expr::Call(_, args) => args.iter().for_each(|a| expr(a, reads)),
+            Expr::Agg { set, args, .. } => {
+                *reads.entry(set.clone().unwrap_or_else(|| "_".into())).or_default() += 1;
+                args.iter().for_each(|a| expr(a, reads));
+            }
+            Expr::SetProp { set, .. } => *reads.entry(set.clone()).or_default() += 1,
+            Expr::Unary(_, a) => expr(a, reads),
+            Expr::Binary(_, a, b) => {
+                expr(a, reads);
+                expr(b, reads);
+            }
+            Expr::Ternary(a, b, c) => {
+                expr(a, reads);
+                expr(b, reads);
+                expr(c, reads);
+            }
+        }
+    }
+    fn entries(es: &[MakeEntry], reads: &mut std::collections::HashMap<String, usize>) {
+        for e in es {
+            if let MakeKey::Generic { from: Some(set) } = &e.key {
+                *reads.entry(set.clone()).or_default() += 1;
+            }
+            if let Some(v) = &e.value {
+                expr(v, reads);
+            }
+        }
+    }
+    let read = |name: &str, reads: &mut std::collections::HashMap<String, usize>| *reads.entry(name.to_string()).or_default() += 1;
+    for s in stmts {
+        match &s.kind {
+            StmtKind::Query { filters, .. } => {
+                for f in filters {
+                    match f {
+                        Filter::Around { input, .. } => read(input.as_deref().unwrap_or("_"), reads),
+                        Filter::Area { set, .. } | Filter::Pivot(set) | Filter::Input(set) => read(set, reads),
+                        Filter::Recurse { input, .. } => read(input, reads),
+                        Filter::RecurseOp(_) => read("_", reads),
+                        Filter::If(e) => expr(e, reads),
+                        Filter::HasKey(_)
+                        | Filter::NotKey(_)
+                        | Filter::Eq(..)
+                        | Filter::Ne(..)
+                        | Filter::Regex { .. }
+                        | Filter::KeyRegex { .. }
+                        | Filter::BBox(_)
+                        | Filter::Ids(_)
+                        | Filter::Poly(_)
+                        | Filter::Newer(_)
+                        | Filter::User(_)
+                        | Filter::Uid(_) => {}
+                    }
+                }
+            }
+            StmtKind::Union(v) => {
+                // a union reads the result of each member
+                for m in v {
+                    read(&m.into, reads);
+                }
+                count_reads(v, reads);
+            }
+            StmtKind::Difference(a, b) => {
+                read(&a.into, reads);
+                read(&b.into, reads);
+                count_reads(std::slice::from_ref(a), reads);
+                count_reads(std::slice::from_ref(b), reads);
+            }
+            StmtKind::Recurse { input, .. } | StmtKind::Out { input, .. } | StmtKind::IsIn { input, .. } | StmtKind::MapToArea { input } => read(input, reads),
+            StmtKind::Item { set } => read(set, reads),
+            StmtKind::Foreach { input, var, body } | StmtKind::Complete { input, var, body, .. } => {
+                read(input, reads);
+                read(var.as_deref().unwrap_or("_"), reads);
+                count_reads(body, reads);
+            }
+            StmtKind::For { input, var, key, body } => {
+                read(input, reads);
+                read(var.as_deref().unwrap_or("_"), reads);
+                expr(key, reads);
+                count_reads(body, reads);
+            }
+            StmtKind::If { cond, then, els } => {
+                expr(cond, reads);
+                count_reads(then, reads);
+                count_reads(els, reads);
+            }
+            StmtKind::Make { entries: es, .. } => entries(es, reads),
+            StmtKind::Convert { input, entries: es, .. } => {
+                read(input, reads);
+                entries(es, reads);
+            }
+            StmtKind::Unsupported(_) => {}
+        }
+    }
+}
+
+/// The statement that answers `b` without storing the result of `a`, for
+/// the pair `nwr(area.c)[name]->.s; nwr.s[name~"x"];`: a query into a named
+/// set, then a query that takes that set and tests tags only. Every filter
+/// of a query is a test of the element alone, so the second result is
+/// what the filters of both statements pass, of the types both name. The
+/// tag filters of `b` then run where the elements are decoded, before the
+/// spatial tests of `a` (the area test of every named element of a city
+/// costs far more than the regex).
+///
+/// Only for pairs where the fused statement behaves as `a` does: element
+/// types only, `a` not a standalone criterion (those ignore the global
+/// bbox) and with a clause that keeps it from the "filters too weak"
+/// remark. The caller checks that nothing else reads the set of `a`.
+fn fused(a: &Stmt, b: &Stmt) -> Option<Stmt> {
+    let (StmtKind::Query { types: ta, filters: fa }, StmtKind::Query { types: tb, filters: fb }) = (&a.kind, &b.kind) else { return None };
+    if a.into == "_" || ta.area || ta.derived || tb.area || tb.derived || is_standalone(ta, fa) {
+        return None;
+    }
+    let is_tag = |f: &Filter| matches!(f, Filter::HasKey(_) | Filter::NotKey(_) | Filter::Eq(..) | Filter::Ne(..) | Filter::Regex { .. } | Filter::KeyRegex { .. });
+    let strong = |f: &Filter| match f {
+        Filter::HasKey(_) | Filter::Eq(..) | Filter::KeyRegex { .. } | Filter::Regex { neg: false, .. } => true,
+        Filter::BBox(_) | Filter::Ids(_) | Filter::Around { .. } | Filter::Poly(_) | Filter::Area { .. } | Filter::Recurse { .. } | Filter::RecurseOp(_) | Filter::Input(_) => true,
+        _ => false,
+    };
+    if fa.iter().any(|f| matches!(f, Filter::Pivot(_))) || !fa.iter().any(strong) {
+        return None;
+    }
+    let inputs = fb.iter().filter(|f| matches!(f, Filter::Input(_))).count();
+    let tags: Vec<Filter> = fb.iter().filter(|f| is_tag(f)).cloned().collect();
+    if inputs != 1 || tags.is_empty() || tags.len() + 1 != fb.len() || !fb.iter().any(|f| matches!(f, Filter::Input(s) if *s == a.into)) {
+        return None;
+    }
+    let types = Types { node: ta.node && tb.node, way: ta.way && tb.way, relation: ta.relation && tb.relation, area: false, derived: false };
+    let mut filters = fa.clone();
+    filters.extend(tags);
+    Some(Stmt { kind: StmtKind::Query { types, filters }, into: b.into.clone(), line: a.line })
+}
+
+/// Every statement list that `exec_block` runs: the script and the bodies
+/// of loops and `if`. The members of a union are not such a list: the
+/// union reads the result of each.
+fn for_each_block(stmts: &mut Vec<Stmt>, f: &mut dyn FnMut(&mut Vec<Stmt>)) {
+    for s in stmts.iter_mut() {
+        match &mut s.kind {
+            StmtKind::Foreach { body, .. } | StmtKind::For { body, .. } | StmtKind::Complete { body, .. } => for_each_block(body, f),
+            StmtKind::If { then, els, .. } => {
+                for_each_block(then, f);
+                for_each_block(els, f);
+            }
+            _ => {}
+        }
+    }
+    f(stmts);
+}
+
+/// Replace each pair of statements `fused` accepts by its statement, when
+/// the only reads of the set between them are the second statements of
+/// such pairs (so no statement sees that the set is not stored).
+pub fn fuse_filter_pairs(stmts: &mut Vec<Stmt>) {
+    #[cfg(test)]
+    if tests::FUSE_OFF.get() {
+        return;
+    }
+    let mut reads = std::collections::HashMap::new();
+    count_reads(stmts, &mut reads);
+    let mut pairs: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for_each_block(stmts, &mut |block| {
+        for w in block.windows(2) {
+            if fused(&w[0], &w[1]).is_some() {
+                *pairs.entry(w[0].into.clone()).or_default() += 1;
+            }
+        }
+    });
+    pairs.retain(|set, n| reads.get(set) == Some(n));
+    if pairs.is_empty() {
+        return;
+    }
+    for_each_block(stmts, &mut |block| {
+        let mut i = 0;
+        while i + 1 < block.len() {
+            match fused(&block[i], &block[i + 1]) {
+                Some(f) if pairs.contains_key(&block[i].into) => {
+                    #[cfg(test)]
+                    tests::FUSED.set(tests::FUSED.get() + 1);
+                    block[i] = f;
+                    block.remove(i + 1);
+                }
+                _ => i += 1,
+            }
+        }
+    });
 }
 
 /// A regex filter with literal prefixes (`^X`): the tag index has its
@@ -1456,6 +1766,21 @@ mod tests {
         pub(super) static TESTED_FIRST: Cell<usize> = const { Cell::new(0) };
         /// The filter whose candidates `index_candidates` read last.
         pub(super) static INDEX_FILTER: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+        /// Makes a region scan decode every element before the tag filters
+        /// (`in_ranges_tagged`).
+        pub(super) static RANGES_PLAIN: Cell<bool> = const { Cell::new(false) };
+        /// `(area)` clauses that took the polygons of the clause before
+        /// (`shared_area_ctx`).
+        pub(super) static AREA_CTX_SHARED: Cell<usize> = const { Cell::new(0) };
+        /// Statements that took the cell ranges of the shared `(area)`
+        /// clause from the statement before (`area_ranges`).
+        pub(super) static AREA_RANGES_SHARED: Cell<usize> = const { Cell::new(0) };
+        /// In place of `AREA_KEEP_MAX`.
+        pub(super) static AREA_KEEP_MAX: Cell<Option<u64>> = const { Cell::new(None) };
+        /// Turns off `fuse_filter_pairs`.
+        pub(in crate::exec) static FUSE_OFF: Cell<bool> = const { Cell::new(false) };
+        /// Pairs `fuse_filter_pairs` replaced since it was last reset.
+        pub(in crate::exec) static FUSED: Cell<usize> = const { Cell::new(0) };
         /// Candidates of a first `[key]` filter over which
         /// `index_candidates` reads a regex, in place of 500,000.
         pub(super) static MANY: Cell<Option<usize>> = const { Cell::new(None) };
@@ -1949,7 +2274,7 @@ mod tests {
             (seed >> 11) as f64 / (1u64 << 53) as f64
         };
         for (radius, spread, center_lon) in [(50.0, 0.05, 7.0), (2000.0, 0.5, 7.0), (0.0, 0.01, 7.0), (300.0, 0.2, 179.9), (5000.0, 2.0, 0.0)] {
-            let mut lon = |r: f64| {
+            let lon = |r: f64| {
                 let v: f64 = center_lon + (r - 0.5) * spread;
                 if v > 180.0 { v - 360.0 } else { v }
             };
@@ -2005,6 +2330,213 @@ mod tests {
             ways += &format!("<way id=\"{}\" {m}>{nds}<tag k=\"highway\" v=\"{}\"/><tag k=\"name\" v=\"Way {i}\"/></way>\n", 4000 + i, ["primary", "secondary", "service"][i % 3]);
         }
         osm_db(name, &grid_osm_with(&nodes, &ways, ""))
+    }
+
+    /// Comparisons of `lat()` and `lon()` of a node with a literal give
+    /// what the same comparison of the strings gives (`Evaluator::cmp_fast`;
+    /// `lat()+""` is the same string on the general path).
+    #[test]
+    fn coordinate_comparisons_as_numbers_equal_the_strings() {
+        let (db, dir) = grid_db("cmp-fast", "");
+        let mut entries = Vec::new();
+        for lit in ["48.85", "48.8500000", "48.850", "48.8499999", "2.35", "2.3500001", "48", "\"\"", "\"abc\"", "\" 48.85\"", "\"48.85 \"", "\"0x30\"", "\"4.885e1\"", "\"nan\"", "\"inf\"", "-0"] {
+            for op in ["<", "<=", ">", ">=", "==", "!="] {
+                for f in ["lat()", "lon()"] {
+                    let k = entries.len();
+                    entries.push(format!("a{k}=({f}{op}{lit}?1:0),b{k}=(({f}+\"\"){op}{lit}?1:0),c{k}={lit}{op}{f},d{k}={lit}{op}({f}+\"\")"));
+                }
+            }
+        }
+        let n = entries.len();
+        let cols: Vec<String> = (0..n).flat_map(|k| [format!("a{k}"), format!("b{k}"), format!("c{k}"), format!("d{k}")]).collect();
+        let q = format!("[out:csv({};false)];node(48.846,2.346,48.854,2.354);convert r {};out;", cols.join(","), entries.join(","));
+        let out = output(&db, &q);
+        assert!(out.lines().count() > 20, "{out}");
+        let (mut ones, mut zeros) = (0, 0);
+        for line in out.lines() {
+            let v: Vec<&str> = line.split('\t').collect();
+            assert_eq!(v.len(), 4 * n);
+            for k in 0..n {
+                assert_eq!(v[4 * k], v[4 * k + 1], "{} in {line}", entries[k]);
+                assert_eq!(v[4 * k + 2], v[4 * k + 3], "{} in {line}", entries[k]);
+                ones += (v[4 * k] == "1") as usize;
+                zeros += (v[4 * k] == "0") as usize;
+            }
+        }
+        assert!(ones > 100 && zeros > 100);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A region scan that tests the tags before it decodes an element gives
+    /// the answers of decoding every element first.
+    #[test]
+    fn region_scan_tests_tags_first() {
+        let rels = [
+            relation(1, &[("way", 4001), ("node", 200_010)], &[("type", "route"), ("route", "bus"), ("name", "Line 1")]),
+            relation(2, &[("way", 4002)], &[("type", "route"), ("route", "tram")]),
+            relation(3, &[("node", 200_020)], &[("type", "site"), ("name", "Beta site")]),
+        ]
+        .concat();
+        let m = "{m}";
+        let mut nodes = String::new();
+        for k in 0..400 {
+            let place = if k % 40 == 7 { "<tag k=\"place\" v=\"town\"/>" } else { "" };
+            let (lat, lon) = (48.84805 + (k / 20) as f64 * 0.0002, 2.34805 + (k % 20) as f64 * 0.0002);
+            nodes += &format!("<node id=\"{}\" lat=\"{lat:.5}\" lon=\"{lon:.5}\" {m}><tag k=\"name\" v=\"{}{k}\"/>{place}</node>\n", 200_001 + k, ["Alpha", "alpha", "Beta", "Gamma"][k % 4]);
+        }
+        let mut ways = String::new();
+        for i in 0..20 {
+            let nds: String = (0..20).map(|j| format!("<nd ref=\"{}\"/>", 200_001 + i * 20 + j)).collect();
+            ways += &format!("<way id=\"{}\" {m}>{nds}<tag k=\"highway\" v=\"{}\"/><tag k=\"name\" v=\"Way {i}\"/></way>\n", 4000 + i, ["primary", "secondary", "service"][i % 3]);
+        }
+        let (db, dir) = osm_db("scan-tags", &grid_osm_with(&nodes, &ways, &rels));
+        let c = "[out:csv(::type,::id,name;false)];";
+        let bbox = "(48.84,2.34,48.86,2.36)";
+        for (q, n) in [
+            (format!("nwr[name]{bbox};out;"), 422),
+            (format!("nwr[name][name~\"^alpha\",i]{bbox};out;"), 200),
+            (format!("nwr[name~\"Way 1|Beta\"]{bbox};out;"), 112),
+            (format!("node[place]{bbox};out;"), 10),
+            (format!("node[!place][name~\"7$\"]{bbox};out;"), 30),
+            (format!("way[highway][highway!=\"residential\"]{bbox};out;"), 20),
+            (format!("way[highway~\"^(primary|service)$\"][name]{bbox};out;"), 13),
+            (format!("way[highway!~\"res\"]{bbox};out;"), 20),
+            (format!("way[~\"^high\"~\"^sec\"]{bbox};out;"), 7),
+            (format!("rel[route]{bbox};out;"), 2),
+            (format!("rel[type][!route]{bbox};out;"), 1),
+            (format!("nwr[name][nosuchkey]{bbox};out;"), 0),
+            (format!("nwr[name~\"nosuchvalue\"]{bbox};out;"), 0),
+            ("node[name](around:30,48.85,2.35);out;".to_string(), usize::MAX),
+        ] {
+            RANGES_PLAIN.set(true);
+            let plain = output(&db, &format!("{c}{q}"));
+            RANGES_PLAIN.set(false);
+            let tagged = output(&db, &format!("{c}{q}"));
+            assert_eq!(tagged, plain, "{q}");
+            assert!(tagged.lines().count() == n || (n == usize::MAX && tagged.lines().count() > 0), "{q}: {}", tagged.lines().count());
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Statements that follow each other with the same area set build its
+    /// polygons once; another set, or the set stored again, builds anew.
+    #[test]
+    fn area_polygons_shared_by_consecutive_statements() {
+        let id = |i: usize, j: usize| i * 30 + j + 1;
+        let (mut ways, mut rels) = (String::new(), String::new());
+        for k in 0..4 {
+            let (i, j) = (k * 4, k * 4);
+            let nds: String = [id(i, j), id(i, j + 3), id(i + 3, j + 3), id(i + 3, j), id(i, j)].iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect();
+            ways += &format!("<way id=\"{}\" {{m}}>{nds}</way>\n", 5000 + k);
+            let name = format!("Town {k}");
+            rels += &relation(10 + k, &[("way", 5000 + k)], &[("type", "boundary"), ("boundary", "administrative"), ("admin_level", "8"), ("name", name.as_str())]);
+        }
+        let (db, dir) = osm_db("area-shared", &grid_osm_with("", &ways, &rels));
+        crate::update::areas::make_areas(&db).unwrap();
+        let c = "[out:csv(::type,::id;false)];";
+        let run = |q: &str| {
+            AREA_CTX_SHARED.set(0);
+            let out = output(&db, &format!("{c}{q}"));
+            (out, AREA_CTX_SHARED.get())
+        };
+        let (one, n) = run("area[name=\"Town 1\"]->.a;nwr(area.a);out ids;");
+        assert_eq!(n, 0);
+        assert!(one.lines().count() > 10, "{one}");
+        // the members of a union, and the statement after it
+        AREA_RANGES_SHARED.set(0);
+        let (three, n) = run("area[name=\"Town 1\"]->.a;(node(area.a);way(area.a);rel(area.a););out ids;way(area.a);out ids;");
+        assert_eq!(n, 3);
+        // the ranges of the ways a second time; with another clause, not shared
+        assert_eq!(AREA_RANGES_SHARED.get(), 1);
+        let (boxed, _) = run("area[name=\"Town 1\"]->.a;way(area.a);out ids;way(area.a)(48.82,2.32,48.88,2.38);out ids;");
+        assert_eq!(AREA_RANGES_SHARED.get(), 1);
+        assert_eq!(boxed.lines().count() % 2, 0, "{boxed}");
+        assert!(three.starts_with(&one), "{three}");
+        // by id, with the same default set
+        let (by_id, n) = run("node(area:3600000011);out ids;way(area:3600000011);out ids;");
+        assert_eq!((by_id.lines().count(), n), (one.lines().filter(|l| !l.starts_with("relation")).count(), 0));
+        let (by_id2, n) = run("area[name=\"Town 2\"];node(area:3600000011)->.x;way(area:3600000011)->.y;(.x;.y;);out ids;");
+        assert_eq!((by_id2, n), (by_id, 1));
+        // another set, and the same name stored again
+        let (two, n) = run("area[name=\"Town 1\"]->.a;area[name=\"Town 2\"]->.b;node(area.a);out ids;node(area.b);out ids;node(area.a);out ids;");
+        assert_eq!(n, 0);
+        let (again, n) = run("area[name=\"Town 1\"]->.a;node(area.a);out ids;area[name=\"Town 2\"]->.a;node(area.a);out ids;area[name=\"Town 1\"]->.a;node(area.a);out ids;");
+        assert_eq!((again, n), (two, 0));
+        // over the cap the polygons go with their statement, with the same answers
+        AREA_KEEP_MAX.set(Some(0));
+        AREA_RANGES_SHARED.set(0);
+        let (capped, n) = run("area[name=\"Town 1\"]->.a;(node(area.a);way(area.a);rel(area.a););out ids;way(area.a);out ids;");
+        AREA_KEEP_MAX.set(None);
+        assert_eq!((capped, n, AREA_RANGES_SHARED.get()), (three, 0, 0));
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A query into a set that only a tag query on that set reads runs as
+    /// one statement, with the answers of the two; other pairs stay.
+    #[test]
+    fn filter_pairs_fuse_to_the_same_answers() {
+        let (db, dir) = tagged_grid("fuse");
+        let c = "[out:csv(::type,::id,name;false)];";
+        let bbox = "(48.84,2.34,48.86,2.36)";
+        let run = |q: &str| {
+            // settings of the case go behind the output format
+            let q = match q.strip_prefix("[bbox") {
+                Some(rest) => format!("{}[bbox{rest}", c.trim_end_matches(';')),
+                None => format!("{c}{q}"),
+            };
+            FUSE_OFF.set(true);
+            let plain = output(&db, &q);
+            FUSE_OFF.set(false);
+            FUSED.set(0);
+            let fused = output(&db, &q);
+            assert_eq!(fused, plain, "{q}");
+            assert!(!fused.contains("error"), "{q}: {fused}");
+            (fused.lines().count(), FUSED.get())
+        };
+        // fused: the set is read by the tag query only
+        for (q, n, pairs) in [
+            (format!("nwr[name]{bbox}->.a;nwr.a[name~\"^alpha\",i];out;"), 200, 1),
+            (format!("nwr[name]{bbox}->.a;node.a[name~\"7$\"][place];out;"), 10, 1),
+            (format!("node[name]{bbox}->.a;nwr.a[name~\"Way|Beta\"];out;"), 100, 1),
+            (format!("way[highway]{bbox}->.a;way.a[name][highway!=\"primary\"]->.b;.b out;"), 13, 1),
+            // twice in a script, the set written again in between
+            (format!("nwr[name]{bbox}->.a;nwr.a[name~\"^Way\"];out;nwr[place]{bbox}->.a;nwr.a[name~\"^Beta\"];out;"), 20, 2),
+            // a chain
+            (format!("nwr[name]{bbox}->.a;nwr.a[name~\"a\"]->.b;nwr.b[place=\"town\"];out;"), 10, 2),
+            // inside a loop body
+            ("way[name=\"Way 2\"];foreach(node(w)[name]->.n;node.n[place];out;);".to_string(), 3, 1),
+            // no element type in common
+            (format!("node[name]{bbox}->.a;way.a[name~\"a\"];out;"), 0, 1),
+        ] {
+            assert_eq!(run(&q), (n, pairs), "{q}");
+        }
+        // not fused
+        for q in [
+            // the set is read again
+            format!("nwr[name]{bbox}->.a;nwr.a[name~\"^alpha\",i];out;.a out ids;"),
+            format!("nwr[name]{bbox}->.a;nwr.a[name~\"^Way\"];out;node(w.a);out ids;"),
+            format!("nwr[name]{bbox}->.a;nwr.a[name~\"^Way\"];out;make n c=a.count(ways);out;"),
+            // the default set
+            format!("nwr[name]{bbox};nwr._[name~\"^Way\"];out;"),
+            // a union reads its members
+            format!("(nwr[name]{bbox}->.a;nwr.a[name~\"^Way\"];);out;"),
+            // more than tag filters on the set
+            format!("nwr[name]{bbox}->.a;nwr.a[name~\"^Way\"](48.84,2.34,48.85,2.35);out;"),
+            format!("nwr[name]{bbox}->.a;nwr.a;out;"),
+            // a standalone criterion, which ignores the global bbox
+            "[bbox:48.84,2.34,48.85,2.35];node(48.84,2.34,48.86,2.36)->.a;node.a[name~\"^alpha\",i];out;".to_string(),
+            // only a negative tag filter: \"filters too weak\"
+            "way[!highway]->.a;way.a[name];out;".to_string(),
+        ] {
+            assert_eq!(run(&q).1, 0, "{q}");
+        }
+        // with a global bbox
+        assert_eq!(run(&format!("[bbox:48.848,2.348,48.849,2.349];node[name]->.a;node.a[name~\"^alpha\",i];out;")).1, 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// An anchored regex in a region with few of the chunks reads the index

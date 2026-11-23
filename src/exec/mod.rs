@@ -105,6 +105,16 @@ pub struct Engine<'s, W: Write> {
     held_bytes: u64,
     pub cli: bool,
     pub messages: Vec<String>,
+    /// The polygons of the last `(area)` clause, with its input set (weak:
+    /// the set may go, the polygons then no longer match) and id
+    /// (`Engine::shared_area_ctx`).
+    area_ctx_last: Option<(std::rc::Weak<Set>, Option<crate::model::Id>, Rc<area::AreaCtx>)>,
+    /// The cell ranges of those polygons per element kind and edge kind
+    /// (`Engine::area_ranges`).
+    area_ranges_last: Vec<(crate::store::Kind, bool, Rc<Vec<crate::geo::CodeRange>>)>,
+    /// Bytes of the two above beyond the database areas, counted against
+    /// the memory limit while they are kept (at most `AREA_KEEP_MAX`).
+    area_kept_bytes: u64,
 }
 
 pub fn stmt_name(k: &StmtKind) -> &'static str {
@@ -277,6 +287,8 @@ pub fn parallel_ok() -> bool {
 }
 
 pub fn run_script<W: Write>(snap: &Snapshot, script: Script, w: W, opts: &RunOptions, jsonp: bool) -> std::result::Result<Printer<W>, (Option<Printer<W>>, RunError)> {
+    let mut script = script;
+    query::fuse_filter_pairs(&mut script.stmts);
     ACTIVE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let _active = ActiveGuard;
     let area_level = uses_areas(&script.stmts);
@@ -318,6 +330,9 @@ pub fn run_script<W: Write>(snap: &Snapshot, script: Script, w: W, opts: &RunOpt
         held_bytes: 0,
         cli: opts.cli,
         messages: Vec::new(),
+        area_ctx_last: None,
+        area_ranges_last: Vec::new(),
+        area_kept_bytes: 0,
     };
     let res = eng.exec_block(&script.stmts);
     let mut err = None;
@@ -424,7 +439,7 @@ impl<'s, W: Write> Engine<'s, W> {
         if let Some(m) = &self.f.limits.mem {
             let size: u64 = self.frames.iter().flat_map(|f| f.values()).map(|s| s.size).sum();
             let bytes: u64 = self.frames.iter().flat_map(|f| f.values()).map(|s| s.bytes).sum();
-            m.reset(size, bytes.saturating_add(self.held_bytes));
+            m.reset(size, bytes.saturating_add(self.held_bytes).saturating_add(self.area_kept_bytes));
         }
     }
 
@@ -432,7 +447,7 @@ impl<'s, W: Write> Engine<'s, W> {
     /// exceed the memory limit.
     pub fn check_memory(&self, extra: u64) -> Result<()> {
         let bytes: u64 = self.frames.iter().flat_map(|f| f.values()).map(|s| s.bytes).sum();
-        if bytes.saturating_add(self.held_bytes).saturating_add(extra) > self.memory_limit() {
+        if bytes.saturating_add(self.held_bytes).saturating_add(self.area_kept_bytes).saturating_add(extra) > self.memory_limit() {
             return Err(Abort(format!("Query run out of memory using about {} MB of RAM.", self.memory_limit() >> 20)).into());
         }
         Ok(())
