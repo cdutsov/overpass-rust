@@ -570,13 +570,7 @@ impl<'s, W: Write> Engine<'s, W> {
                     None => false,
                 }
             };
-            let mut rest = if part.len() >= 64 && super::parallel_ok() {
-                use rayon::prelude::*;
-                part.par_iter().map(keep).collect::<Vec<bool>>()
-            } else {
-                part.iter().map(keep).collect::<Vec<bool>>()
-            }
-            .into_iter();
+            let mut rest = super::par_map(&part, 64, keep).into_iter();
             out.extend(first_in.iter().map(|f| *f || rest.next().unwrap_or(false)));
         }
         Ok(out)

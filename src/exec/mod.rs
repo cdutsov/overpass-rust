@@ -267,16 +267,23 @@ fn spread(l: Load) -> bool {
     }
     let need = l.threads.min(l.cpus);
     let host_idle = l.host_cpus.saturating_sub(l.runnable.saturating_sub(1));
-    let own_idle = l.cpus.saturating_sub(l.active - 1);
+    let own_idle = l.cpus.saturating_sub(l.active.saturating_sub(1));
     host_idle >= need && own_idle >= need
 }
 
-/// Whether a query may spread work over the thread pool (`spread`). Does
-/// not start the pool.
-pub fn parallel_ok() -> bool {
+/// Whether a query may spread work over the thread pool (`spread`). Starts
+/// the pool on first use. Outside a query (`make-areas` runs as a process
+/// of its own) the work stays on the calling thread, as in 0.2.8: there the
+/// pool would not take turns with the queries of the server. The unit tests
+/// call sections directly.
+fn parallel_ok() -> bool {
     static POOL: std::sync::Once = std::sync::Once::new();
+    let active = ACTIVE.load(std::sync::atomic::Ordering::Relaxed);
+    if active == 0 && !cfg!(test) {
+        return false;
+    }
     let threads = threads();
-    let ok = spread(Load { threads, active: ACTIVE.load(std::sync::atomic::Ordering::Relaxed), cpus: cpus(), host_cpus: host_cpus(), runnable: runnable() });
+    let ok = spread(Load { threads, active, cpus: cpus(), host_cpus: host_cpus(), runnable: runnable() });
     if ok {
         // The pool starts on first use (fails harmlessly if already built).
         POOL.call_once(|| {
@@ -284,6 +291,213 @@ pub fn parallel_ok() -> bool {
         });
     }
     ok
+}
+
+/// How long a section keeps the thread pool before it gives way to the
+/// section of another query that waits for it, and how long a section
+/// works on its own thread before it waits for the pool (`par_run`).
+const TURN: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// About how long a pool thread works on one run of items of a section
+/// before it takes the next: a section gives way within about this after
+/// its turn, and its last runs end about together.
+const RUN: std::time::Duration = std::time::Duration::from_millis(1);
+
+/// Sections on the thread pool now, of all queries: from when they queue
+/// for it until their tasks end.
+static ON_POOL: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Counts a section on the pool (`ON_POOL`) while it lives.
+struct OnPool;
+
+impl OnPool {
+    fn enter() -> OnPool {
+        ON_POOL.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        OnPool
+    }
+}
+
+impl Drop for OnPool {
+    fn drop(&mut self) {
+        ON_POOL.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Stops the other tasks of a section when a task panics (the panic
+/// reaches the caller when they have ended).
+struct StopOnPanic<'a>(&'a std::sync::atomic::AtomicBool);
+
+impl Drop for StopOnPanic<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.0.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+}
+
+/// `f` over `items`, each result handed to `sink` in input order; stops at
+/// the first error. All parallel work of a query goes through here
+/// (`par_parts`).
+pub fn par_run<I: Sync, T: Send, E: Send>(items: &[I], min: usize, f: impl Fn(&I) -> std::result::Result<T, E> + Sync, mut sink: impl FnMut(T) -> std::result::Result<(), E>) -> std::result::Result<(), E> {
+    for part in par_parts(items, min, &f, &mut sink)? {
+        for r in part {
+            sink(r)?;
+        }
+    }
+    Ok(())
+}
+
+/// `f` over `items`, results in input order (`par_parts`).
+pub fn par_map<I: Sync, T: Send>(items: &[I], min: usize, f: impl Fn(&I) -> T + Sync) -> Vec<T> {
+    let mut out = Vec::with_capacity(items.len());
+    let parts: std::result::Result<Vec<Vec<T>>, std::convert::Infallible> = par_parts(items, min, &|it| Ok(f(it)), |r| {
+        out.push(r);
+        Ok(())
+    });
+    let Ok(parts) = parts;
+    for part in parts {
+        out.extend(part);
+    }
+    out
+}
+
+/// `f` over `items`, stopping at the first error. The results of the items
+/// that run on the calling thread go to `one` as they come; those of the
+/// thread pool follow them in the parts returned, in input order.
+///
+/// Sections of at least `min` items run on the thread pool while the host
+/// has room for it (`parallel_ok`). Rayon takes a job from the queue of
+/// the pool only when the jobs it runs have no work left to hand out, so
+/// the section of a light query used to wait for the whole running section
+/// of another one (seconds). Hence: while another section is on the pool,
+/// a section starts on its own thread, where a small one ends; after TURN
+/// it queues for the pool, and a section on the pool that has had it for
+/// TURN stops taking items when another one is there, and queues the rest
+/// behind it. Sections take turns of about TURN; one alone on the pool
+/// runs in one go.
+///
+/// On the pool a section is one task per pool thread (the first one queues
+/// the others). Each takes runs of items that take about RUN (one slow
+/// item, a chunk read from disk, holds one thread, not the others), at
+/// most 1/64 of its share and smaller toward the end, until none are left
+/// or it gives way. The
+/// tasks never wait for each other: a pool thread that waits (as in a
+/// rayon join) runs any queued job meanwhile, also the whole section of
+/// another query, and the section it waits in ends only after that.
+pub fn par_parts<I: Sync, T: Send, E: Send>(items: &[I], min: usize, f: &(impl Fn(&I) -> std::result::Result<T, E> + Sync), mut one: impl FnMut(T) -> std::result::Result<(), E>) -> std::result::Result<Vec<Vec<T>>, E> {
+    use std::sync::atomic::Ordering::{Relaxed, SeqCst};
+    use std::sync::Mutex;
+    if items.len() < min.max(2) || rayon::current_thread_index().is_some() {
+        // small, or a section inside a section: on a pool thread it would
+        // have to wait for the others (see above)
+        for it in items {
+            one(f(it)?)?;
+        }
+        return Ok(Vec::new());
+    }
+    let mut done = 0;
+    if ON_POOL.load(SeqCst) > 0 {
+        let start = std::time::Instant::now();
+        while done < items.len() && ON_POOL.load(Relaxed) > 0 && start.elapsed() < TURN {
+            one(f(&items[done])?)?;
+            done += 1;
+        }
+        // a rest that takes less than another TURN at this rate ends here
+        let left = (items.len() - done) as u128;
+        if done > 0 && start.elapsed().as_nanos() * left < TURN.as_nanos() * done as u128 {
+            for it in &items[done..] {
+                one(f(it)?)?;
+            }
+            return Ok(Vec::new());
+        }
+    }
+    let rest = &items[done..];
+    if rest.is_empty() {
+        return Ok(Vec::new());
+    }
+    if !parallel_ok() {
+        // the host is busy
+        for it in rest {
+            one(f(it)?)?;
+        }
+        return Ok(Vec::new());
+    }
+    let n = rest.len();
+    let tasks = rayon::current_num_threads().min(n);
+    // runs of at most 1/64 of the share of a thread (16 items at least): the
+    // cost of items can change along a section (a city of long ways after
+    // open land), and a run grown on cheap items must not take a whole
+    // stretch of dear ones (1/16 cost the around tests of a railway query 8%)
+    let most = (n / (tasks * 64)).max(16);
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let parts: Mutex<Vec<(usize, Vec<T>)>> = Mutex::new(Vec::new());
+    let failed: Mutex<Option<E>> = Mutex::new(None);
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    // a section that gave way keeps the pool: the host load is checked
+    // once, as for a section that runs in one go
+    while next.load(SeqCst) < n && !stop.load(SeqCst) {
+        let on = OnPool::enter();
+        let started = std::sync::OnceLock::new();
+        let (next, parts, failed, stop, started) = (&next, &parts, &failed, &stop, &started);
+        let work = move || {
+            let _panic = StopOnPanic(stop);
+            let turn = *started.get_or_init(std::time::Instant::now);
+            let mut mine = Vec::new();
+            let mut k = 1;
+            'runs: while !stop.load(Relaxed) && (ON_POOL.load(Relaxed) < 2 || turn.elapsed() < TURN) {
+                // toward the end, at most half the share of a thread
+                // of what is left: the last runs end about together
+                let left = n.saturating_sub(next.load(Relaxed));
+                let take = k.min(most).min((left / (2 * tasks)).max(1));
+                let c = next.fetch_add(take, SeqCst);
+                if c >= n {
+                    break;
+                }
+                let end = (c + take).min(n);
+                let t = std::time::Instant::now();
+                let mut part = Vec::with_capacity(end - c);
+                for it in &rest[c..end] {
+                    match f(it) {
+                        Ok(r) => part.push(r),
+                        Err(e) => {
+                            failed.lock().unwrap_or_else(|p| p.into_inner()).get_or_insert(e);
+                            stop.store(true, Relaxed);
+                            break 'runs;
+                        }
+                    }
+                }
+                mine.push((c, part));
+                let took = t.elapsed();
+                k = if took < RUN / 2 {
+                    (take * 2).min(most)
+                } else if took > RUN * 2 {
+                    (take / 2).max(1)
+                } else {
+                    take
+                };
+            }
+            parts.lock().unwrap_or_else(|p| p.into_inner()).extend(mine);
+        };
+        let work = &work;
+        rayon::in_place_scope(|s| {
+            // one task from this thread (one wake-up, as for a rayon job); it
+            // queues the others on its pool thread, where idle threads take
+            // them
+            s.spawn(move |s| {
+                for _ in 1..tasks {
+                    s.spawn(move |_| work());
+                }
+                work();
+            });
+        });
+        drop(on);
+        if let Some(e) = failed.lock().unwrap_or_else(|p| p.into_inner()).take() {
+            return Err(e);
+        }
+    }
+    let mut parts = parts.into_inner().unwrap_or_else(|p| p.into_inner());
+    parts.sort_unstable_by_key(|p| p.0);
+    Ok(parts.into_iter().map(|p| p.1).collect())
 }
 
 pub fn run_script<W: Write>(snap: &Snapshot, script: Script, w: W, opts: &RunOptions, jsonp: bool) -> std::result::Result<Printer<W>, (Option<Printer<W>>, RunError)> {
@@ -724,7 +938,182 @@ impl<'s, W: Write> Engine<'s, W> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Load, count_cpus, spread};
+    use super::{Load, count_cpus, par_map, par_run, spread, threads};
+    use std::time::Duration;
+
+    /// The tests that time sections beside a long one run one at a time.
+    fn pool_test() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Results in input order, as on one thread, for sections of any size.
+    #[test]
+    fn par_map_keeps_the_order() {
+        for len in [0, 1, 2, 7, 511, 512, 513, 100_000, 1_000_000] {
+            let items: Vec<u64> = (0..len).collect();
+            let want: Vec<u64> = items.iter().map(|x| x * 3 + 1).collect();
+            assert_eq!(par_map(&items, 512, |x| x * 3 + 1), want, "{len}");
+            assert_eq!(par_map(&items, 2, |x| x * 3 + 1), want, "{len}");
+        }
+    }
+
+    /// A section inside a section (on a pool thread) finishes.
+    #[test]
+    fn par_map_nested() {
+        let outer: Vec<u64> = (0..32).collect();
+        let inner: Vec<u64> = (0..10_000).collect();
+        let got = par_map(&outer, 2, |&k| par_map(&inner, 2, |x| x + k).iter().sum::<u64>());
+        let want: Vec<u64> = outer.iter().map(|&k| inner.iter().map(|x| x + k).sum()).collect();
+        assert_eq!(got, want);
+    }
+
+    /// An error of an item or of the sink ends the section; the sink has
+    /// seen the results before it, in order, or none.
+    #[test]
+    fn par_run_stops_at_the_first_error() {
+        let items: Vec<u32> = (0..200_000).collect();
+        let mut sunk = Vec::new();
+        let r = par_run(&items, 8, |&x| if x == 5000 { Err(x) } else { Ok(x) }, |x| {
+            sunk.push(x);
+            Ok(())
+        });
+        assert_eq!(r, Err(5000));
+        assert!(sunk.iter().copied().eq(0..sunk.len() as u32) && sunk.len() <= 5000, "{}", sunk.len());
+        let mut n = 0;
+        let r = par_run(&items, 8, |&x| Ok::<u32, u32>(x), |x| {
+            n += 1;
+            if x == 7 { Err(x) } else { Ok(()) }
+        });
+        assert_eq!((r, n), (Err(7), 8));
+        // below `min`: on this thread
+        let r: Result<(), ()> = par_run(&items[..7], 8, |_| {
+            assert!(rayon::current_thread_index().is_none());
+            Ok(())
+        }, |_| Ok(()));
+        assert!(r.is_ok());
+    }
+
+    /// Runs `second` while a long section of another thread (400 items of
+    /// 2 ms per pool thread, about 0.8 s on the pool) has the pool. Returns
+    /// whether the long section used the pool, and whether it was still
+    /// running when `second` ended.
+    fn beside_a_long_section(second: impl FnOnce()) -> (bool, bool) {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let long_done = AtomicBool::new(false);
+        let on_pool = AtomicBool::new(false);
+        let mut running = false;
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                let items: Vec<usize> = (0..400 * threads()).collect();
+                let got = par_map(&items, 2, |&x| {
+                    if rayon::current_thread_index().is_some() {
+                        on_pool.store(true, SeqCst);
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                    x * 2
+                });
+                assert!(got.iter().copied().eq(items.iter().map(|x| x * 2)));
+                long_done.store(true, SeqCst);
+            });
+            std::thread::sleep(Duration::from_millis(200));
+            second();
+            running = !long_done.load(SeqCst);
+        });
+        let used = on_pool.load(SeqCst);
+        if !used {
+            // vacuous when the host had no room for the pool
+            eprintln!("beside_a_long_section: the pool was not used");
+        }
+        (used, running)
+    }
+
+    /// A small section does not wait for the long section of another
+    /// query on the pool (with one rayon job per section it waited for all
+    /// of it: rayon takes a new job only when the running ones have no work
+    /// left to hand out).
+    #[test]
+    fn small_section_does_not_wait_for_a_long_one() {
+        let _one = pool_test();
+        let mut took = Duration::ZERO;
+        let (busy, _) = beside_a_long_section(|| {
+            let items: Vec<u32> = (0..64).collect();
+            let start = std::time::Instant::now();
+            assert_eq!(par_map(&items, 2, |x| x + 1), (1..65).collect::<Vec<u32>>());
+            took = start.elapsed();
+        });
+        assert!(!busy || took < Duration::from_millis(50), "{took:?}");
+    }
+
+    /// A large section gets turns on the pool beside the long section of
+    /// another query, and ends first (it waited for all of it), with its
+    /// results in order across its own work and the turns.
+    #[test]
+    fn large_sections_take_turns() {
+        use std::sync::atomic::{AtomicBool, Ordering::SeqCst};
+        let _one = pool_test();
+        let on_pool = AtomicBool::new(false);
+        let (busy, long_running) = beside_a_long_section(|| {
+            let items: Vec<usize> = (0..50 * threads()).collect();
+            let got = par_map(&items, 2, |&x| {
+                if rayon::current_thread_index().is_some() {
+                    on_pool.store(true, SeqCst);
+                }
+                std::thread::sleep(Duration::from_millis(2));
+                x + 1
+            });
+            assert!(got.iter().copied().eq(items.iter().map(|x| x + 1)));
+        });
+        assert!(!busy || (on_pool.load(SeqCst) && long_running), "{} {long_running}", on_pool.load(SeqCst));
+    }
+
+    /// No active query (0 used to wrap in `active - 1`): the host has room.
+    /// (`parallel_ok` keeps sections outside a query off the pool.)
+    #[test]
+    fn spread_without_an_active_query() {
+        assert!(spread(Load { active: 0, ..HOST24 }));
+    }
+
+    /// A section that has to go to the pool beside the long section of
+    /// another query waits about a TURN, not for the other section (on
+    /// 0.2.8 all of its remaining 0.6 s).
+    #[test]
+    fn medium_section_waits_about_a_turn() {
+        let _one = pool_test();
+        let mut took = Duration::ZERO;
+        let (busy, _) = beside_a_long_section(|| {
+            let items: Vec<u32> = (0..40).collect();
+            let start = std::time::Instant::now();
+            let got = par_map(&items, 2, |&x| {
+                std::thread::sleep(Duration::from_millis(1));
+                x + 1
+            });
+            took = start.elapsed();
+            assert!(got.iter().copied().eq(1..41));
+        });
+        assert!(!busy || took < Duration::from_millis(100), "{took:?}");
+    }
+
+    /// The rest of a section after its TURN on its own thread ends there
+    /// when it takes less than another TURN, instead of waiting for the
+    /// pool.
+    #[test]
+    fn small_rest_ends_on_its_own_thread() {
+        let _one = pool_test();
+        let mut took = Duration::ZERO;
+        let (busy, _) = beside_a_long_section(|| {
+            let items: Vec<u32> = (0..12).collect();
+            let start = std::time::Instant::now();
+            let got = par_map(&items, 2, |&x| {
+                assert!(rayon::current_thread_index().is_none());
+                std::thread::sleep(Duration::from_millis(1));
+                x
+            });
+            took = start.elapsed();
+            assert!(got.iter().copied().eq(0..12));
+        });
+        assert!(!busy || took < Duration::from_millis(30), "{took:?}");
+    }
 
     /// A pool of 8 on a host of 24 CPUs without a quota, one query.
     const HOST24: Load = Load { threads: 8, active: 1, cpus: 24, host_cpus: 24, runnable: 1 };

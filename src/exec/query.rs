@@ -750,12 +750,7 @@ impl<'s, W: Write> Engine<'s, W> {
                             T::geoms(&self.f, part)?
                         };
                         // Geometric tests are pure: run them in parallel for large batches.
-                        if geoms.len() >= 512 && super::parallel_ok() {
-                            use rayon::prelude::*;
-                            sub_keep.extend(geoms.par_iter().map(test).collect::<Vec<bool>>());
-                        } else {
-                            sub_keep.extend(geoms.iter().map(test));
-                        }
+                        sub_keep.extend(super::par_map(&geoms, 512, test));
                         drop(geoms);
                         drop(scope);
                     }

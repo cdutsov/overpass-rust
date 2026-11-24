@@ -596,39 +596,43 @@ impl<W: Write> Printer<W> {
         }
     }
 
-    /// Print many elements; large batches are formatted in parallel.
+    /// Print many elements; large batches are formatted in parallel, in
+    /// chunks of CHUNK elements (`exec::par_map`).
     pub fn items(&mut self, list: &[(Item, GeomOut, Option<MetaOut>)], fl: u32) -> io::Result<()> {
         const CHUNK: usize = 512;
-        if list.len() < 4 * CHUNK || !crate::exec::parallel_ok() {
+        if list.len() < 4 * CHUNK {
             for (it, g, m) in list {
                 self.item(it, fl, g, m.as_ref())?;
             }
             return Ok(());
         }
-        use rayon::prelude::*;
         let json = matches!(self.fmt, OutFormat::Json);
-        let fmt = &self.fmt;
-        let parts: Vec<Vec<u8>> = list
-            .par_chunks(CHUNK)
-            .map(|chunk| {
-                let mut b = Vec::with_capacity(chunk.len() * 128);
-                for (i, (it, g, m)) in chunk.iter().enumerate() {
-                    if json && i > 0 {
-                        b.extend_from_slice(b",\n");
-                    }
-                    Self::format_item(fmt, &mut b, it, fl, g, m.as_ref());
+        let chunks: Vec<&[(Item, GeomOut, Option<MetaOut>)]> = list.chunks(CHUNK).collect();
+        let Printer { w, fmt, buf, first_elem, .. } = self;
+        let fmt = &*fmt;
+        // A chunk formatted on this thread (a busy host, or the start
+        // beside another section) is written at once, as by `item`; those
+        // of the pool when all of them are done.
+        crate::exec::par_run(&chunks, 4, |chunk| -> io::Result<Vec<u8>> {
+            let mut b = Vec::with_capacity(chunk.len() * 128);
+            for (i, (it, g, m)) in chunk.iter().enumerate() {
+                if json && i > 0 {
+                    b.extend_from_slice(b",\n");
                 }
-                b
-            })
-            .collect();
-        for p in parts {
-            if json && !std::mem::replace(&mut self.first_elem, false) {
-                self.buf.extend_from_slice(b",\n");
+                Self::format_item(fmt, &mut b, it, fl, g, m.as_ref());
             }
-            self.buf.extend_from_slice(&p);
-            self.flush_if_big()?;
-        }
-        Ok(())
+            Ok(b)
+        }, |p| {
+            if json && !std::mem::replace(first_elem, false) {
+                buf.extend_from_slice(b",\n");
+            }
+            buf.extend_from_slice(&p);
+            if buf.len() >= 1 << 16 {
+                w.write_all(buf)?;
+                buf.clear();
+            }
+            Ok(())
+        })
     }
 
     // ------------------------------------------------------------------ XML
@@ -1146,6 +1150,66 @@ fn json_dgeom(b: &mut Vec<u8>, g: &DGeom, ind: &str) {
 mod tests {
     use super::*;
     use crate::geo::Pt;
+
+    /// `items` prints what `item` prints element by element, in every
+    /// format, for lists on both sides of 4 x 512, as the first elements or
+    /// after one; alone on the pool and beside the long section of another
+    /// query (own-thread start, turns).
+    #[test]
+    fn items_match_item_by_item() {
+        let nodes: Vec<Node> = (0..9000u64)
+            .map(|i| {
+                let tags = if i % 3 == 0 { Tags::from_pairs([("name", format!("n\"{i}<&>,;"))]) } else { Tags::default() };
+                Node { id: i + 1, pos: Pt::from_ll(47.0 + i as f64 * 1e-5, 8.0 - i as f64 * 1e-5), tags }
+            })
+            .collect();
+        let metas: Vec<MetaOut> = (0..9000u32).map(|i| MetaOut { meta: Meta { version: i, timestamp: 1_600_000_000 + i as i64, changeset: i as u64 * 7, uid: i }, user: Some("u<\"x\">") }).collect();
+        let csv = OutFormat::Csv(CsvSpec { fields: vec!["::id".into(), "name".into(), "::lat".into(), "::lon".into(), "::version".into()], header: true, separator: ";".into() });
+        let run = || {
+            for fmt in [OutFormat::Json, OutFormat::Xml, csv.clone()] {
+                for len in [2047, 2048, 2049, 5000, 8192, 9000] {
+                    for lead in [false, true] {
+                        let fl = ID | COORDS | TAGS | META;
+                        let list: Vec<(Item, GeomOut, Option<MetaOut>)> = nodes[..len].iter().zip(&metas).map(|(n, m)| (Item::Node(n), GeomOut::default(), Some(MetaOut { meta: m.meta, user: m.user }))).collect();
+                        let mut a = Printer::new(Vec::new(), fmt.clone());
+                        let mut b = Printer::new(Vec::new(), fmt.clone());
+                        for p in [&mut a, &mut b] {
+                            p.header("t", None);
+                            if lead {
+                                p.item(&Item::Node(&nodes[8999]), fl, &GeomOut::default(), None).unwrap();
+                            }
+                        }
+                        a.items(&list, fl).unwrap();
+                        for (it, g, m) in &list {
+                            b.item(it, fl, g, m.as_ref()).unwrap();
+                        }
+                        a.footer().unwrap();
+                        b.footer().unwrap();
+                        assert!(a.w == b.w, "{fmt:?} {len} {lead}");
+                    }
+                }
+            }
+        };
+        run();
+        // beside a long section of another thread
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    let items: Vec<u64> = (0..4000).collect();
+                    crate::exec::par_map(&items, 2, |&x| {
+                        std::thread::sleep(std::time::Duration::from_micros(200));
+                        x
+                    });
+                }
+            });
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            for _ in 0..3 {
+                run();
+            }
+            stop.store(true, std::sync::atomic::Ordering::SeqCst);
+        });
+    }
 
     #[test]
     fn xml_node_matches_cpp() {

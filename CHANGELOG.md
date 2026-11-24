@@ -3,6 +3,26 @@
 Changes of overpass-rust, newest first. "Overpass API" is the C++ server
 (0.7.62) whose answers overpass-rust reproduces.
 
+## 0.2.9 (2026-11-24)
+
+Faster
+- A light query does not wait for the parallel work of a heavy one. The
+  queries of a server share one pool of threads (8) for their parallel parts:
+  decoding, spatial and area tests, printing. Such a part kept the pool until
+  it ended, so a small part of another query could wait seconds behind it.
+  A part that finds the pool busy now starts on its own thread, where a small
+  one ends; after 10 ms it queues, and the part on the pool gives way once it
+  has had the pool for 10 ms. The threads take items in runs of about 1 ms,
+  so one slow item (a chunk read from disk) holds one thread.
+- Measured with a pool of 8 threads: beside a part of 3 s of another query, a
+  part with 40 ms of work takes 14 ms (2.9 s on 0.2.8), one with 400 ms takes
+  100 ms (3.1 s). A query of 15 ms (`out meta` in a city) while a heavy
+  `around` query runs on the planet: median 29 ms (81 ms), at most 74 ms
+  (190 ms). A heavy query beside a stream of light ones takes about 6% longer,
+  the pool time they get; alone it runs as on 0.2.8.
+- Real queries on the planet, against 0.2.8: 25,529 that take under 1 s give
+  the same answers with 2% less time and 5% less CPU.
+
 ## 0.2.8 (2026-11-23)
 
 Faster

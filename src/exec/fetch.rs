@@ -10,7 +10,6 @@ use crate::store::codec::{self, Pick};
 use crate::store::{Kind, Snapshot, Scan};
 use crate::update::Stored;
 use anyhow::Result;
-use rayon::prelude::*;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::cell::RefCell;
 
@@ -487,30 +486,24 @@ fn decode_chunks<I: Sync, T: Send + MemSize>(limits: &Limits, items: &[I], bytes
     Ok(out)
 }
 
-/// Decode work items, in parallel when there are many. Stops early when the
-/// query runs out of time.
+/// Decode work items, in parallel when there are many (`par_run`). Stops
+/// early when the query runs out of time.
 fn par_flat_map<I: Sync, T: Send + MemSize>(limits: &Limits, items: &[I], f: impl Fn(&I) -> Result<Vec<T>> + Sync + Send) -> Result<Vec<T>> {
-    if items.len() < PAR_THRESHOLD || !super::parallel_ok() {
-        let mut out = Vec::new();
-        for (i, it) in items.iter().enumerate() {
-            if i % 64 == 63 {
-                limits.check()?;
-            }
-            let es = f(it)?;
-            limits.account(&es)?;
-            out.extend(es);
-        }
-        return Ok(out);
-    }
-    let parts = items.par_iter().map(|it| {
+    let mut out = Vec::new();
+    let parts = super::par_parts(items, PAR_THRESHOLD, &|it| -> Result<Vec<T>> {
         limits.check()?;
         let es = f(it)?;
         limits.account(&es)?;
         Ok(es)
-    }).collect::<Result<Vec<Vec<T>>>>()?;
-    let mut out = Vec::with_capacity(parts.iter().map(|p| p.len()).sum());
-    for p in parts {
-        out.extend(p);
+    }, |es| {
+        out.extend(es);
+        Ok(())
+    })?;
+    // the parts of the pool in one reservation: growing the vector part by
+    // part copies it and holds up to twice its size meanwhile
+    out.reserve_exact(parts.iter().flatten().map(Vec::len).sum());
+    for es in parts.into_iter().flatten() {
+        out.extend(es);
     }
     Ok(out)
 }
@@ -1007,19 +1000,14 @@ impl<'s> Fetch<'s> {
             Ok(codec::decode_meta(v, Pick::Ids(want))?.into_iter().map(|m| (m.id, m.meta)).collect())
         };
         let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
-        if chunks.len() >= PAR_THRESHOLD && super::parallel_ok() {
-            self.limits.check()?;
-            for part in chunks.par_iter().map(decode).collect::<Result<Vec<_>>>()? {
-                out.extend(part);
-            }
-        } else {
-            for (i, c) in chunks.iter().enumerate() {
-                if i % 256 == 255 {
-                    self.limits.check()?;
-                }
-                out.extend(decode(c)?);
-            }
-        }
+        let limits = &self.limits;
+        super::par_run(&chunks, PAR_THRESHOLD, |c| {
+            limits.check()?;
+            decode(c)
+        }, |part| {
+            out.extend(part);
+            Ok(())
+        })?;
         Ok(out)
     }
 
@@ -1036,6 +1024,74 @@ impl<'s> Fetch<'s> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A decode on the pool (`par_run`) stops at the deadline, at a cancel
+    /// and at the memory limit of the query, with the error of that limit,
+    /// alone on the pool and beside the long section of another query.
+    #[test]
+    fn decode_stops_at_the_limits_on_the_pool() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering::{Relaxed, SeqCst}};
+        use std::sync::Arc;
+        let dir = std::env::temp_dir().join(format!("fetch-limits-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut osm = String::from("<osm version=\"0.6\">\n");
+        for i in 0..20_000u64 {
+            // a long tag value that does not compress: about 50 nodes a chunk
+            let v: String = (0..20u64).map(|k| format!("{:016x}", (i * 31 + k).wrapping_mul(0x9E37_79B9_7F4A_7C15))).collect();
+            osm += &format!("<node id=\"{}\" lat=\"{:.4}\" lon=\"{:.4}\"><tag k=\"k\" v=\"{v}\"/></node>\n", i + 1, -80.0 + (i % 400) as f64 * 0.4, -170.0 + (i / 400) as f64 * 0.4);
+        }
+        let file = dir.join("in.osm");
+        std::fs::write(&file, osm + "</osm>\n").unwrap();
+        let db = crate::store::Db::open(&dir.join("db")).unwrap();
+        crate::import::import_file(&db, &file, &mut Default::default()).unwrap();
+        let snap = db.snapshot().unwrap();
+        let chunks = snap.all_chunks(Kind::Node).unwrap().len();
+        assert!(chunks >= 100, "{chunks} chunks");
+        let per = Fetch::new(&snap).all::<Node>(|_| true).unwrap()[0].mem_size().1;
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            for beside in [false, true] {
+                if beside {
+                    s.spawn(|| {
+                        while !stop.load(SeqCst) {
+                            let items: Vec<u64> = (0..4000).collect();
+                            crate::exec::par_map(&items, 2, |&x| {
+                                std::thread::sleep(std::time::Duration::from_micros(200));
+                                x
+                            });
+                        }
+                    });
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                let mut f = Fetch::new(&snap);
+                assert_eq!(f.all::<Node>(|_| true).unwrap().len(), 20_000);
+                let seen = AtomicUsize::new(0);
+                let count = |_: &Node| {
+                    seen.fetch_add(1, Relaxed);
+                    true
+                };
+                f.limits.deadline = Some(std::time::Instant::now() - std::time::Duration::from_millis(1));
+                let e = f.all::<Node>(count).unwrap_err();
+                assert!(e.downcast_ref::<Interrupted>().is_some(), "{e}");
+                assert_eq!(seen.swap(0, Relaxed), 0, "decoded after the deadline (beside: {beside})");
+                f.limits.deadline = None;
+                f.limits.cancel = Some(Arc::new(AtomicBool::new(true)));
+                let e = f.all::<Node>(count).unwrap_err();
+                assert!(e.downcast_ref::<Interrupted>().is_some(), "{e}");
+                assert_eq!(seen.swap(0, Relaxed), 0, "decoded after the cancel (beside: {beside})");
+                f.limits.cancel = None;
+                // room for about 100 nodes
+                f.limits.mem = Some(Arc::new(MemBudget::new(u64::MAX, 100 * per)));
+                let e = f.all::<Node>(count).unwrap_err();
+                assert!(e.downcast_ref::<OutOfMemory>().is_some(), "{e}");
+                let n = seen.swap(0, Relaxed);
+                assert!(n < 1000, "{n} nodes decoded with room for 100 (beside: {beside})");
+            }
+            stop.store(true, SeqCst);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A key alone lists every element that has it: the list counts
     /// against the memory limit of the query, on one thread and on several.
