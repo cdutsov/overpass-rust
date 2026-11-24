@@ -165,6 +165,101 @@ pub struct Evaluator<'e, 's, W: Write> {
     node_ll: std::cell::Cell<Option<(Id, f64, f64)>>,
     /// Literals as numbers, by the address of their expression (`cmp_fast`).
     lit_dbl: RefCell<FxHashMap<usize, Option<f64>>>,
+    /// Ternary chains over one coordinate, by the address of their first
+    /// expression; None for a ternary that is not one (`chain`).
+    chains: RefCell<FxHashMap<usize, Option<Rc<Chain>>>>,
+}
+
+/// `lat()<t0?a0:(lat()<t1?a1:(... :f))`: ternaries nested in their else
+/// branch that compare the same coordinate of a node with literal numbers
+/// by the same operator, the numbers in the order in which a comparison
+/// that holds makes the following ones hold too (ascending for `<` and
+/// `<=`, descending for `>` and `>=`). The first comparison that holds is
+/// then found by bisection. Grid statistics bucket nodes with a hundred
+/// such levels per coordinate.
+struct Chain {
+    lat: bool,
+    op: BinOp,
+    thresholds: Vec<f64>,
+    /// The values of the branches `a0 ... f` when all are literals.
+    leaves: Option<Vec<String>>,
+}
+
+/// `lat()` and `lon()` of a position as the numbers their printed forms
+/// read as (`dbl(&fix(.., 7))`), without printing them: a coordinate is a
+/// whole number of 1e-7 degrees, its 7 decimals print that number, and the
+/// double nearest to k/1e7 is the quotient of the two doubles.
+pub(super) fn printed_ll(p: crate::geo::Pt) -> (f64, f64) {
+    ((p.y as i64 - 910_000_000) as f64 / 1e7, p.ilon() as f64 / 1e7)
+}
+
+/// Levels from which a chain is searched by bisection.
+const CHAIN_MIN: usize = 4;
+
+/// The coordinate, operator and literal of `lat()<1.5`, as `cmp_fast`
+/// compares them.
+fn coord_test(e: &Expr) -> Option<(bool, BinOp, f64)> {
+    let Expr::Binary(op, a, b) = e else { return None };
+    if !matches!(op, BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge) {
+        return None;
+    }
+    let (Expr::Call(name, args), Expr::Lit(lit)) = (&**a, &**b) else { return None };
+    let lat = match name.as_str() {
+        "lat" => true,
+        "lon" => false,
+        _ => return None,
+    };
+    if !args.is_empty() {
+        return None;
+    }
+    let t = dbl(lit)?;
+    (!t.is_nan()).then_some((lat, *op, t))
+}
+
+fn holds(op: BinOp, x: f64, t: f64) -> bool {
+    match op {
+        BinOp::Lt => x < t,
+        BinOp::Le => x <= t,
+        BinOp::Gt => x > t,
+        _ => x >= t,
+    }
+}
+
+impl Chain {
+    fn build(e: &Expr) -> Option<Chain> {
+        let Expr::Ternary(c, _, _) = e else { return None };
+        let (lat, op, _) = coord_test(c)?;
+        let mut thresholds = Vec::new();
+        let mut leaves = Some(Vec::new());
+        let mut cur = e;
+        while let Expr::Ternary(c, a, b) = cur {
+            match coord_test(c) {
+                Some((l, o, t)) if l == lat && o == op && thresholds.last().is_none_or(|p| if matches!(op, BinOp::Lt | BinOp::Le) { *p <= t } else { *p >= t }) => thresholds.push(t),
+                _ => break,
+            }
+            match (&**a, &mut leaves) {
+                (Expr::Lit(v), Some(l)) => l.push(v.clone()),
+                _ => leaves = None,
+            }
+            cur = b;
+        }
+        if thresholds.len() < CHAIN_MIN {
+            return None;
+        }
+        match (cur, &mut leaves) {
+            (Expr::Lit(v), Some(l)) => l.push(v.clone()),
+            _ => leaves = None,
+        }
+        Some(Chain { lat, op, thresholds, leaves })
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Ternary chains are evaluated level by level.
+    pub static CHAINS_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Ternary chains evaluated by bisection.
+    pub static CHAIN_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Bytes of a string held in a list, for the memory limit.
@@ -189,6 +284,7 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
             ticks: std::cell::Cell::new(0),
             node_ll: std::cell::Cell::new(None),
             lit_dbl: RefCell::new(FxHashMap::default()),
+            chains: RefCell::new(FxHashMap::default()),
         }
     }
 
@@ -428,6 +524,64 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
         Ok(g)
     }
 
+    /// `lat()` and `lon()` of a node as the numbers their printed forms
+    /// (7 decimals) read as; kept for the node last asked for.
+    fn node_ll(&self, n: &Node) -> Option<(f64, f64)> {
+        match self.node_ll.get() {
+            Some(c) if c.0 == n.id => Some((c.1, c.2)),
+            _ => {
+                let (la, lo) = printed_ll(n.pos);
+                self.node_ll.set(Some((n.id, la, lo)));
+                Some((la, lo))
+            }
+        }
+    }
+
+    /// The value of a ternary that starts a `Chain`, for a node: the
+    /// branch of the first comparison that holds, found by bisection; each
+    /// comparison is the one `cmp_fast` makes. None for other ternaries
+    /// and elements.
+    fn chain(&self, e: &Expr, cx: Cx) -> Result<Option<V>> {
+        let Some(El::N(n)) = cx.el else { return Ok(None) };
+        let Expr::Ternary(c, _, _) = e else { return Ok(None) };
+        if !matches!(&**c, Expr::Binary(BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge, a, b) if matches!((&**a, &**b), (Expr::Call(..), Expr::Lit(_)))) {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        if CHAINS_OFF.get() {
+            return Ok(None);
+        }
+        let key = e as *const Expr as usize;
+        let known = self.chains.borrow().get(&key).cloned();
+        let chain = match known {
+            Some(c) => c,
+            None => {
+                let c = Chain::build(e).map(Rc::new);
+                self.chains.borrow_mut().insert(key, c.clone());
+                c
+            }
+        };
+        let Some(chain) = chain else { return Ok(None) };
+        let Some((la, lo)) = self.node_ll(n) else { return Ok(None) };
+        let x = if chain.lat { la } else { lo };
+        let i = chain.thresholds.partition_point(|t| !holds(chain.op, x, *t));
+        #[cfg(test)]
+        CHAIN_HITS.set(CHAIN_HITS.get() + 1);
+        if let Some(leaves) = &chain.leaves {
+            return Ok(Some(V::S(leaves[i].clone())));
+        }
+        let mut cur = e;
+        for _ in 0..i {
+            let Expr::Ternary(_, _, b) = cur else { return Ok(None) };
+            cur = b;
+        }
+        let branch = match cur {
+            Expr::Ternary(_, a, _) if i < chain.thresholds.len() => a,
+            _ => cur,
+        };
+        Ok(Some(self.eval(branch, cx)?.unwrap_or(V::S(String::new()))))
+    }
+
     /// The result of a comparison between `lat()` or `lon()` of a node and
     /// a literal number, without building the strings: grid keys such as
     /// `lat()<40.48?0:(lat()<40.49?1:...)` run a hundred of them per
@@ -450,15 +604,7 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
             if !args.is_empty() {
                 return None;
             }
-            let (id, la, lo) = match self.node_ll.get() {
-                Some(c) if c.0 == n.id => c,
-                _ => {
-                    let c = (n.id, dbl(&fix(n.pos.lat(), 7))?, dbl(&fix(n.pos.lon(), 7))?);
-                    self.node_ll.set(Some(c));
-                    c
-                }
-            };
-            debug_assert_eq!(id, n.id);
+            let (la, lo) = self.node_ll(n)?;
             Some(if lat { la } else { lo })
         };
         let lit = |e: &Expr| -> Option<f64> {
@@ -524,6 +670,9 @@ impl<'e, 's, W: Write> Evaluator<'e, 's, W> {
                 V::S(binary(*op, &l, &r))
             }
             Expr::Ternary(c, a, b) => {
+                if let Some(v) = self.chain(e, cx)? {
+                    return Ok(Some(v));
+                }
                 let fast = match &**c {
                     Expr::Binary(op, l, r) => self.cmp_fast(*op, l, r, cx),
                     _ => None,
@@ -1214,7 +1363,10 @@ impl<'s, W: Write> Engine<'s, W> {
         let mut groups: BTreeMap<Vec<u8>, Set> = BTreeMap::new();
         {
             let ev = Evaluator::new(self);
-            let els = ordered(&src);
+            // In the order of the set (by id): the groups are sorted by id
+            // in the end, so the C++ iteration order (a sort of all
+            // elements by tile) changes nothing here.
+            let els: Vec<El> = src.nodes.iter().map(El::N).chain(src.ways.iter().map(El::W)).chain(src.rels.iter().map(El::R)).chain(src.areas.iter().map(El::A)).chain(src.derived.iter().map(El::D)).collect();
             ev.prefetch(&els, [key])?;
             use super::fetch::MemSize;
             for el in els {
@@ -1338,6 +1490,62 @@ mod tests {
         ];
         for (op, l, r, want) in cases {
             assert_eq!(binary(op, l, r), want, "{l:?} {op:?} {r:?}");
+        }
+    }
+
+    /// `printed_ll` is what printing a coordinate with 7 decimals and
+    /// reading it again gives, bit for bit.
+    #[test]
+    fn coordinates_as_their_printed_forms_read() {
+        let same = |y: u32, x: u32| {
+            let p = crate::geo::Pt { y, x };
+            let want = (dbl(&fix(p.lat(), 7)).unwrap(), dbl(&fix(p.lon(), 7)).unwrap());
+            let got = printed_ll(p);
+            // the sign of a zero aside, which no comparison sees
+            assert_eq!((got.0.to_bits() << 1, got.1.to_bits() << 1), (want.0.to_bits() << 1, want.1.to_bits() << 1), "{y} {x}");
+        };
+        let ys = [10_000_000u32, 10_000_001, 909_999_999, 910_000_000, 910_000_001, 1_810_000_000, 1_809_999_999, 1_398_500_000];
+        let xs = [0x8000_0000u32, 0x7FFF_FFFF, 0x8000_0001, crate::geo::x_of_ilon(1_800_000_000), crate::geo::x_of_ilon(-1_800_000_000), crate::geo::x_of_ilon(23_500_000)];
+        for y in ys {
+            for x in xs {
+                same(y, x);
+            }
+        }
+        let mut s = 0x2545_F491_4F6C_DD1Du64;
+        for _ in 0..1_000_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            same(10_000_000 + (s % 1_800_000_001) as u32, crate::geo::x_of_ilon((((s >> 32) % 3_600_000_001) as i64 - 1_800_000_000) as i32));
+        }
+    }
+
+    /// rv-eval: `printed_ll` against the printed form over whole windows
+    /// of coordinates and 20 million random positions.
+    #[test]
+    #[ignore]
+    fn rv_printed_ll_wide() {
+        let same = |y: u32, x: u32| {
+            let p = crate::geo::Pt { y, x };
+            let want = (dbl(&fix(p.lat(), 7)).unwrap(), dbl(&fix(p.lon(), 7)).unwrap());
+            let got = printed_ll(p);
+            assert!(got.0 == want.0 && got.1 == want.1, "{y} {x} {got:?} {want:?}");
+        };
+        for c in [10_000_000u32, 910_000_000, 1_810_000_000, 500_000_000, 1_398_500_000, 1_000_000_000] {
+            for y in c.saturating_sub(200_000)..=c.saturating_add(200_000).min(1_810_000_000) {
+                same(y, crate::geo::x_of_ilon((y as i64 - 910_000_000) as i32 * 2 % 1_800_000_000));
+            }
+        }
+        for k in -1_800_000_000i64..=-1_799_800_000 {
+            same(910_000_000, crate::geo::x_of_ilon(k as i32));
+            same(910_000_000, crate::geo::x_of_ilon(-k as i32));
+        }
+        let mut s = 0x9E37_79B9_7F4A_7C15u64;
+        for _ in 0..20_000_000 {
+            s ^= s << 13;
+            s ^= s >> 7;
+            s ^= s << 17;
+            same(10_000_000 + (s % 1_800_000_001) as u32, crate::geo::x_of_ilon((((s >> 32) % 3_600_000_001) as i64 - 1_800_000_000) as i32));
         }
     }
 

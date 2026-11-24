@@ -279,10 +279,32 @@ pub const AREA_REL_OFFSET: Id = 3_600_000_000;
 
 /// Unix timestamp to `YYYY-MM-DDTHH:MM:SSZ`.
 pub fn format_timestamp(ts: i64) -> String {
+    let mut b = Vec::with_capacity(20);
+    put_timestamp(&mut b, ts);
+    // digits and ASCII punctuation, or the output of `format!`
+    String::from_utf8(b).unwrap_or_default()
+}
+
+/// `format_timestamp` into a byte buffer (`out meta` writes one per
+/// element).
+pub fn put_timestamp(b: &mut Vec<u8>, ts: i64) {
     let days = ts.div_euclid(86_400);
     let secs = ts.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
-    format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, secs / 3600, (secs / 60) % 60, secs % 60)
+    if !(0..=9999).contains(&y) {
+        use std::io::Write;
+        let _ = write!(b, "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, secs / 3600, (secs / 60) % 60, secs % 60);
+        return;
+    }
+    #[inline(always)]
+    fn two(v: u32) -> [u8; 2] {
+        [b'0' + (v / 10) as u8, b'0' + (v % 10) as u8]
+    }
+    let (y, secs) = (y as u32, secs as u32);
+    let (yh, yl) = (two(y / 100), two(y % 100));
+    let (mo, da) = (two(m), two(d));
+    let (h, mi, se) = (two(secs / 3600), two(secs / 60 % 60), two(secs % 60));
+    b.extend_from_slice(&[yh[0], yh[1], yl[0], yl[1], b'-', mo[0], mo[1], b'-', da[0], da[1], b'T', h[0], h[1], b':', mi[0], mi[1], b':', se[0], se[1], b'Z']);
 }
 
 /// Parse `YYYY-MM-DDTHH:MM:SSZ` (the time part and `Z` optional).
@@ -353,5 +375,29 @@ mod tests {
             assert_eq!(format_timestamp(parse_timestamp(s).unwrap()), s);
         }
         assert_eq!(parse_timestamp("2012-09-14"), parse_timestamp("2012-09-14T00:00:00Z"));
+    }
+
+    /// The byte writer gives what `format!` gave, also outside the years
+    /// with four digits.
+    #[test]
+    fn put_timestamp_matches_format() {
+        let old = |ts: i64| {
+            let days = ts.div_euclid(86_400);
+            let secs = ts.rem_euclid(86_400);
+            let (y, m, d) = civil_from_days(days);
+            format!("{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z", y, m, d, secs / 3600, (secs / 60) % 60, secs % 60)
+        };
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut cases: Vec<i64> = vec![0, -1, 1, 86_399, 86_400, 951_782_400, 1_732_406_400, 253_402_300_799, 253_402_300_800, -62_167_219_200, -62_167_219_201, i32::MAX as i64, i32::MIN as i64, 1 << 40, -(1 << 40)];
+        for _ in 0..200_000 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            // mostly the years of OSM data, some far outside
+            cases.push(if x & 15 == 0 { (x >> 20) as i64 - (1 << 42) } else { 1_100_000_000 + (x % 800_000_000) as i64 });
+        }
+        for ts in cases {
+            assert_eq!(format_timestamp(ts), old(ts), "{ts}");
+        }
     }
 }

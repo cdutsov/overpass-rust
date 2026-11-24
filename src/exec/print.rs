@@ -159,6 +159,20 @@ fn meta_span<T>(all: &[T], i: usize) -> &[T] {
     &all[i * WINDOW..((i + META_WINDOWS) * WINDOW).min(all.len())]
 }
 
+/// The meta data of the elements of window `i` (`len` elements) out of
+/// that of its span, which holds one entry per element in print order;
+/// empty when no meta data is printed.
+fn meta_window(metas: &[Option<Meta>], i: usize, len: usize) -> &[Option<Meta>] {
+    let start = (i % META_WINDOWS) * WINDOW;
+    metas.get(start..start + len).unwrap_or(&[])
+}
+
+/// What is printed for element `k` of a window: its meta data and user name.
+fn meta_out<'a>(mw: &[Option<Meta>], k: usize, users: &'a HashMap<u32, String>) -> Option<MetaOut<'a>> {
+    let m = (*mw.get(k)?)?;
+    Some(MetaOut { meta: m, user: users.get(&m.uid).map(|s| s.as_str()) })
+}
+
 impl<'s, W: Write> Engine<'s, W> {
     pub fn print(&mut self, s: &Set, o: &OutOpts) -> Result<()> {
         let fl = out_flags(o);
@@ -194,15 +208,17 @@ impl<'s, W: Write> Engine<'s, W> {
         remaining -= nodes.len() as u64;
         let no_geom = GeomOut::default();
         // Elements are prepared and printed in windows to bound memory.
-        let mut metas = HashMap::default();
+        let mut metas: Vec<Option<Meta>> = Vec::new();
         for (i, win) in nodes.chunks(WINDOW).enumerate() {
             if want_meta && i % META_WINDOWS == 0 {
-                metas = self.f.meta(Kind::Node, &meta_span(&nodes, i).iter().map(|n| n.id).collect::<Vec<_>>())?;
+                metas = self.f.meta_in_order(Kind::Node, &meta_span(&nodes, i).iter().map(|n| (n.cell(), n.id)).collect::<Vec<_>>())?;
             }
-            let users = self.users_for(win.iter().filter_map(|n| metas.get(&n.id)))?;
+            let mw = meta_window(&metas, i, win.len());
+            let users = self.users_for(mw.iter().flatten())?;
             let list: Vec<(Item, GeomOut, Option<MetaOut>)> = win
                 .iter()
-                .map(|n| (Item::Node(n), GeomOut::default(), metas.get(&n.id).map(|m| MetaOut { meta: *m, user: users.get(&m.uid).map(|s| s.as_str()) })))
+                .enumerate()
+                .map(|(k, n)| (Item::Node(n), GeomOut::default(), meta_out(mw, k, &users)))
                 .collect();
             self.p.items(&list, fl)?;
             self.check()?;
@@ -221,24 +237,26 @@ impl<'s, W: Write> Engine<'s, W> {
         #[cfg(test)]
         let boxes = boxes && !BOXES_OFF.get();
         let by_box = |w: &Way| boxes && !w.missing && !w.bbox.is_empty();
-        let mut metas = HashMap::default();
+        let mut metas: Vec<Option<Meta>> = Vec::new();
         for (i, win) in ways.chunks(WINDOW).enumerate() {
             // the vertices of a window are dropped with it
             let _scope = self.f.limits.mem_scope();
             let mut verts = if need_geom { way_vertices(&self.f, &win.iter().copied().filter(|w| !by_box(w)).collect::<Vec<&Way>>())? } else { HashMap::default() };
             if want_meta && i % META_WINDOWS == 0 {
-                metas = self.f.meta(Kind::Way, &meta_span(&ways, i).iter().map(|w| w.id).collect::<Vec<_>>())?;
+                metas = self.f.meta_in_order(Kind::Way, &meta_span(&ways, i).iter().map(|w| (w.cell(), w.id)).collect::<Vec<_>>())?;
             }
-            let users = self.users_for(win.iter().filter_map(|w| metas.get(&w.id)))?;
+            let mw = meta_window(&metas, i, win.len());
+            let users = self.users_for(mw.iter().flatten())?;
             let list: Vec<(Item, GeomOut, Option<MetaOut>)> = win
                 .iter()
-                .map(|w| {
+                .enumerate()
+                .map(|(k, w)| {
                     let g = match verts.remove(&w.id) {
                         Some(v) => way_geom(&cpp_way_positions(v, w.idx), fl, clip),
                         None if need_geom && by_box(w) => box_geom(&w.bbox, fl),
                         None => GeomOut::default(),
                     };
-                    (Item::Way(w), g, metas.get(&w.id).map(|m| MetaOut { meta: *m, user: users.get(&m.uid).map(|s| s.as_str()) }))
+                    (Item::Way(w), g, meta_out(mw, k, &users))
                 })
                 .collect();
             self.p.items(&list, fl)?;
@@ -252,19 +270,21 @@ impl<'s, W: Write> Engine<'s, W> {
         }
         let rels: Vec<&Relation> = rels.into_iter().take(remaining.min(usize::MAX as u64) as usize).collect();
         remaining -= rels.len() as u64;
-        let mut metas = HashMap::default();
+        let mut metas: Vec<Option<Meta>> = Vec::new();
         for (i, win) in rels.chunks(WINDOW).enumerate() {
             let _scope = self.f.limits.mem_scope();
             if want_meta && i % META_WINDOWS == 0 {
-                metas = self.f.meta(Kind::Relation, &meta_span(&rels, i).iter().map(|r| r.id).collect::<Vec<_>>())?;
+                metas = self.f.meta_in_order(Kind::Relation, &meta_span(&rels, i).iter().map(|r| (r.cell(), r.id)).collect::<Vec<_>>())?;
             }
-            let users = self.users_for(win.iter().filter_map(|r| metas.get(&r.id)))?;
+            let mw = meta_window(&metas, i, win.len());
+            let users = self.users_for(mw.iter().flatten())?;
             let boxed = if need_geom && boxes && clip.is_none() { self.rels_by_box(win)? } else { HashSet::default() };
             let open: Vec<&Relation> = win.iter().copied().filter(|r| !boxed.contains(&r.id)).collect();
             let (npos, wverts) = if need_geom { self.member_geometry(&open)? } else { (HashMap::default(), HashMap::default()) };
             let list: Vec<(Item, GeomOut, Option<MetaOut>)> = win
                 .iter()
-                .map(|r| {
+                .enumerate()
+                .map(|(k, r)| {
                     let g = if boxed.contains(&r.id) {
                         box_geom(&r.bbox, fl)
                     } else if need_geom {
@@ -272,7 +292,7 @@ impl<'s, W: Write> Engine<'s, W> {
                     } else {
                         GeomOut::default()
                     };
-                    (Item::Relation(r), g, metas.get(&r.id).map(|m| MetaOut { meta: *m, user: users.get(&m.uid).map(|s| s.as_str()) }))
+                    (Item::Relation(r), g, meta_out(mw, k, &users))
                 })
                 .collect();
             self.p.items(&list, fl)?;

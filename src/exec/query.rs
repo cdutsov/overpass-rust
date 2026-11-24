@@ -4,6 +4,8 @@
 
 //! The query statement: candidate generation and filtering per element type.
 
+use std::borrow::Cow;
+
 use super::fetch::{Fetch, Source, arc_ranges, ranges_for, tile_runs};
 use super::filter::TagFilter;
 use super::geom::{AroundSource, EGeom, PolyTest, Polygon, RectPos, rel_geoms, rel_geoms_near, way_geoms};
@@ -161,8 +163,8 @@ pub trait QElem: Stored {
     }
     /// Geometry sufficient for bbox, around and poly tests whose regions
     /// meet the stored boxes `near` accepts (relations: see
-    /// `rel_geoms_near`, which also takes `near_cell`).
-    fn near_geoms(f: &Fetch, elems: &[&Self], _near: &dyn Fn(&Rect) -> bool, _near_cell: &dyn Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
+    /// `rel_geoms_near`, which also asks it about cells).
+    fn near_geoms(f: &Fetch, elems: &[&Self], _near: &dyn Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
         Self::geoms(f, elems)
     }
     fn as_el(&self) -> super::eval::El<'_>;
@@ -177,11 +179,18 @@ pub trait QElem: Stored {
     fn spatially_empty(&self) -> bool {
         false
     }
+    /// The position of a node: its whole geometry.
+    fn point(&self) -> Option<crate::geo::Pt> {
+        None
+    }
 }
 
 impl QElem for Node {
     fn tags_of(&self) -> &Tags {
         &self.tags
+    }
+    fn point(&self) -> Option<crate::geo::Pt> {
+        Some(self.pos)
     }
     fn from_set(s: &Set) -> &Vec<Self> {
         &s.nodes
@@ -250,8 +259,8 @@ impl QElem for Relation {
     fn bbox_geoms(f: &Fetch, elems: &[&Self], rects: &[Rect]) -> Result<Vec<EGeom>> {
         super::geom::rel_geoms_for_bbox(f, elems, rects)
     }
-    fn near_geoms(f: &Fetch, elems: &[&Self], near: &dyn Fn(&Rect) -> bool, near_cell: &dyn Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
-        rel_geoms_near(f, elems, near, near_cell)
+    fn near_geoms(f: &Fetch, elems: &[&Self], near: &dyn Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
+        rel_geoms_near(f, elems, near)
     }
     fn as_el(&self) -> super::eval::El<'_> {
         super::eval::El::R(self)
@@ -363,7 +372,11 @@ impl<'s, W: Write> Engine<'s, W> {
             out.ways = self.query_type::<Way>(&plan, pre)?;
         }
         if types.relation {
-            out.rels = match self.rel_spatial_by_members(&filters, &arounds)? {
+            // The nodes and ways of a statement with one `around` clause
+            // and nothing else (`nwr(around.p:3000)`) are those the member
+            // path looks for.
+            let found = (types.node && types.way && matches!(&filters[..], [Filter::Around { .. }])).then_some((&out.nodes[..], &out.ways[..]));
+            out.rels = match self.rel_spatial_by_members(&filters, &arounds, found)? {
                 Some(rplan) => self.query_type::<Relation>(&rplan, (&area_ctxs[..], &[]))?,
                 None => self.query_type::<Relation>(&plan, pre)?,
             };
@@ -429,12 +442,14 @@ impl<'s, W: Write> Engine<'s, W> {
         #[cfg(test)]
         tests::REGION.set(Some("area"));
         let arcs = ctx.has_implicit();
+        // ways and relations lie in the same cells (`ranges_for`, `arc_ranges`)
+        let kind = if kind == Kind::Node { Kind::Node } else { Kind::Way };
         if let Some((_, _, r)) = self.area_ranges_last.iter().find(|(k, a, _)| *k == kind && *a == arcs) {
             #[cfg(test)]
             tests::AREA_RANGES_SHARED.set(tests::AREA_RANGES_SHARED.get() + 1);
             return Some(r.to_vec());
         }
-        let r = std::rc::Rc::new(if arcs { arc_ranges(kind, &ctx.rects) } else { ranges_for(kind, &ctx.rects) });
+        let r = std::rc::Rc::new(if arcs { arc_ranges(kind, &ctx.rects) } else { ctx.cell_ranges(kind).into_owned() });
         let bytes = (r.capacity() * std::mem::size_of::<CodeRange>()) as u64;
         if self.area_kept_bytes + bytes <= area_keep_max() && self.check_memory(bytes).is_ok() {
             self.area_ranges_last.push((kind, arcs, r.clone()));
@@ -446,30 +461,92 @@ impl<'s, W: Write> Engine<'s, W> {
     fn around_source(&self, input: &Option<String>, points: &[(f64, f64)]) -> Result<AroundSource> {
         let mut src = AroundSource::default();
         if !points.is_empty() {
-            src.points = points.to_vec();
-            for w in points.windows(2) {
-                src.segments.push(crate::geo::Segment::new(w[0].0, w[0].1, w[1].0, w[1].1));
-            }
+            src.add_line(points);
             return Ok(src);
         }
         let set = self.get(input.as_deref().unwrap_or("_"));
         for n in &set.nodes {
             src.points.push((n.pos.lat(), n.pos.lon()));
         }
-        for g in way_geoms(&self.f, &set.ways)? {
-            src.add(&g);
-        }
-        for g in rel_geoms(&self.f, &set.rels)? {
-            if let EGeom::Multi { points, lines } = g {
-                for p in points {
-                    src.points.push((p.lat(), p.lon()));
-                }
-                for l in lines {
-                    src.add(&EGeom::Line(l));
+        // The ways of a large set are known by their stored box until a
+        // candidate comes near (`AroundSource::add_lazy`). Not the ways over
+        // more than a few tiles: the box of a long way or a large polygon
+        // holds much that is far from its line. A way without a box has no
+        // node in the database and no geometry.
+        let lazy = |w: &Way| !w.bbox.may_cross() && (w.bbox.y1 >> 16) - (w.bbox.y0 >> 16) < LAZY_TILES && (w.bbox.x1 >> 16) - (w.bbox.x0 >> 16) < LAZY_TILES;
+        if set.ways.len() >= lazy_min() {
+            let mut whole: Vec<&Way> = Vec::new();
+            for w in set.ways.iter().filter(|w| !w.bbox.is_empty()) {
+                if lazy(w) {
+                    src.add_lazy(w);
+                } else {
+                    whole.push(w);
                 }
             }
+            for g in way_geoms(&self.f, &whole)? {
+                src.add(&g);
+            }
+        } else {
+            for g in way_geoms(&self.f, &set.ways)? {
+                src.add(&g);
+            }
+        }
+        for g in rel_geoms(&self.f, &set.rels)? {
+            src.add(&g);
         }
         Ok(src)
+    }
+
+    /// The vertices of the lazy ways of the source that come near one of
+    /// the geometries, as a source of their own for `around_match_with`;
+    /// None when there are none.
+    fn around_fine(&self, src: &AroundSource, r: f64, geoms: &[EGeom]) -> Result<Option<std::sync::Arc<AroundSource>>> {
+        if !src.has_lazy() {
+            return Ok(None);
+        }
+        if let Some(full) = src.lazy_full() {
+            return Ok(Some(full));
+        }
+        let boxes: Vec<Rect> = geoms.iter().filter_map(geom_box).collect();
+        let mut ways = src.lazy_near(&boxes);
+        if ways.is_empty() {
+            return Ok(None);
+        }
+        // Batches of candidates all over the region each come near most
+        // ways: once as many were loaded as there are, all are loaded and
+        // kept for the rest of the statement.
+        let all = src.lazy_loaded(ways.len());
+        if all {
+            ways = src.lazy_all();
+        }
+        #[cfg(test)]
+        tests::LAZY_LOADED.set(tests::LAZY_LOADED.get() + ways.len());
+        self.check()?;
+        let ids: Vec<Id> = ways.iter().flat_map(|w| w.iter().copied()).collect();
+        let pos = self.f.node_positions(&ids)?;
+        drop(ids);
+        self.check()?;
+        let mut fine = AroundSource::default();
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        for w in ways {
+            pts.clear();
+            // a way with a missing node contributes nothing
+            if w.iter().all(|id| pos.get(id).map(|p| pts.push((p.lat(), p.lon()))).is_some()) {
+                fine.add_line(&pts);
+            }
+        }
+        fine.prepare_index(r);
+        let fine = std::sync::Arc::new(fine);
+        if all {
+            src.set_lazy_full(fine.clone());
+        }
+        Ok(Some(fine))
+    }
+
+    /// Which of the geometries pass the `around` test of the source.
+    fn around_pass(&self, src: &AroundSource, r: f64, geoms: &[EGeom]) -> Result<Vec<bool>> {
+        let fine = self.around_fine(src, r, geoms)?;
+        Ok(super::par_map(geoms, 512, |g| around_match_with(src, fine.as_deref(), g, r)))
     }
 
     /// Candidate ids from all clauses that collect data directly.
@@ -547,17 +624,22 @@ impl<'s, W: Write> Engine<'s, W> {
     /// The rectangles of the most restrictive single spatial clause, for
     /// range selection, and whether its test follows great-circle edges
     /// (`around`, implicit areas: `arc_ranges`).
-    fn spatial_rects(&self, plan: &Plan, arounds: &[(AroundSource, f64)], area_ctxs: &[std::rc::Rc<super::area::AreaCtx>]) -> Result<Option<(Vec<Rect>, bool)>> {
-        let mut options: Vec<(&'static str, Vec<Rect>, bool)> = plan.bboxes.iter().map(|b| ("bbox", b.rects(), false)).collect();
-        options.extend(plan.polys.iter().map(|p| ("poly", p.bbox().rects(), false)));
-        options.extend(arounds.iter().map(|(src, r)| ("around", src.bbox_rects(*r), true)));
-        options.extend(area_ctxs.iter().map(|c| ("area", c.rects.clone(), c.has_implicit())));
-        let mut best: Option<(u64, &'static str, Vec<Rect>, bool)> = None;
+    fn spatial_rects<'a>(&self, plan: &Plan, arounds: &'a [(AroundSource, f64)], area_ctxs: &'a [std::rc::Rc<super::area::AreaCtx>]) -> Result<Option<(Cow<'a, [Rect]>, bool)>> {
+        // the cost of an around cover is kept with its source
+        type Opt<'a> = (&'static str, Cow<'a, [Rect]>, bool, Option<&'a AroundSource>);
+        let mut options: Vec<Opt<'a>> = plan.bboxes.iter().map(|b| ("bbox", Cow::Owned(b.rects()), false, None)).collect();
+        options.extend(plan.polys.iter().map(|p| ("poly", Cow::Owned(p.bbox().rects()), false, None)));
+        options.extend(arounds.iter().map(|(src, r)| ("around", src.bbox_rects(*r), true, Some(src))));
+        options.extend(area_ctxs.iter().map(|c| ("area", Cow::Borrowed(&c.rects[..]), c.has_implicit(), None)));
+        let mut best: Option<(u64, &'static str, Cow<'a, [Rect]>, bool)> = None;
         if options.len() == 1 {
-            best = options.pop().map(|(what, rects, arcs)| (0, what, rects, arcs));
+            best = options.pop().map(|(what, rects, arcs, _)| (0, what, rects, arcs));
         }
-        for (what, rects, arcs) in options {
-            let n = region_cost(&rects);
+        for (what, rects, arcs, cost) in options {
+            let n = match cost {
+                Some(src) => *src.cost.get_or_init(|| around_cost(src, &rects)),
+                None => region_cost(&rects),
+            };
             if best.as_ref().is_none_or(|(b, _, _, _)| n < *b) {
                 best = Some((n, what, rects, arcs));
             }
@@ -642,7 +724,7 @@ impl<'s, W: Write> Engine<'s, W> {
         if plan.has_spatial() && !cands.is_empty() {
             let grow = |r: &Rect| Rect { y0: r.y0.saturating_sub(1), x0: r.x0.saturating_sub(1), y1: r.y1.saturating_add(1), x1: r.x1.saturating_add(1) };
             let bbox_rects: Vec<Vec<Rect>> = plan.bboxes.iter().map(|b| b.rects()).collect();
-            let around_rects: Vec<Vec<Rect>> = arounds.iter().map(|(s, r)| s.bbox_rects(*r)).collect();
+            let around_rects: Vec<Cow<'_, [Rect]>> = arounds.iter().map(|(s, r)| s.bbox_rects(*r)).collect();
             let poly_rects: Vec<Vec<Rect>> = plan.polys.iter().map(|p| p.bbox().rects()).collect();
             // `around` and implicit areas follow great-circle edges, which
             // pass north or south of the box (`Rect::arc_box`)
@@ -650,7 +732,20 @@ impl<'s, W: Write> Engine<'s, W> {
             let only_bbox = arounds.is_empty() && plan.polys.is_empty() && plan.areas.is_empty();
             let mut keep = vec![true; cands.len()];
             let mut undecided: Vec<usize> = Vec::new();
+            // A node against boxes only: the test on its position is the
+            // whole test (`geom_in_bbox` of a point), no geometry is built.
+            let node_tests: Vec<_> = if only_bbox { plan.bboxes.iter().map(node_test).collect() } else { Vec::new() };
+            #[cfg(test)]
+            let only_bbox_nodes = only_bbox && !tests::NODE_BOX_PLAIN.get();
+            #[cfg(not(test))]
+            let only_bbox_nodes = only_bbox;
             for (i, e) in cands.iter().enumerate() {
+                if only_bbox_nodes {
+                    if let Some(p) = e.point() {
+                        keep[i] = node_tests.iter().all(|t| t(p));
+                        continue;
+                    }
+                }
                 if let Some(sb) = e.stored_bbox() {
                     if sb.is_empty() || (e.spatially_empty() && area_ctxs.is_empty()) {
                         keep[i] = false;
@@ -716,21 +811,14 @@ impl<'s, W: Write> Engine<'s, W> {
                         let a = b.arc_box();
                         arounds.iter().zip(&around_rects).any(|((s, _), rs)| s.near_box(rs, &a))
                     };
+                    // Also for cells: `near_around` takes the cell grown by the
+                    // bulge of the edges it may hold (boxes up to its width),
+                    // and `near_box` accepts every box that meets the
+                    // rectangles of the clause, which hold all it can pass.
                     let near = |b: &Rect| near_bbox(b) || near_around(b) || near_poly(b);
-                    // for cells: the rectangles of an around clause, which
-                    // hold all it can pass, against the cell grown by the
-                    // bulge of the edges it may hold (boxes up to its width)
-                    let near_cell = |b: &Rect| {
-                        near_bbox(b)
-                            || (!around_rects.is_empty() && {
-                                let a = b.arc_box();
-                                around_rects.iter().any(|rs| rs.iter().any(|r| grow(r).intersects(&a)))
-                            })
-                            || near_poly(b)
-                    };
-                    let test = |g: &EGeom| {
+                    let test = |g: &EGeom, fine: &[Option<std::sync::Arc<AroundSource>>]| {
                         plan.bboxes.iter().all(|b| geom_in_bbox(g, b))
-                            && arounds.iter().all(|(src, r)| around_match(src, g, *r))
+                            && arounds.iter().zip(fine).all(|((src, r), fine)| around_match_with(src, fine.as_deref(), g, *r))
                             && plan.polys.iter().all(|p| poly_match(p, g))
                     };
                     // The geometries are built and tested for a batch of
@@ -745,12 +833,15 @@ impl<'s, W: Write> Engine<'s, W> {
                         let geoms = if only_bbox && bbox_rects.len() == 1 {
                             T::bbox_geoms(&self.f, part, &bbox_rects[0])?
                         } else if reduce_rel_geoms(plan) {
-                            T::near_geoms(&self.f, part, &near, &near_cell)?
+                            T::near_geoms(&self.f, part, &near)?
                         } else {
                             T::geoms(&self.f, part)?
                         };
+                        // the lazy ways of the sources near this batch
+                        let fine = arounds.iter().map(|(src, r)| self.around_fine(src, *r, &geoms)).collect::<Result<Vec<_>>>()?;
                         // Geometric tests are pure: run them in parallel for large batches.
-                        sub_keep.extend(super::par_map(&geoms, 512, test));
+                        sub_keep.extend(super::par_map(&geoms, 512, |g| test(g, &fine)));
+                        drop(fine);
                         drop(geoms);
                         drop(scope);
                     }
@@ -808,7 +899,12 @@ impl<'s, W: Write> Engine<'s, W> {
     /// seconds). Returns the plan without these clauses, restricted to those
     /// ids, or None when a region is large (its nodes would cost more than
     /// the geometries).
-    fn rel_spatial_by_members(&mut self, filters: &[Filter], arounds: &[(AroundSource, f64)]) -> Result<Option<Plan>> {
+    ///
+    /// `found`: the nodes and ways that pass the clause, when the statement
+    /// has found them already (its only clause, also asked for nodes and
+    /// ways). Else the member path reads them without their tags, which no
+    /// test here looks at.
+    fn rel_spatial_by_members(&mut self, filters: &[Filter], arounds: &[(AroundSource, f64)], found: Option<(&[Node], &[Way])>) -> Result<Option<Plan>> {
         // About 0.01 square degrees (10 x 7 km in central Europe).
         const MAX_REGION: f64 = 1e12;
         let size = |rects: &[Rect]| -> f64 { rects.iter().map(|x| (x.y1 - x.y0) as f64 * (x.x1 - x.x0) as f64).sum() };
@@ -818,13 +914,13 @@ impl<'s, W: Write> Engine<'s, W> {
         }
         // The member tests of the clauses, in their order, with their rectangles.
         let mut next_around = arounds.iter();
-        let member_tests: Vec<(MemberTest, Vec<Rect>)> = clauses
+        let member_tests: Vec<(MemberTest, Cow<'_, [Rect]>)> = clauses
             .iter()
             .map(|f| match f {
                 Filter::Poly(pts) => {
                     let poly = Polygon { pts: pts.clone() };
                     let rects = poly.bbox().rects();
-                    (MemberTest::Poly(poly.prepare()), rects)
+                    (MemberTest::Poly(poly.prepare()), Cow::Owned(rects))
                 }
                 _ => {
                     let (src, r) = next_around.next().expect("counted above");
@@ -853,13 +949,21 @@ impl<'s, W: Write> Engine<'s, W> {
         let mut next_around = arounds.iter();
         for clause in clauses {
             let mut members = Set::default();
-            match clause {
+            let (node_ids, way_ids): (Vec<Id>, Vec<Id>) = match clause {
                 Filter::Around { .. } => {
-                    let around = next_around.next().expect("counted above");
-                    let sub = Plan::new(std::slice::from_ref(clause))?;
-                    let pre = (&[][..], std::slice::from_ref(around));
-                    members.nodes = self.query_type::<Node>(&sub, pre)?;
-                    members.ways = self.query_type::<Way>(&sub, pre)?;
+                    let (src, r) = next_around.next().expect("counted above");
+                    match found {
+                        Some((nodes, ways)) => {
+                            #[cfg(test)]
+                            tests::AROUND_MEMBERS.set(Some("found"));
+                            (nodes.iter().map(|n| n.id).collect(), ways.iter().map(|w| w.id).collect())
+                        }
+                        None => {
+                            #[cfg(test)]
+                            tests::AROUND_MEMBERS.set(Some("read"));
+                            self.around_members(src, *r)?
+                        }
+                    }
                 }
                 Filter::Poly(pts) => {
                     let poly = Polygon { pts: pts.clone() };
@@ -880,12 +984,12 @@ impl<'s, W: Write> Engine<'s, W> {
                     });
                     members.nodes = nodes;
                     members.ways = ways;
+                    (members.nodes.iter().map(|n| n.id).collect(), members.ways.iter().map(|w| w.id).collect())
                 }
                 _ => unreachable!(),
-            }
+            };
+            drop(members);
             // the relations are decoded once, by the plan below
-            let node_ids: Vec<Id> = members.nodes.iter().map(|n| n.id).collect();
-            let way_ids: Vec<Id> = members.ways.iter().map(|w| w.id).collect();
             let mut v = self.f.snap.relations_with_members(ElemType::Node, &node_ids)?;
             v.extend(self.f.snap.relations_with_members(ElemType::Way, &way_ids)?);
             v.sort_unstable();
@@ -903,6 +1007,46 @@ impl<'s, W: Write> Engine<'s, W> {
             None => ids,
         });
         Ok(Some(plan))
+    }
+
+    /// The ids of the nodes and ways an `around` clause passes, as
+    /// `query_type` finds them for the clause alone (the nodes in the tiles
+    /// of its rectangles, the ways stored where an edge may meet them, then
+    /// the stored box and the test on the vertices), decoded without their
+    /// tags: for the member path of relations, which needs the ids only.
+    fn around_members(&mut self, src: &AroundSource, r: f64) -> Result<(Vec<Id>, Vec<Id>)> {
+        let rects = src.bbox_rects(r);
+        // with lazy ways, the nodes in their boxes first
+        let lazy = src.has_lazy();
+        let nodes = self.f.in_ranges_by::<Node>(&ranges_for(Kind::Node, &rects), |v, p| codec::decode_nodes(v, p, false), |n| if lazy { src.near_box(&rects, &Rect::point(n.pos)) } else { around_match(src, &EGeom::Point(n.pos), r) })?;
+        let mut node_ids: Vec<Id> = nodes.iter().map(|n| n.id).collect();
+        if lazy {
+            node_ids.clear();
+            for part in nodes.chunks(geom_batch()) {
+                self.check()?;
+                let geoms: Vec<EGeom> = part.iter().map(|n| EGeom::Point(n.pos)).collect();
+                let pass = self.around_pass(src, r, &geoms)?;
+                node_ids.extend(part.iter().zip(pass).filter(|(_, p)| *p).map(|(n, _)| n.id));
+            }
+        }
+        drop(nodes);
+        self.check()?;
+        // an edge across the antimeridian leaves the box
+        let mut close = self.f.in_ranges_by::<Way>(&arc_ranges(Kind::Way, &rects), |v, p| codec::decode_ways(v, p, false), |w| !w.missing && !w.bbox.is_empty() && (w.bbox.may_cross() || src.near_box(&rects, &w.bbox.arc_box())))?;
+        if close.len() > geom_batch() {
+            close.sort_by_cached_key(|w| crate::geo::morton(w.bbox.y0 >> 16, w.bbox.x0 >> 16));
+        }
+        let mut way_ids = Vec::new();
+        for part in close.chunks(geom_batch()) {
+            self.check()?;
+            let scope = self.f.limits.mem_scope();
+            let geoms = way_geoms(&self.f, part)?;
+            let pass = self.around_pass(src, r, &geoms)?;
+            way_ids.extend(part.iter().zip(pass).filter(|(_, p)| *p).map(|(w, _)| w.id));
+            drop(geoms);
+            drop(scope);
+        }
+        Ok((node_ids, way_ids))
     }
 
     /// `around` and `poly` on relations starting from the relations a tag
@@ -929,7 +1073,7 @@ impl<'s, W: Write> Engine<'s, W> {
     /// cross its border, with 4 x 10^5 members. The relations that pass
     /// every clause (sorted by id), or None when the candidates or their
     /// members would cost more than the member path.
-    fn rel_spatial_by_candidates(&mut self, filters: &[Filter], member_tests: &[(MemberTest, Vec<Rect>)]) -> Result<Option<Vec<Relation>>> {
+    fn rel_spatial_by_candidates(&mut self, filters: &[Filter], member_tests: &[(MemberTest, Cow<'_, [Rect]>)]) -> Result<Option<Vec<Relation>>> {
         const MAX_CANDIDATES: usize = 20_000;
         const NODES_PER_CHUNK: usize = 500;
         const MEMBER_COST: usize = 4;
@@ -937,7 +1081,10 @@ impl<'s, W: Write> Engine<'s, W> {
         let Some((_, rects0)) = member_tests.first() else { return Ok(None) };
         let rest: Vec<Filter> = filters.iter().filter(|f| !matches!(f, Filter::Around { .. } | Filter::Poly(_))).cloned().collect();
         let plan = Plan::new(&rest)?;
-        let region_cost0 = region_cost(rects0);
+        let region_cost0 = match member_tests.first() {
+            Some((MemberTest::Around(src, _), _)) => around_cost(src, rects0),
+            _ => region_cost(rects0),
+        };
         let bbox = plan.bboxes.iter().map(|b| (region_cost(&b.rects()), b.rects())).filter(|(n, _)| *n < region_cost0).min_by_key(|(n, _)| *n).map(|(_, rs)| rs);
         let ranges = match (&bbox, member_tests.first()) {
             (Some(rs), _) => ranges_for(Kind::Relation, rs),
@@ -1081,10 +1228,17 @@ impl<'s, W: Write> Engine<'s, W> {
             }
             let (pass_nodes, pass_ways): (HashSet<Id>, HashSet<Id>) = match test {
                 MemberTest::Around(src, r) => {
-                    let nodes = positions.iter().filter(|(_, p)| around_match(src, &EGeom::Point(**p), *r)).map(|(id, _)| *id).collect();
+                    let nodes = if src.has_lazy() {
+                        let (ids, geoms): (Vec<Id>, Vec<EGeom>) = positions.iter().map(|(id, p)| (*id, EGeom::Point(*p))).unzip();
+                        let pass = self.around_pass(src, *r, &geoms)?;
+                        ids.into_iter().zip(pass).filter(|(_, p)| *p).map(|(id, _)| id).collect()
+                    } else {
+                        positions.iter().filter(|(_, p)| around_match(src, &EGeom::Point(**p), *r)).map(|(id, _)| *id).collect()
+                    };
                     let close: Vec<&Way> = ways.iter().filter(|w| !w.bbox.is_empty() && !w.missing && near(&w.bbox, test, rs)).collect();
                     let geoms = way_geoms(&self.f, &close)?;
-                    (nodes, close.iter().zip(&geoms).filter(|(_, g)| around_match(src, g, *r)).map(|(w, _)| w.id).collect())
+                    let pass = self.around_pass(src, *r, &geoms)?;
+                    (nodes, close.iter().zip(pass).filter(|(_, p)| *p).map(|(w, _)| w.id).collect())
                 }
                 // the nodes and ways the member path reads: nodes in the
                 // tiles of the rectangles, ways whose box meets them
@@ -1284,7 +1438,7 @@ impl<'s, W: Write> Engine<'s, W> {
         let needs = rest.iter().filter_map(|t| t.value_literals()).map(|lits| literal_search(&lits)).collect::<Result<Vec<_>>>()?;
         let chunk = |data: &[u8]| needs.iter().all(|re| re.is_match(data));
         let keep = |tags: &Tags| rest.iter().all(|t| t.matches(tags));
-        self.f.at_where::<T>(pairs, Some(TagTest { chunk: &chunk, keep: &keep, keys: &super::fetch::required_keys(rest.iter().copied()) }))
+        self.f.at_where::<T>(pairs, Some(TagTest { chunk: &chunk, keep: &keep, keys: &super::fetch::required_keys(rest.iter().copied()), key_tests: &[] }))
     }
 
     /// The elements stored in the ranges that pass the tag filters of the
@@ -1301,7 +1455,16 @@ impl<'s, W: Write> Engine<'s, W> {
         #[cfg(not(test))]
         let plain = false;
         if plan.tags.is_empty() || plain {
-            return self.f.in_ranges::<T>(ranges, |e| plan.tags.iter().all(|t| t.matches(e.tags_of())));
+            // The cells of the ranges reach beyond the boxes of the
+            // statement: the nodes outside a box are dropped chunk by
+            // chunk, before they are collected and sorted (`node(bbox)`
+            // reads up to several times the nodes it returns).
+            #[cfg(test)]
+            if tests::NODE_BOX_PLAIN.get() {
+                return self.f.in_ranges::<T>(ranges, |e| plan.tags.iter().all(|t| t.matches(e.tags_of())));
+            }
+            let inside: Vec<_> = plan.bboxes.iter().map(node_test).collect();
+            return self.f.in_ranges::<T>(ranges, |e| plan.tags.iter().all(|t| t.matches(e.tags_of())) && e.point().is_none_or(|p| inside.iter().all(|t| t(p))));
         }
         let needs = plan.tags.iter().filter_map(|t| t.value_literals()).map(|lits| literal_search(&lits)).collect::<Result<Vec<_>>>()?;
         let chunk = |data: &[u8]| needs.iter().all(|re| re.is_match(data));
@@ -1456,6 +1619,13 @@ fn count_reads(stmts: &[Stmt], reads: &mut std::collections::HashMap<String, usi
             StmtKind::Unsupported(_) => {}
         }
     }
+}
+
+/// Whether a statement (with the statements inside it) reads the set.
+pub(super) fn reads_set(s: &Stmt, set: &str) -> bool {
+    let mut reads = std::collections::HashMap::new();
+    count_reads(std::slice::from_ref(s), &mut reads);
+    reads.contains_key(set)
 }
 
 /// The statement that answers `b` without storing the result of `a`, for
@@ -1645,39 +1815,133 @@ fn region_cost(rects: &[Rect]) -> u64 {
     tiles + rects.len() as u64 / 16
 }
 
-/// `around` test per spec §6.
+/// Ways an `around` source must have in a set before it takes them by
+/// their stored box (`AroundSource::add_lazy`): the vertices of fewer are
+/// looked up faster than their boxes are sorted out.
+fn lazy_min() -> usize {
+    #[cfg(test)]
+    if let Some(n) = tests::LAZY_MIN.get() {
+        return n;
+    }
+    2000
+}
+
+/// Level-16 tiles in each direction that the box of a lazy way of an
+/// `around` source spans at most (about 2 km).
+const LAZY_TILES: u32 = 3;
+
+/// The box of a geometry for `AroundSource::lazy_near`, with the bulge of
+/// its edges; None when it has no point that an `around` test can pass (a
+/// way with a missing node never passes).
+fn geom_box(g: &EGeom) -> Option<Rect> {
+    let line = |b: &mut Rect, v: &[Option<crate::geo::Pt>]| {
+        if v.iter().all(|p| p.is_some()) {
+            v.iter().flatten().for_each(|p| b.extend(*p));
+        }
+    };
+    let mut b = Rect::EMPTY;
+    match g {
+        EGeom::Point(p) => return Some(Rect::point(*p)),
+        EGeom::Line(v) => line(&mut b, v),
+        EGeom::Multi { points, lines } => {
+            points.iter().for_each(|p| b.extend(*p));
+            lines.iter().for_each(|l| line(&mut b, l));
+        }
+        EGeom::Empty => {}
+    }
+    (!b.is_empty()).then(|| b.arc_box())
+}
+
+/// `around_match` on the source and on the vertices of its lazy ways near
+/// the element (`Engine::around_fine`).
+fn around_match_with(src: &AroundSource, fine: Option<&AroundSource>, g: &EGeom, r: f64) -> bool {
+    around_match(src, g, r) || fine.is_some_and(|f| around_match(f, g, r))
+}
+
+/// `region_cost` of the cover of an `around` source, with each segment
+/// counted twice: the cover held a rectangle for each vertex and each
+/// segment when the costs were set, and they decide between this region
+/// and a bbox. Counted so, a cover of more than 2^20 tiles is not sorted
+/// into distinct tiles (`tile_runs` does not either) and costs the sum
+/// of its rectangles. With the plain count, the two rivers of a set
+/// (10^5 segments, 10^6 tiles) cost less than a bbox over a canyon that
+/// holds little data: the statement sorted the tiles three times and read
+/// the rivers, 0.48 s for 0.25 s.
+fn around_cost(src: &AroundSource, rects: &[Rect]) -> u64 {
+    const MAX_TILES: u64 = 1 << 20;
+    let segments = src.segments.len() as u64;
+    let items = (rects.len() as u64).max(1);
+    let tiles: u64 = rects.iter().filter(|r| !r.is_empty()).map(|r| ((r.y1 >> 16) - (r.y0 >> 16) + 1) as u64 * ((r.x1 >> 16) - (r.x0 >> 16) + 1) as u64).sum();
+    // the share of the segments in the rectangles, once more
+    let twice = |n: u64| n + (n as u128 * segments.min(items) as u128 / items as u128) as u64;
+    if twice(tiles) > MAX_TILES {
+        return twice(tiles) + twice(rects.len() as u64) / 16;
+    }
+    region_cost(rects) + segments / 16
+}
+
+/// `around` test per spec §6, on the points and segments of the source
+/// (not its lazy ways: `around_match_with`).
 pub fn around_match(src: &AroundSource, g: &EGeom, r: f64) -> bool {
     use crate::geo::{Segment, cartesian, great_circle_dist};
+    // a source of lazy ways only (`around_match_with` tests those): its
+    // index holds no item to test
+    if src.points.is_empty() && src.segments.is_empty() {
+        return false;
+    }
     let np = src.points.len();
     let mut cand: Vec<u32> = Vec::new();
-    let point_inside = |lat: f64, lon: f64, cand: &mut Vec<u32>| -> bool {
-        let cp = cartesian(lat, lon);
-        let near_point = |c: &(f64, f64)| (r > 0.0 && great_circle_dist(c.0, c.1, lat, lon) <= r) || ((c.0 - lat).abs() < 1e-7 && (c.1 - lon).abs() < 1e-7);
-        let near_segment = |s: &Segment| {
-            s.line_dist(&cp) <= r && {
+    // Two points are at least as far from each other as their latitudes,
+    // and as one is from the meridian of the other (the arc sine of the
+    // cosine of its latitude times the sine of the longitudes apart): past
+    // the radius by more than the rounding of the distance (5 cm; from a
+    // radius of 1 m on), the distance is not computed. A source with a
+    // radius of hundreds of km has thousands of points in the grid cell of
+    // each candidate.
+    const DEG: f64 = 40_000_000.0 / 360.0;
+    let reach = (r + 0.05) * (1.0 + 1e-9);
+    let (lat_reach, sin_reach) = if r >= 1.0 && reach / crate::geo::ARC_TO_METER < 1.5 { (reach / DEG, (reach / crate::geo::ARC_TO_METER).sin() * (1.0 + 1e-12)) } else { (f64::INFINITY, f64::INFINITY) };
+    // the ends of a segment are points of the source (`AroundSource`); the
+    // first end of segment `i` only where no segment before it ends there
+    let point_inside = |lat: f64, lon: f64| -> bool {
+        // for the segments only: a source of nodes does not need it
+        let cp = std::cell::OnceCell::new();
+        let cos_lat = std::cell::OnceCell::new();
+        let near_point = |c: &(f64, f64)| {
+            if (c.0 - lat).abs() > lat_reach {
+                return false;
+            }
+            let dlon = (c.1 - lon).abs();
+            if dlon <= 90.0 && *cos_lat.get_or_init(|| lat.to_radians().cos()) * dlon.to_radians().sin() > sin_reach {
+                return false;
+            }
+            (r > 0.0 && great_circle_dist(c.0, c.1, lat, lon) <= r) || ((c.0 - lat).abs() < 1e-7 && (c.1 - lon).abs() < 1e-7)
+        };
+        let near_segment = |i: usize, s: &Segment| {
+            near_point(&s.b) || (src.first_end(i) && near_point(&s.a)) || s.line_dist(cp.get_or_init(|| cartesian(lat, lon))) <= r && {
                 let ab = great_circle_dist(s.a.0, s.a.1, s.b.0, s.b.1);
                 let lim = (ab * ab + r * r).sqrt();
                 great_circle_dist(lat, lon, s.a.0, s.a.1) <= lim && great_circle_dist(lat, lon, s.b.0, s.b.1) <= lim
             }
         };
         match &src.index {
-            None => src.points.iter().any(near_point) || src.segments.iter().any(near_segment),
-            Some(ix) => {
-                ix.at_point(lat, lon, cand);
-                cand.iter().any(|&i| if (i as usize) < np { near_point(&src.points[i as usize]) } else { near_segment(&src.segments[i as usize - np]) })
-            }
+            None => src.points.iter().any(near_point) || src.segments.iter().enumerate().any(|(i, s)| near_segment(i, s)),
+            // items past the segments are lazy ways
+            Some(ix) => ix.at_point(lat, lon).any(|i| if (i as usize) < np { near_point(&src.points[i as usize]) } else { src.segments.get(i as usize - np).is_some_and(|s| near_segment(i as usize - np, s)) }),
         }
     };
-    let seg_inside = |a: (f64, f64), b: (f64, f64), cand: &mut Vec<u32>| -> bool {
-        let seg = Segment::new(a.0, a.1, b.0, b.1);
+    let seg_inside = |a: (f64, f64), b: (f64, f64), ca: crate::geo::V3, cb: crate::geo::V3, cand: &mut Vec<u32>| -> bool {
+        let seg = Segment::with_cartesian(a, b, ca, cb);
         let ab = great_circle_dist(a.0, a.1, b.0, b.1);
         let lim = (ab * ab + r * r).sqrt();
-        let near_point = |c: &(f64, f64)| seg.line_dist(&cartesian(c.0, c.1)) <= r && great_circle_dist(c.0, c.1, a.0, a.1) <= lim && great_circle_dist(c.0, c.1, b.0, b.1) <= lim;
+        let near_at = |c: &(f64, f64), cc: &crate::geo::V3| seg.line_dist(cc) <= r && great_circle_dist(c.0, c.1, a.0, a.1) <= lim && great_circle_dist(c.0, c.1, b.0, b.1) <= lim;
+        let near_point = |i: usize| near_at(&src.points[i], &src.point_c(i));
+        let near_segment = |i: usize, t: &Segment| near_at(&t.b, &t.cb) || (src.first_end(i) && near_at(&t.a, &t.ca)) || t.intersects(&seg);
         match &src.index {
             Some(ix) if ix.near_segment(&seg, cand) => {
-                cand.iter().any(|&i| if (i as usize) < np { near_point(&src.points[i as usize]) } else { src.segments[i as usize - np].intersects(&seg) })
+                cand.iter().any(|&i| if (i as usize) < np { near_point(i as usize) } else { src.segments.get(i as usize - np).is_some_and(|t| near_segment(i as usize - np, t)) })
             }
-            _ => src.points.iter().any(near_point) || src.segments.iter().any(|t| t.intersects(&seg)),
+            _ => (0..np).any(near_point) || src.segments.iter().enumerate().any(|(i, t)| near_segment(i, t)),
         }
     };
     let way_match = |v: &[Option<crate::geo::Pt>], cand: &mut Vec<u32>| -> bool {
@@ -1685,15 +1949,20 @@ pub fn around_match(src: &AroundSource, g: &EGeom, r: f64) -> bool {
             return false;
         }
         let pts: Vec<(f64, f64)> = v.iter().flatten().map(|p| (p.lat(), p.lon())).collect();
-        if pts.iter().any(|p| point_inside(p.0, p.1, cand)) {
+        if pts.iter().any(|p| point_inside(p.0, p.1)) {
             return true;
         }
-        pts.windows(2).any(|w| seg_inside(w[0], w[1], cand))
+        if pts.len() < 2 {
+            return false;
+        }
+        // a vertex is an end of two segments
+        let carts: Vec<crate::geo::V3> = pts.iter().map(|p| cartesian(p.0, p.1)).collect();
+        (1..pts.len()).any(|k| seg_inside(pts[k - 1], pts[k], carts[k - 1], carts[k], cand))
     };
     match g {
-        EGeom::Point(p) => point_inside(p.lat(), p.lon(), &mut cand),
+        EGeom::Point(p) => point_inside(p.lat(), p.lon()),
         EGeom::Line(v) => way_match(v, &mut cand),
-        EGeom::Multi { points, lines } => points.iter().any(|p| point_inside(p.lat(), p.lon(), &mut cand)) || lines.iter().any(|l| way_match(l, &mut cand)),
+        EGeom::Multi { points, lines } => points.iter().any(|p| point_inside(p.lat(), p.lon())) || lines.iter().any(|l| way_match(l, &mut cand)),
         EGeom::Empty => false,
     }
 }
@@ -1738,6 +2007,13 @@ mod tests {
         /// Where the candidate path took the members it tested: "ids" or
         /// "region"; None when the boxes decided every relation.
         pub(super) static MEMBERS_FROM: Cell<Option<&'static str>> = const { Cell::new(None) };
+        /// Where the member path took the nodes and ways of its last
+        /// `around` clause: "found" (those of the statement) or "read".
+        pub(super) static AROUND_MEMBERS: Cell<Option<&'static str>> = const { Cell::new(None) };
+        /// `lazy_min` on this thread.
+        pub(super) static LAZY_MIN: Cell<Option<usize>> = const { Cell::new(None) };
+        /// Lazy ways of `around` sources whose vertices were loaded.
+        pub(super) static LAZY_LOADED: Cell<usize> = const { Cell::new(0) };
         /// Whether the last element query with a region and without a
         /// `key=value` filter took its candidates from the tag index.
         pub(super) static INDEXED: Cell<bool> = const { Cell::new(false) };
@@ -1774,6 +2050,8 @@ mod tests {
         pub(super) static AREA_KEEP_MAX: Cell<Option<u64>> = const { Cell::new(None) };
         /// Turns off `fuse_filter_pairs`.
         pub(in crate::exec) static FUSE_OFF: Cell<bool> = const { Cell::new(false) };
+        /// Nodes meet their boxes as geometries after the scan, as ways do.
+        pub(super) static NODE_BOX_PLAIN: Cell<bool> = const { Cell::new(false) };
         /// Pairs `fuse_filter_pairs` replaced since it was last reset.
         pub(in crate::exec) static FUSED: Cell<usize> = const { Cell::new(0) };
         /// Candidates of a first `[key]` filter over which
@@ -1993,6 +2271,148 @@ mod tests {
         // Full output with geometry and tags.
         both_ways(&db, "relation[\"route\"=\"bus\"](around:500,48.85,2.35);out geom;");
         both_ways(&db, "[out:json];relation[route](around:600,48.85,2.35);out geom(48.845,2.345,48.855,2.355);");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The member path of `around` takes the nodes and ways of a statement
+    /// with that one clause and nothing else, and reads them without their
+    /// tags otherwise: the relations are those of the candidate path and
+    /// of the three statements by type.
+    #[test]
+    fn rel_around_members_from_the_statement() {
+        let rels = [
+            relation(1, &[("way", 1015)], &[("route", "bus")]),
+            relation(2, &[("way", 1000)], &[("route", "bus")]),
+            relation(3, &[("node", 466)], &[("route", "tram")]),
+            relation(4, &[("way", 3001), ("node", 1)], &[("route", "bus")]),
+            relation(5, &[("relation", 1)], &[("route", "bus")]),
+            relation(6, &[("node", 999_998), ("way", 1029)], &[("route", "bus")]),
+            relation(7, &[("way", 1000), ("way", 1029)], &[("route", "bus")]),
+            relation(8, &[("way", 3000)], &[("type", "multipolygon")]),
+        ]
+        .concat();
+        let (db, dir) = grid_db("found", &rels);
+        let c = "[out:csv(::type,::id;false)];";
+        let around = "(around:500,48.85,2.35)";
+        // query, where the member path takes its nodes and ways
+        let cases: &[(String, Option<&str>)] = &[
+            (format!("nwr{around};out ids;"), Some("found")),
+            (format!("(node{around};way{around};rel{around};);out ids;"), Some("read")),
+            (format!("rel{around};out ids;"), Some("read")),
+            (format!("nwr[route]{around};out ids;"), Some("read")),
+            (format!("nwr{around}(48.84,2.34,48.86,2.36);out ids;"), Some("read")),
+            (format!("nw{around};out ids;"), None),
+            ("way(1015)->.w;nwr(around.w:50);out ids;".to_string(), Some("found")),
+            ("way(1015)->.w;rel(around.w:50);out ids;".to_string(), Some("read")),
+            ("node(466);nwr(around:100);out ids;".to_string(), Some("found")),
+            (format!("nwr{around}(around:300,48.851,2.351);out ids;"), Some("read")),
+            (format!("[bbox:48.84,2.34,48.86,2.36];nwr{around};out ids;"), Some("read")),
+        ];
+        let mut outs = Vec::new();
+        for (q, from) in cases {
+            let q = format!("{}{q}", if q.starts_with('[') { c.trim_end_matches(';') } else { c });
+            AROUND_MEMBERS.set(None);
+            let (members, _) = run_q(&db, &q, true);
+            assert_eq!(AROUND_MEMBERS.get(), *from, "{q}");
+            let (cands, _) = run_q(&db, &q, false);
+            assert_eq!(members, cands, "{q}");
+            outs.push(members);
+        }
+        assert!(outs[0].contains("relation\t1\n") && outs[0].contains("relation\t3\n") && outs[0].contains("relation\t8\n") && !outs[0].contains("relation\t2\n"), "{}", outs[0]);
+        assert_eq!(outs[0], outs[1]);
+        assert!(outs[6].contains("relation\t1\n"), "{}", outs[6]);
+        assert!(outs[6].ends_with(&outs[7]), "{} {}", outs[6], outs[7]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A large set of ways as an `around` source is taken by the stored
+    /// boxes of its ways, and the vertices are loaded for the ways near the
+    /// candidates: the answers are those of the source with all vertices,
+    /// on both paths of relations, in batches, and few ways are loaded for
+    /// candidates in one corner.
+    #[test]
+    fn around_lazy_ways_match_loaded_ways() {
+        let m = "{m}";
+        // 150 small ways on the dense grid (rows and columns 20 apart): an
+        // L of three nodes, every tenth closed, one with a missing node
+        let dense = |i: usize, j: usize| 100_000 + i * 200 + j;
+        let mut ways = String::new();
+        for k in 0..150 {
+            let (i, j) = (5 + (k / 15) * 20, 5 + (k % 15) * 13);
+            let mut nds = vec![dense(i, j), dense(i + 3, j), dense(i + 3, j + 4)];
+            if k % 10 == 0 {
+                nds.push(dense(i, j));
+            }
+            if k == 77 {
+                nds.push(999_997);
+            }
+            let nds: String = nds.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect();
+            ways += &format!("<way id=\"{}\" {m}>{nds}<tag k=\"small\" v=\"yes\"/></way>\n", 5000 + k);
+        }
+        // a way of one node, and one across the antimeridian
+        ways += &format!("<way id=\"5200\" {m}><nd ref=\"{}\"/><tag k=\"small\" v=\"yes\"/></way>\n", dense(190, 190));
+        ways += &format!("<way id=\"5201\" {m}><nd ref=\"300001\"/><nd ref=\"300002\"/><tag k=\"small\" v=\"yes\"/></way>\n");
+        let nodes = format!("<node id=\"300001\" lat=\"10.0\" lon=\"179.9995\" {m}/>\n<node id=\"300002\" lat=\"10.0\" lon=\"-179.9995\" {m}/>\n<node id=\"300003\" lat=\"10.0003\" lon=\"180.0\" {m}><tag k=\"probe\" v=\"yes\"/></node>\n");
+        let rels = [
+            relation(1, &[("way", 1015)], &[("route", "bus")]),
+            relation(2, &[("way", 1000)], &[("route", "bus")]),
+            relation(3, &[("node", 466)], &[("route", "tram")]),
+            relation(4, &[("node", dense(8, 5))], &[("route", "tram")]),
+            relation(5, &[("way", 5003), ("way", 1029)], &[("route", "bus")]),
+            relation(6, &[("way", 5077)], &[]),
+            relation(7, &[("node", 300_003)], &[]),
+        ]
+        .concat();
+        let (db, dir) = osm_db("lazy", &grid_osm_with(&nodes, &ways, &rels));
+        let c = "[out:csv(::type,::id;false)];";
+        let s = "way[small]->.s;";
+        let queries = [
+            format!("{s}node(around.s:10);out ids;"),
+            format!("{s}node(around.s:0);out ids;"),
+            format!("{s}way(around.s:0);out ids;"),
+            format!("{s}way(around.s:12);out ids;"),
+            format!("{s}nwr(around.s:30);out ids;"),
+            format!("{s}nwr(around.s:0);out ids;"),
+            format!("{s}rel(around.s:25);out ids;"),
+            format!("{s}rel[route](around.s:60);out ids;"),
+            format!("{s}nwr[highway](around.s:5);out ids;"),
+            format!("{s}node(around.s:15)(48.845,2.345,48.85,2.35);out ids;"),
+            format!("{s}node(around.s:20)(around:300,48.85,2.35);out ids;"),
+            format!("{s}way[small](around.s:40);out ids;"),
+            format!("{s}node(around.s:2000);out count;"),
+            format!("{s}nwr[probe](around.s:100);out ids;"),
+            format!("({s}node(466);way(1003);rel(3);)->.s;nwr(around.s:20);out ids;"),
+            format!("{s}way(1010)->.t;node(around.s:20)(around.t:100);out ids;"),
+            format!("{s}node(around.s:10)->.a;way[small](around.a:0);out ids;"),
+        ];
+        let mut loaded = 0;
+        for q in &queries {
+            let q = format!("{c}{q}");
+            LAZY_MIN.set(Some(usize::MAX));
+            let (want, _) = run_q(&db, &q, false);
+            assert!(want.lines().count() > 0, "{q}");
+            for (min, batch, off) in [(1, None, false), (1, None, true), (1, Some(7), false), (100, Some(40), true), (usize::MAX, None, true)] {
+                LAZY_MIN.set(Some(min));
+                GEOM_BATCH.set(batch);
+                LAZY_LOADED.set(0);
+                let (got, _) = run_q(&db, &q, off);
+                assert_eq!(got, want, "{q} (lazy from {min} ways, batch {batch:?}, candidates off: {off})");
+                assert!(min < 1000 || LAZY_LOADED.get() == 0, "{q}");
+                // per source at most all ways once more than there are
+                assert!(LAZY_LOADED.get() <= 2 * 2 * 153, "{q}: {} (batch {batch:?})", LAZY_LOADED.get());
+                loaded += LAZY_LOADED.get();
+            }
+            GEOM_BATCH.set(None);
+        }
+        assert!(loaded > 1000, "{loaded}");
+        // candidates in one corner of the grid: the ways near the nodes of
+        // the tiles read for it, not all 152
+        LAZY_MIN.set(Some(1));
+        LAZY_LOADED.set(0);
+        let out = output(&db, &format!("{c}{s}node(around.s:10)(48.84,2.34,48.8412,2.3412);out ids;"));
+        assert!(out.lines().count() > 5, "{out}");
+        assert!((1..=40).contains(&LAZY_LOADED.get()), "{}", LAZY_LOADED.get());
+        LAZY_MIN.set(None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2282,7 +2702,9 @@ mod tests {
                 let b = (a.0 + (rnd() - 0.5) * spread * 0.3, lon(rnd()));
                 src.segments.push(crate::geo::Segment::new(a.0, a.1, b.0, b.1));
             }
-            let plain = AroundSource { points: src.points.clone(), segments: src.segments.clone(), index: None };
+            let mut plain = AroundSource::default();
+            plain.points = src.points.clone();
+            plain.segments = src.segments.clone();
             src.prepare(radius);
             assert!(src.index.is_some());
             let mut hits = 0;
@@ -2297,6 +2719,246 @@ mod tests {
             }
             assert!(hits > 0);
         }
+    }
+
+    /// A long segment is covered in pieces (`segment_spans`): every point
+    /// and line the test passes lies in the rectangles and in the cells of
+    /// the index, the index answers as the scan of all items, and a
+    /// diagonal takes a fraction of the area of its one box.
+    #[test]
+    fn around_long_segments_are_covered_in_pieces() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let grow = |r: &Rect| Rect { y0: r.y0.saturating_sub(1), x0: r.x0.saturating_sub(1), y1: r.y1.saturating_add(1), x1: r.x1.saturating_add(1) };
+        let area = |rs: &[Rect]| -> f64 { rs.iter().map(|r| (r.y1 - r.y0) as f64 * (r.x1 - r.x0) as f64).sum() };
+        // radius, ends, whether the cover is cut
+        let cases: &[(f64, (f64, f64), (f64, f64), bool)] = &[
+            (25.0, (51.17571, 7.21023), (51.24529, 6.40653), true),
+            (10_000.0, (48.5, 2.5), (46.0, 7.7), true),
+            (0.0, (47.0, 8.0), (47.3, 8.4), true),
+            (5000.0, (60.0, 10.0), (70.0, 40.0), true),
+            (300.0, (-30.0, -60.0), (-35.0, -50.0), true),
+            (300.0, (10.0, 170.0), (12.0, 179.5), true),
+            // along a meridian, along a parallel, short, across the antimeridian, near a pole
+            (300.0, (10.0, 20.0), (12.0, 20.001), false),
+            (300.0, (10.0, 20.0), (10.001, 22.0), false),
+            (300.0, (10.0, 20.0), (10.004, 20.004), false),
+            (300.0, (10.0, 179.0), (12.0, -179.0), false),
+            (300.0, (86.0, 20.0), (88.0, 60.0), false),
+        ];
+        for &(radius, a, b, cut) in cases {
+            let mut src = AroundSource::default();
+            src.add_line(&[a, b]);
+            let rects = src.bbox_rects(radius).into_owned();
+            assert_eq!(rects.len() > 2, cut, "{a:?} {b:?}");
+            if cut {
+                let one = Rect { y0: rects.iter().map(|r| r.y0).min().unwrap(), x0: rects.iter().map(|r| r.x0).min().unwrap(), y1: rects.iter().map(|r| r.y1).max().unwrap(), x1: rects.iter().map(|r| r.x1).max().unwrap() };
+                assert!(area(&rects) < area(&[one]) / 3.0, "{a:?} {b:?}: {} pieces", rects.len());
+            }
+            // 39 more segments, so that the index is built
+            let mut many = AroundSource::default();
+            many.add_line(&[a, b]);
+            for _ in 0..39 {
+                let c = (a.0 + (rnd() - 0.5) * 2.0, a.1 + (rnd() - 0.5) * 0.5);
+                many.add_line(&[c, (c.0 + (rnd() - 0.5) * 2.0, c.1 + (rnd() - 0.5) * 2.0)]);
+            }
+            let mut plain = AroundSource::default();
+            plain.segments = many.segments.clone();
+            many.prepare(radius);
+            assert!(many.index.is_some());
+            let many_rects = many.bbox_rects(radius);
+            let deg = radius * 360.0 / 40_000_000.0;
+            let mut hits = 0;
+            for k in 0..3000 {
+                // near the arc: within 1.5 radii of a point between the ends, and past the ends
+                let t = rnd() * 1.02 - 0.01;
+                let off = if k % 3 == 0 { 1.5 } else { 1.05 };
+                // a point of the arc
+                let (ca, cb) = (crate::geo::cartesian(a.0, a.1), crate::geo::cartesian(b.0, b.1));
+                let v = ca.scale(1.0 - t).add(&cb.scale(t));
+                let v = v.scale(1.0 / v.dot(&v).sqrt());
+                let (alat, alon) = (v.0.asin().to_degrees(), v.1.atan2(v.2).to_degrees());
+                let lat = alat + (rnd() - 0.5) * 2.0 * off * deg + (rnd() - 0.5) * 0.02 * (k % 2) as f64;
+                let lon = alon + (rnd() - 0.5) * 2.0 * off * deg / lat.to_radians().cos();
+                let p = Pt::from_ll(lat.clamp(-89.9, 89.9), if lon > 180.0 { lon - 360.0 } else if lon < -180.0 { lon + 360.0 } else { lon });
+                let q = Pt::from_ll((p.lat() + (rnd() - 0.5) * 0.01).clamp(-89.9, 89.9), (p.lon() + (rnd() - 0.5) * 0.01).clamp(-180.0, 180.0));
+                for g in [EGeom::Point(p), EGeom::Line(vec![Some(p), Some(q)])] {
+                    let hit = around_match(&src, &g, radius);
+                    let mut bx = Rect::point(p);
+                    if matches!(g, EGeom::Line(_)) {
+                        bx.extend(q);
+                    }
+                    let bx = bx.arc_box();
+                    if hit {
+                        assert!(rects.iter().any(|r| grow(r).intersects(&bx)), "{g:?} outside the cover of {a:?} {b:?}");
+                        assert!(many.near_box(&many_rects, &bx), "{g:?} outside the cells of {a:?} {b:?}");
+                    }
+                    assert_eq!(around_match(&plain, &g, radius), around_match(&many, &g, radius), "{g:?} {a:?} {b:?}");
+                    hits += hit as usize;
+                }
+            }
+            assert!(hits > 100, "{a:?} {b:?}: {hits}");
+        }
+    }
+
+    /// The vertices of a line are tested once, with the segment that ends
+    /// there: the answers are those of segments tested at both ends, with
+    /// and without the index.
+    #[test]
+    fn around_line_vertices_are_tested_once() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        for (radius, step, n) in [(30.0, 0.002, 80), (0.0, 0.002, 80), (500.0, 0.02, 80), (30.0, 0.002, 6), (2000.0, 0.3, 40)] {
+            // two lines of n vertices each, and a node
+            let mut line = AroundSource::default();
+            let mut both_ends = AroundSource::default();
+            for l in 0..2 {
+                let mut p = (47.0 + l as f64 * step, 8.0);
+                let mut pts = vec![p];
+                for _ in 1..n {
+                    p = (p.0 + (rnd() - 0.5) * step, p.1 + rnd() * step);
+                    pts.push(p);
+                }
+                line.add_line(&pts);
+                for w in pts.windows(2) {
+                    both_ends.segments.push(crate::geo::Segment::new(w[0].0, w[0].1, w[1].0, w[1].1));
+                }
+            }
+            line.points.push((47.0, 8.0 + step));
+            both_ends.points.push((47.0, 8.0 + step));
+            assert_eq!(line.segments.len(), 2 * (n - 1));
+            assert!(line.first_end(0) && !line.first_end(1) && line.first_end(n - 1) && !line.first_end(n));
+            let mut indexed = AroundSource::default();
+            indexed.points = line.points.clone();
+            for l in 0..2 {
+                let pts: Vec<(f64, f64)> = std::iter::once(line.segments[l * (n - 1)].a).chain(line.segments[l * (n - 1)..(l + 1) * (n - 1)].iter().map(|s| s.b)).collect();
+                indexed.add_line(&pts);
+            }
+            indexed.prepare(radius);
+            assert_eq!(indexed.index.is_some(), n > 20);
+            let deg = radius * 360.0 / 40_000_000.0;
+            let mut hits = 0;
+            for k in 0..6000 {
+                // near a vertex (also exactly on it), and anywhere near the lines
+                let v = line.segments[(rnd() * line.segments.len() as f64) as usize];
+                let v = if k % 2 == 0 { v.a } else { v.b };
+                let p = match k % 3 {
+                    0 => Pt::from_ll(v.0 + (rnd() - 0.5) * 2.2 * deg, v.1 + (rnd() - 0.5) * 3.2 * deg),
+                    1 => Pt::from_ll(v.0, v.1),
+                    _ => Pt::from_ll(47.0 + (rnd() - 0.5) * step * 4.0, 8.0 + rnd() * step * n as f64 * 0.5),
+                };
+                let q = Pt::from_ll(p.lat() + (rnd() - 0.5) * step * 0.2, p.lon() + (rnd() - 0.5) * step * 0.2);
+                for g in [EGeom::Point(p), EGeom::Line(vec![Some(p), Some(q)]), EGeom::Line(vec![Some(q), Some(Pt::from_ll(q.lat() + deg, q.lon()))])] {
+                    let want = around_match(&both_ends, &g, radius);
+                    assert_eq!(around_match(&line, &g, radius), want, "{g:?} radius {radius}");
+                    assert_eq!(around_match(&indexed, &g, radius), want, "{g:?} radius {radius} (index)");
+                    hits += want as usize;
+                }
+            }
+            assert!(hits > 500 && hits < 17_500, "radius {radius}: {hits}");
+        }
+    }
+
+    /// The bounds that spare the distance of two points (their latitudes,
+    /// the meridian of one) never change the answer of the distance
+    /// itself: points at the radius and close to it on both sides, in all
+    /// directions, for radii from under a metre to a quarter of the globe,
+    /// up to high latitudes and across the antimeridian.
+    #[test]
+    fn around_point_bounds_keep_the_answers() {
+        use crate::geo::great_circle_dist;
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut rnd = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let exact = |c: (f64, f64), p: Pt, r: f64| (r > 0.0 && great_circle_dist(c.0, c.1, p.lat(), p.lon()) <= r) || ((c.0 - p.lat()).abs() < 1e-7 && (c.1 - p.lon()).abs() < 1e-7);
+        let (mut inside, mut outside) = (0, 0);
+        for radius in [0.0f64, 0.3, 1.0, 1.5, 25.0, 300.0, 3000.0, 50_000.0, 666_888.0, 3_000_000.0, 9_000_000.0, 12_000_000.0] {
+            for (lat, lon) in [(0.0, 0.0), (47.0, 8.0), (-33.0, 151.0), (10.0, 179.9999), (84.0, -30.0), (-89.0, 100.0), (63.5, -179.99)] {
+                let mut src = AroundSource::default();
+                src.points.push((lat, lon));
+                // a segment far away, so that the segment tests run too
+                src.add_line(&[(-lat * 0.5 + 1.0, lon * 0.5 + 2.0), (-lat * 0.5 + 1.001, lon * 0.5 + 2.001)]);
+                let deg = radius * 360.0 / 40_000_000.0;
+                for k in 0..4000 {
+                    // around the radius: far, near, and within the rounding of the coordinates
+                    let f = match k % 4 {
+                        0 => rnd() * 2.0,
+                        1 => 1.0 + (rnd() - 0.5) * 1e-3,
+                        2 => 1.0 + (rnd() - 0.5) * 1e-6,
+                        _ => 1.0 + (rnd() - 0.5) * 4e-7 / deg.max(1e-7),
+                    };
+                    let dir = rnd() * std::f64::consts::TAU;
+                    let plat = (lat + dir.sin() * deg * f).clamp(-90.0, 90.0);
+                    let scale = plat.to_radians().cos().max(1e-6);
+                    let mut plon = lon + dir.cos() * deg * f / scale;
+                    while plon > 180.0 {
+                        plon -= 360.0;
+                    }
+                    while plon < -180.0 {
+                        plon += 360.0;
+                    }
+                    let p = Pt::from_ll(plat, plon);
+                    let want = exact((lat, lon), p, radius) || exact(src.segments[0].a, p, radius) || exact(src.segments[0].b, p, radius);
+                    let far = great_circle_dist(src.segments[0].a.0, src.segments[0].a.1, p.lat(), p.lon()) > radius + 1000.0;
+                    if far {
+                        assert_eq!(around_match(&src, &EGeom::Point(p), radius), want, "radius {radius} at {lat} {lon}: {} {}", p.lat(), p.lon());
+                        inside += want as usize;
+                        outside += !want as usize;
+                    }
+                }
+            }
+        }
+        assert!(inside > 20_000 && outside > 20_000, "{inside} {outside}");
+    }
+
+    /// The cost of an `around` cover: that of its distinct tiles and its
+    /// rectangles while it is small, with the segments counted twice; the
+    /// sum of the rectangles, unsorted, from 2^20 tiles on.
+    #[test]
+    fn around_cost_of_small_and_large_covers() {
+        let line = |n: usize| {
+            let mut src = AroundSource::default();
+            let pts: Vec<(f64, f64)> = (0..=n).map(|k| (47.0 + k as f64 * 0.0002, 8.0 + (k % 7) as f64 * 0.0001)).collect();
+            src.add_line(&pts);
+            src.prepare(1000.0);
+            src
+        };
+        // 1000 segments along 20 km: a few hundred distinct tiles
+        let small = line(1000);
+        let rects = small.bbox_rects(1000.0);
+        let cost = around_cost(&small, &rects);
+        assert_eq!(cost, region_cost(&rects) + 1000 / 16);
+        assert!(cost < 2000, "{cost}");
+        // 40,000 segments of 20 tiles each: under 2^20 tiles, over it counted
+        // twice, where the distinct tiles are a few thousand
+        let large = line(40_000);
+        let rects = large.bbox_rects(1000.0);
+        let cost = around_cost(&large, &rects);
+        assert!(cost > 1 << 20 && region_cost(&rects) < 100_000, "{cost} {}", region_cost(&rects));
+        // 60,000: `region_cost` does not sort them either
+        let large = line(60_000);
+        let rects = large.bbox_rects(1000.0);
+        assert_eq!(around_cost(&large, &rects), 2 * region_cost(&rects));
+        // nodes count once
+        let mut nodes = AroundSource::default();
+        nodes.points = (0..1000).map(|k| (47.0 + k as f64 * 0.001, 8.0)).collect();
+        nodes.prepare(100.0);
+        let rects = nodes.bbox_rects(100.0);
+        assert_eq!(around_cost(&nodes, &rects), region_cost(&rects));
     }
 
     /// Tagged nodes in the dense centre of the grid (ids from 200,001; 20
@@ -2359,6 +3021,130 @@ mod tests {
             }
         }
         assert!(ones > 100 && zeros > 100);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// rv-scan: tag filters give the answers of filtering a set in memory
+    /// on every path: region scans with key and value tests of the chunk
+    /// (`in_ranges_tagged`, and with `RANGES_PLAIN`), the tag index on one
+    /// and on several threads (`FirstPairs`), for keys and values with
+    /// non-ASCII letters, empty keys and values, keys inside longer keys,
+    /// long (truncated) values, regexes that match the empty string, `,i`.
+    #[test]
+    #[ignore = "randomized, about 5 s: cargo test --release --lib rv_tag_filters_on_all_paths -- --ignored"]
+    fn rv_tag_filters_on_all_paths() {
+        use crate::exec::fetch::PAR_SCAN_VALUES;
+        let mut x = 0x5151_2468_ace0_1357u64;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) % n.max(1)
+        };
+        let long1 = "x".repeat(250);
+        let long2 = format!("{}Zürich", "y".repeat(201));
+        let keys = ["name", "name:en", "Name", "NAME", "highway", "high", "addr:street", "k", "", "ü", "Ü", "straße", "STRASSE", "a.b", "a+b", "x y", "ключ", "name_old", "e\\f", "q\"t"];
+        let vals = ["", "a", "ab", "Zürich", "zürich", "ZÜRICH", "Main Street", "main street", "MAIN", "Straße", "STRASSE", "İstanbul", "istanbul", "ıi", "Kelvin", "\u{212a}elvin", "ſea", "Sea", "улица", "УЛИЦА", "日本", "🙂", long1.as_str(), long2.as_str(), "a\u{301}", "ǅ", "ǆ", "Ǆ", "1", "12", "a.b", "a*b", "line\nbreak", "e\\f", "q\"t", "primary", "secondary"];
+        let res = ["^Zür", "zürich", "ZÜRICH", "^$", ".", "^.$", "^..?$", "a", "ab", "^a", "b$", "Sea", "sea", "kelvin", "^K", "straße", "STRASSE", "ss", "улица", "^У", "日", "🙂", "x{3}", "^x+$", "(Main|Sea)", "[Mm]ain", "Mai?n", ".*", "a*", "^(a|ab)$", "[[:alpha:]]+", "[[:upper:]]", "\\.", "a\\*b", "İ", "ı", "i", "I", "ǅ", "ǆ", "\u{301}", "line.break", "e\\\\f", "q\"t", "Zürich$", "^y+Z", "rich", "^prim", "ary$", "^ZÜR", "ICH$"];
+        let kres = ["^name", "name:", ":en$", "^.ame$", "^NAME$", "^$", "high", "^high$", "^k$", "^ü$", "e\\\\f", ".", "^STR", "straße", "^a.b$", "^a\\+b$", "x y", "ключ", "q\"t", "^n", "AME"];
+        let xml = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;").replace('\n', "&#10;");
+        let ql = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
+        let tags = |next: &mut dyn FnMut(u64) -> u64| -> String {
+            let mut t = String::new();
+            let mut used = Vec::new();
+            for _ in 0..next(5) {
+                let k = keys[next(keys.len() as u64) as usize];
+                if used.contains(&k) {
+                    continue;
+                }
+                used.push(k);
+                t += &format!("<tag k=\"{}\" v=\"{}\"/>", xml(k), xml(vals[next(vals.len() as u64) as usize]));
+            }
+            t
+        };
+        let mut nodes = String::new();
+        let n = 15_000u64;
+        for i in 0..n {
+            let (lat, lon) = (46.0 + next(400_000) as f64 * 1e-6, 7.0 + next(400_000) as f64 * 1e-6);
+            let t = if next(2) == 0 { tags(&mut next) } else { String::new() };
+            nodes += &format!("<node id=\"{}\" lat=\"{lat:.6}\" lon=\"{lon:.6}\" {{m}}>{t}</node>\n", 300_000 + i);
+        }
+        let mut ways = String::new();
+        for w in 0..2500u64 {
+            let first = next(n);
+            let nds: String = (0..2 + next(3)).map(|k| format!("<nd ref=\"{}\"/>", 300_000 + if next(8) == 0 { next(n) } else { (first + k) % n })).collect();
+            ways += &format!("<way id=\"{}\" {{m}}>{nds}{}</way>\n", 10_000 + w, tags(&mut next));
+        }
+        let mut rels = String::new();
+        for r in 0..300u64 {
+            let mem: String = (0..1 + next(3)).map(|_| if next(2) == 0 { format!("<member type=\"node\" ref=\"{}\" role=\"\"/>", 300_000 + next(n)) } else { format!("<member type=\"way\" ref=\"{}\" role=\"\"/>", 10_000 + next(2500)) }).collect();
+            rels += &format!("<relation id=\"{}\" {{m}}>{mem}{}</relation>\n", 20_000 + r, tags(&mut next));
+        }
+        let (db, dir) = osm_db("rv-tags", &grid_osm_with(&nodes, &ways, &rels));
+        let run = |q: &str| -> Option<String> {
+            let opts = crate::exec::RunOptions { cli: true, ..Default::default() };
+            match crate::exec::run(&db, q, Vec::new(), &opts) {
+                Ok(p) => Some(String::from_utf8(p.w).unwrap()),
+                Err((Some(p), _)) => Some(String::from_utf8(p.w).unwrap()),
+                Err((None, _)) => None,
+            }
+        };
+        let c = "[out:csv(::type,::id;false)];";
+        let (mut compared, mut nonempty, mut skipped) = (0, 0, 0);
+        for round in 0..700 {
+            let mut f = String::new();
+            let mut positive = false;
+            for _ in 0..1 + next(3) {
+                let k = ql(keys[next(keys.len() as u64) as usize]);
+                let v = ql(vals[next(vals.len() as u64) as usize]);
+                let re = ql(res[next(res.len() as u64) as usize]);
+                let ci = if next(2) == 0 { ",i" } else { "" };
+                f += &match next(9) {
+                    0 => { positive = true; format!("[\"{k}\"]") }
+                    1 => format!("[!\"{k}\"]"),
+                    2 => { positive = true; format!("[\"{k}\"=\"{v}\"]") }
+                    3 => format!("[\"{k}\"!=\"{v}\"]"),
+                    4 | 5 => { positive = true; format!("[\"{k}\"~\"{re}\"{ci}]") }
+                    6 => format!("[\"{k}\"!~\"{re}\"{ci}]"),
+                    _ => { positive = true; format!("[~\"{}\"~\"{re}\"{ci}]", ql(kres[next(kres.len() as u64) as usize])) }
+                };
+            }
+            let ty = ["node", "way", "rel", "nwr"][next(4) as usize];
+            let (s, w) = (46.0 + next(37) as f64 * 0.01, 7.0 + next(37) as f64 * 0.01);
+            let size = [0.03, 0.15, 0.5][next(3) as usize];
+            let bbox = format!("({s:.2},{w:.2},{:.2},{:.2})", s + size, w + size);
+            PAR_SCAN_VALUES.set(if round % 3 == 0 { Some(2) } else { None });
+            FUSE_OFF.set(true);
+            let reference = run(&format!("{c}{ty}{bbox}->.s;{ty}.s{f};out;"));
+            FUSE_OFF.set(false);
+            let Some(reference) = reference else {
+                skipped += 1;
+                continue;
+            };
+            let q = format!("{c}{ty}{f}{bbox};out;");
+            let tagged = run(&q).unwrap();
+            RANGES_PLAIN.set(true);
+            let plain = run(&q).unwrap();
+            RANGES_PLAIN.set(false);
+            assert_eq!(plain, reference, "round {round}: {q} (plain)");
+            assert_eq!(tagged, reference, "round {round}: {q}");
+            compared += 1;
+            nonempty += !reference.is_empty() as usize;
+            if positive {
+                FUSE_OFF.set(true);
+                let reference = run(&format!("{c}({ty}(-90,-180,90,180);way(3001);)->.s;{ty}.s{f};out;")).unwrap();
+                FUSE_OFF.set(false);
+                let q = format!("{c}{ty}{f};out;");
+                let global = run(&q).unwrap();
+                if !global.contains("Filters too weak") {
+                    assert_eq!(global, reference, "round {round}: {q}");
+                    compared += 1;
+                }
+            }
+        }
+        PAR_SCAN_VALUES.set(None);
+        assert!(compared > 700 && nonempty > 150 && skipped < 100, "{compared} compared, {nonempty} not empty, {skipped} skipped");
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -2443,10 +3229,11 @@ mod tests {
         AREA_RANGES_SHARED.set(0);
         let (three, n) = run("area[name=\"Town 1\"]->.a;(node(area.a);way(area.a);rel(area.a););out ids;way(area.a);out ids;");
         assert_eq!(n, 3);
-        // the ranges of the ways a second time; with another clause, not shared
-        assert_eq!(AREA_RANGES_SHARED.get(), 1);
+        // the ranges of the ways for the relations and for the ways a
+        // second time; with another clause, not shared
+        assert_eq!(AREA_RANGES_SHARED.get(), 2);
         let (boxed, _) = run("area[name=\"Town 1\"]->.a;way(area.a);out ids;way(area.a)(48.82,2.32,48.88,2.38);out ids;");
-        assert_eq!(AREA_RANGES_SHARED.get(), 1);
+        assert_eq!(AREA_RANGES_SHARED.get(), 2);
         assert_eq!(boxed.lines().count() % 2, 0, "{boxed}");
         assert!(three.starts_with(&one), "{three}");
         // by id, with the same default set
@@ -2530,6 +3317,176 @@ mod tests {
         }
         // with a global bbox
         assert_eq!(run(&format!("[bbox:48.848,2.348,48.849,2.349];node[name]->.a;node.a[name~\"^alpha\",i];out;")).1, 1);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Nested ternaries over `lat()` or `lon()` with literals in order are
+    /// searched by bisection (`Evaluator::chain`): the values of the
+    /// evaluation level by level, for ascending and descending levels, ties,
+    /// levels out of order, branches that are expressions, other elements
+    /// than nodes, and as the key of `for`.
+    #[test]
+    fn ternary_chains_by_bisection_equal_the_levels() {
+        use crate::exec::eval::{CHAINS_OFF, CHAIN_HITS};
+        let (db, dir) = grid_db("chains", "");
+        // levels 0.0005 apart from 48.8395, 2.3395: on node positions and between
+        let chain = |f: &str, op: &str, from: f64, step: f64, n: usize, leaf: &dyn Fn(usize) -> String| {
+            let mut e = leaf(n);
+            for k in (0..n).rev() {
+                e = format!("({f}{op}{:.4}?{}:{e})", from + step * k as f64, leaf(k));
+            }
+            e
+        };
+        let num = |k: usize| k.to_string();
+        let lat_up = chain("lat()", "<", 48.8395, 0.0005, 40, &num);
+        let lon_up = chain("lon()", "<=", 2.3395, 0.0005, 40, &num);
+        let lat_down = chain("lat()", ">", 48.8595, -0.0005, 40, &num);
+        let lon_down = chain("lon()", ">=", 2.3595, -0.0005, 40, &num);
+        let ties = "(lat()<48.84?0:(lat()<48.84?1:(lat()<48.845?2:(lat()<48.845?3:(lat()<48.85?4:5)))))";
+        let unordered = "(lat()<48.84?0:(lat()<48.85?1:(lat()<48.845?2:(lat()<48.86?3:(lat()<48.855?4:(lat()<48.87?5:(lat()<48.88?6:(lat()<48.89?7:8))))))))";
+        let mixed = "(lat()<48.84?0:(lat()<48.845?1:(lat()<48.85?2:(lat()<48.855?3:(lon()<2.34?4:(lon()<2.345?5:(lon()<2.35?6:(lon()<2.355?7:(lat()>48.86?8:9)))))))))";
+        let exprs = chain("lat()", "<", 48.8395, 0.001, 12, &|k| format!("id()+{k}"));
+        let texts = chain("lon()", "<", 2.3395, 0.001, 12, &|k| format!("\"c{k}\""));
+        let nested = chain("lat()", "<", 48.8395, 0.002, 8, &|k| format!("({k}*100+{})", chain("lon()", "<", 2.3395, 0.002, 8, &num)));
+        let odd = "(lat()<\"48.85 \"?0:(lat()<\"0x31\"?1:(lat()<\"4.886e1\"?2:(lat()<\"inf\"?3:(lat()<\"nan\"?4:5)))))";
+        let short = "(lat()<48.84?0:(lat()<48.85?1:2))";
+        let cols = [&lat_up[..], &lon_up, &lat_down, &lon_down, ties, unordered, mixed, &exprs, &texts, &nested, odd, short];
+        let entries: Vec<String> = cols.iter().enumerate().map(|(k, e)| format!("c{k}={e}")).collect();
+        let names: Vec<String> = (0..cols.len()).map(|k| format!("c{k}")).collect();
+        let key = format!("{lat_up}*1000+{lon_up}");
+        let queries = [
+            format!("[out:csv(::id,{};false)];node(48.838,2.338,48.862,2.362);convert r ::id=id(),{};out;", names.join(","), entries.join(",")),
+            // ways and relations take the general path
+            format!("[out:csv(::id,{};false)];way(48.838,2.338,48.862,2.362);convert r ::id=id(),{};out;", names.join(","), entries.join(",")),
+            format!("[out:csv(v,n;false)];node(48.838,2.338,48.862,2.362);for({key}){{make c v=_.val,n=count(nodes);out;}}"),
+            format!("[out:csv(::id;false)];node(48.838,2.338,48.862,2.362)(if:{lat_up}==7&&{lon_down}>3);out;"),
+        ];
+        for (k, q) in queries.iter().enumerate() {
+            CHAINS_OFF.set(true);
+            let plain = output(&db, q);
+            CHAINS_OFF.set(false);
+            CHAIN_HITS.set(0);
+            let got = output(&db, q);
+            assert_eq!(got, plain, "{q}");
+            assert!(!got.contains("error") && got.lines().count() > 20, "{q}: {got}");
+            assert_eq!(CHAIN_HITS.get() > 1000, k != 1, "{k}: {}", CHAIN_HITS.get());
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `node(bbox)` drops the nodes outside its boxes in the scan and tests
+    /// the others on their position: the answers of the geometry test
+    /// after the scan, also on the edges of a box, with two boxes, a global
+    /// bbox, a box across the antimeridian and with other clauses.
+    #[test]
+    fn nodes_meet_their_boxes_in_the_scan() {
+        let far = "<node id=\"300001\" lat=\"10.0\" lon=\"179.9995\" {m}/><node id=\"300002\" lat=\"10.0\" lon=\"-179.9995\" {m}/><node id=\"300003\" lat=\"10.0\" lon=\"180.0\" {m}/><node id=\"300004\" lat=\"10.0\" lon=\"-180.0\" {m}/><node id=\"300005\" lat=\"10.0005\" lon=\"179.0\" {m}><tag k=\"name\" v=\"x\"/></node>\n";
+        let (db, dir) = osm_db("node-box", &grid_osm_with(far, "", ""));
+        let c = "[out:csv(::type,::id;false)];";
+        let mut queries: Vec<String> = Vec::new();
+        for b in [
+            "(48.83,2.33,48.85,2.35)",
+            // edges on grid lines and on single nodes
+            "(48.84,2.34,48.84,2.34)",
+            "(48.8400001,2.34,48.8419999,2.3419999)",
+            "(48.84005,2.34005,48.84105,2.34105)",
+            "(48.840049,2.340051,48.841051,2.341049)",
+            "(48.82,2.32,48.878,2.378)",
+            "(48.9,2.3,48.95,2.4)",
+            // across the antimeridian, and at it
+            "(9.9,179.9,10.1,-179.9)",
+            "(9.9,179.9995,10.1,180.0)",
+            "(9.9,-180.0,10.1,-179.9995)",
+            "(10.0,180.0,10.0,-180.0)",
+        ] {
+            queries.push(format!("{c}node{b};out;"));
+            queries.push(format!("{c}node{b}(48.8405,2.3405,48.8415,2.3415);out;"));
+            queries.push(format!("{c}node{b}(around:150,48.841,2.341);out;"));
+            queries.push(format!("{c}node{b}->.a;node.a(48.8405,2.3405,48.8415,2.3415);out;"));
+            queries.push(format!("{c}(node{b};way{b};);out;"));
+            queries.push(format!("[bbox:48.8402,2.3402,48.8412,2.3412]{c}node{b};out;"));
+            queries.push(format!("{c}node{b}[name];out;"));
+            queries.push(format!("{c}node{b}[!name];out count;"));
+        }
+        let mut seen = 0;
+        for q in &queries {
+            NODE_BOX_PLAIN.set(true);
+            let plain = output(&db, q);
+            NODE_BOX_PLAIN.set(false);
+            assert_eq!(output(&db, q), plain, "{q}");
+            seen += plain.lines().count();
+        }
+        assert!(seen > 5000, "{seen}");
+        let one = |q: &str| output(&db, &format!("{c}{q}"));
+        assert_eq!(one("node(48.84005,2.34005,48.84005,2.34005);out;"), "node\t100000\n");
+        assert_eq!(one("node(9.9,179.9995,10.1,-179.9995);out;").lines().count(), 4);
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A member of a union that recurses down, and whose result only the
+    /// union reads, does not read the elements the union holds already:
+    /// the answers of reading them all. A member whose result is read
+    /// again reads them all.
+    #[test]
+    fn union_members_leave_out_what_the_union_holds() {
+        use crate::exec::{KNOWN_HELD, KNOWN_OFF};
+        let rels = relation(5000, &[("way", 1011), ("node", 342), ("node", 100_005)], &[("type", "route")])
+            + &relation(5001, &[("way", 2011), ("way", 1011), ("relation", 5000)], &[("type", "route")])
+            + &relation(5002, &[("node", 100_000), ("relation", 5001)], &[]);
+        let (db, dir) = grid_db("union-known", &rels);
+        // node 342 of the coarse grid (48.842, 2.342), where the ways 1011
+        // and 2011 cross, and the fine nodes around it
+        let b = "(48.8405,2.3405,48.8425,2.3425)";
+        let run = |q: &str| {
+            KNOWN_OFF.set(true);
+            let plain = output(&db, q);
+            KNOWN_OFF.set(false);
+            KNOWN_HELD.set(0);
+            let got = output(&db, q);
+            assert_eq!(got, plain, "{q}");
+            assert!(!got.contains("error"), "{q}: {got}");
+            (got.lines().count(), KNOWN_HELD.get())
+        };
+        // left out: the nodes of the box are held when the ways bring them again
+        for q in [
+            format!("node{b}->.n;way(bn.n)->.w;(.n;.w;node(w.w););out meta;"),
+            format!("node{b}->.n;way(bn.n)->.w;(rel(bn.n);rel(bw.w);)->.r;rel(br.r)->.p;(.n;.w;.r;.p;node(w.w););out meta;"),
+            format!("(node{b};way{b};rel{b};);(._;>;);out;"),
+            format!("(node{b};way{b};rel{b};);(._;>>;);out meta;"),
+            format!("(node(48.82,2.32,48.88,2.38);rel(5002););(._;>>;);out;"),
+            format!("(way(1011);rel(5001););(._;>;);out;"),
+            format!("rel(5001)->.r;way(1011)->.w;node{b}->.n;(.n;.w;way(r.r);node(w);.r;);out;"),
+            format!("rel(5000)->.r;node(342)->.n;(.n;node(r.r);node(100005););out;"),
+            format!("rel(5002)->.r;rel(5001)->.s;(.s;rel(r.r););out;"),
+            format!("node{b}->.n;way(bn.n)->.w;(.n;.w;node(w.w)[!highway];);out;"),
+            format!("node{b}->.n;way(id:1011,2011)->.w;(.n;node(w.w:12,13););out;"),
+            // into a named set that is read afterwards
+            format!("node{b}->.n;way(bn.n)->.w;(.n;.w;node(w.w)->.x;.n->.x;)->.all;.all out;.x out ids;"),
+        ] {
+            let (lines, held) = run(&q);
+            assert!(lines > 5 && held > 0, "{q}: {lines} {held}");
+        }
+        // read them all: the result of the member is read again
+        for q in [
+            // the last member of a union into another set: `_` after it
+            format!("node{b}->.n;way(bn.n)->.w;(.n;.w;node(w.w);)->.all;out ids;.all out;"),
+            // the next member reads it
+            format!("node{b}->.n;way(bn.n)->.w;(.n;.w;node(w.w);way(bn);)->.all;.all out;"),
+            format!("node{b}->.n;way(bn.n)->.w;(.n;.w;node(w.w);node._(48.84,2.34,48.841,2.341);)->.all;.all out;"),
+            format!("node{b}->.n;way(bn.n)->.w;(.n;.w;node(w.w);._;);out;"),
+            // a named result that stays
+            format!("node{b}->.n;way(bn.n)->.w;(.n;.w;node(w.w)->.x;);out;.x out ids;"),
+            // not a recursion down
+            format!("node{b}->.n;way(bn.n)->.w;(.n;.w;way(bn.n);rel(bw.w););out;"),
+            // the first member
+            format!("way{b}->.w;(node(w.w);.w;);out;"),
+        ] {
+            let (lines, held) = run(&q);
+            assert!(lines > 5 && held == 0, "{q}: {lines} {held}");
+        }
         drop(db);
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -3509,5 +4466,580 @@ mod tests {
         let (p, q) = (Pt::from_ll(45.0, 8.53), Pt::from_ll(45.0, 8.56));
         assert!(!node_in_bbox(p, &b) && !node_in_bbox(q, &b) && line_in_bbox(&[Some(p), Some(q)], &b));
         assert!(!line_in_bbox(&[Some(p)], &b));
+    }
+
+    // ---- reviewer rv-eval: randomised differentials (bounded, #[ignore]) ----
+
+    /// `output`, with a rejected query as its message (generated queries).
+    fn output_or_rejected(db: &crate::store::Db, q: &str) -> String {
+        let opts = crate::exec::RunOptions { cli: true, ..Default::default() };
+        match crate::exec::run(db, q, Vec::new(), &opts) {
+            Ok(p) => String::from_utf8(p.w).unwrap(),
+            Err((Some(p), _)) => String::from_utf8(p.w).unwrap(),
+            Err((None, e)) => format!("REJECTED {e}"),
+        }
+    }
+
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn pick<'a, T: ?Sized>(&mut self, v: &[&'a T]) -> &'a T {
+            v[(self.next() % v.len() as u64) as usize]
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// Patch 06: random unions with recursion members in many contexts
+    /// give the answers of reading every element.
+    #[test]
+    #[ignore]
+    fn rv_union_known_random() {
+        use crate::exec::{KNOWN_HELD, KNOWN_OFF};
+        let rels = relation(5000, &[("way", 1011), ("node", 342), ("node", 100_005)], &[("type", "route")])
+            + &relation(5001, &[("way", 2011), ("way", 1011), ("relation", 5000)], &[("type", "route")])
+            + &relation(5002, &[("node", 100_000), ("relation", 5001)], &[])
+            + &relation(5003, &[("way", 1015), ("way", 2015), ("node", 466), ("way", 3001)], &[("type", "multipolygon")])
+            + &relation(5004, &[("relation", 5005), ("node", 100_201)], &[])
+            + &relation(5005, &[("relation", 5004), ("way", 1012)], &[])
+            + &relation(5006, &[], &[("type", "empty")]);
+        let (db, dir) = grid_db("rv-union-known", &rels);
+        let b = "(48.8405,2.3405,48.8425,2.3425)";
+        let prelude = format!("node{b}->.n;way(bn.n)->.w;rel(bn.n)->.r1;rel(bw.w)->.r2;(.r1;.r2;)->.r;rel(id:5001,5002,5003,5004,5006)->.R;way(1011)->.w1;node(100000)->.x;");
+        let names = ["_", "x", "n", "w", "all", "R"];
+        let downs = [
+            ">", ">>", ".w >", ".R >", ".R >>", ".r >>", ".w1 >", "node(w.w)", "node(w)", "node(w.w)[!highway]", "node(w.w)[highway]",
+            "node(w.w:1,-1)", "way(r.R)", "node(r.R)", "rel(r.R)", "nwr(r.R)", "way(r)", "node(r)", "node(w.w1)", "node(w.w)(w.w1)",
+            "way(r.R)[highway=residential]", "node(r.R:\"\")", "nw(r.R)", "rel(r)",
+        ];
+        let others = [
+            ".n", ".w", ".r", ".R", ".w1", "._", ".x", "way(bn)", "way(bn.n)", "rel(bw)", "<", "node._(48.841,2.341,48.842,2.342)",
+            "(.n; - node(w.w);)", "(.w; >;)", "(.R; >>;)", "make m n=count(nodes)",
+            "make m n=x.count(nodes)", "convert t ::id=id()", "foreach.w((._;>;)->.y;)", "if (count(nodes) > 0) {(.n;node(w.w););}",
+            "foreach.w->.it((.it;node(w.it););)", "for (t[\"type\"]) {(.r;way(r););}", "complete {(._;node(w););}",
+            "node(id:100000,100001,342)", ".n->.x", "._->.x", ".x->._", "way(1012)", "(._;)", "(.x;node(w.w1);)",
+        ];
+        let mut rng = Rng(0x9E37_79B9_7F4A_7C15);
+        let member = |rng: &mut Rng, depth: usize| -> String {
+            let k = rng.below(10);
+            let base = if k < 6 { rng.pick(&downs).to_string() } else { rng.pick(&others).to_string() };
+            let into = if rng.below(3) == 0 { format!("->.{}", rng.pick(&names)) } else { String::new() };
+            let _ = depth;
+            if base.starts_with("out") || base.starts_with("foreach") || base.starts_with("if") || base.contains(" out") {
+                format!("{base};")
+            } else {
+                format!("{base}{into};")
+            }
+        };
+        let (mut runs, mut held_runs, mut errors) = (0, 0, 0);
+        for round in 0..2500 {
+            let n = 2 + rng.below(5) as usize;
+            let mut body = String::new();
+            for _ in 0..n {
+                if rng.below(8) == 0 {
+                    // a nested union
+                    let m = 2 + rng.below(3) as usize;
+                    let inner: String = (0..m).map(|_| member(&mut rng, 1)).collect();
+                    let into = if rng.below(2) == 0 { format!("->.{}", rng.pick(&names)) } else { String::new() };
+                    body += &format!("({inner}){into};");
+                } else {
+                    body += &member(&mut rng, 0);
+                }
+            }
+            let into = if rng.below(2) == 0 { format!("->.{}", rng.pick(&names)) } else { String::new() };
+            let mut un = format!("({body}){into};");
+            un += match rng.below(4) {
+                0 => "out ids;",
+                1 => ".x out ids;",
+                2 => "out count;.x out count;",
+                _ => "",
+            };
+            let wrapped = match rng.below(7) {
+                0 => format!("foreach.R->.it({un});"),
+                1 => format!("if (1) {{{un}}}"),
+                2 => format!("for (t[\"type\"]) {{{un}}}"),
+                3 => format!("foreach.w1({un});"),
+                4 => format!("complete(3) {{{un}}}"),
+                _ => un,
+            };
+            let q = format!("[out:csv(::type,::id;false)];{prelude}{wrapped}out;.x out;.n out count;.w out count;.all out;.R out;");
+            KNOWN_OFF.set(true);
+            let plain = output_or_rejected(&db, &q);
+            KNOWN_OFF.set(false);
+            KNOWN_HELD.set(0);
+            let got = output_or_rejected(&db, &q);
+            assert_eq!(got, plain, "round {round}: {q}");
+            runs += 1;
+            held_runs += (KNOWN_HELD.get() > 0) as usize;
+            errors += (plain.contains("error") || plain.starts_with("REJECTED")) as usize;
+        }
+        eprintln!("rv_union_known_random: {runs} queries, {held_runs} left elements out, {errors} with errors");
+        assert!(held_runs > 300, "{held_runs}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Patch 07: random ternary chains (orders, ties, odd literals, mixed
+    /// operators and coordinates, nested chains in the branches) give the
+    /// values of the evaluation level by level, in `convert`, `for` and
+    /// `(if:)`.
+    #[test]
+    #[ignore]
+    fn rv_chains_random() {
+        use crate::exec::eval::{CHAINS_OFF, CHAIN_HITS};
+        let (db, dir) = grid_db("rv-chains", "");
+        let mut rng = Rng(0xD1B5_4A32_D192_ED03);
+        // grid nodes at 48.82 + 0.002 i, 2.32 + 0.002 j: the box holds 11 x 11
+        let lits = |rng: &mut Rng, lat: bool| -> String {
+            let (o, step) = if lat { (48.82, 0.002) } else { (2.32, 0.002) };
+            let i = rng.below(13) as f64 - 1.0;
+            match rng.below(16) {
+                0..=5 => format!("{:.3}", o + step * i),
+                6 => format!("{:.4}", o + step * i + 0.001),
+                7 => format!("{:.7}", o + step * i),
+                8 => format!("\"{:.3}\"", o + step * i),
+                9 => format!("{:.5}e1", (o + step * i) / 10.0),
+                10 => rng.pick(&["\"nan\"", "\"inf\"", "\"-inf\"", "\"1e400\"", "\"-1e400\""]).to_string(),
+                11 => rng.pick(&["\"48.83 \"", "\" 48.83\"", "\"abc\"", "\"\"", "\"0x30\"", "\"+48.83\"", "\"-0\"", "\"48,83\""]).to_string(),
+                12 => format!("{:.9}", o + step * i + 1e-8),
+                13 => format!("{:.8}", o + step * i - 5e-8),
+                _ => format!("{:.3}", o + step * i),
+            }
+        };
+        fn chain(rng: &mut Rng, lits: &dyn Fn(&mut Rng, bool) -> String, depth: usize) -> String {
+            let lat = rng.below(2) == 0;
+            let op = *["<", "<=", ">", ">="].iter().nth(rng.below(4) as usize).unwrap();
+            let n = 1 + rng.below(14) as usize;
+            let mode = rng.below(4); // 0 ascending, 1 descending, 2 random, 3 sorted for the op
+            let mut ts: Vec<String> = (0..n).map(|_| lits(rng, lat)).collect();
+            let num = |s: &String| crate::exec::eval::num::dbl(s.trim_matches('"')).unwrap_or(f64::NAN);
+            match mode {
+                0 => ts.sort_by(|a, b| num(a).partial_cmp(&num(b)).unwrap_or(std::cmp::Ordering::Equal)),
+                1 => ts.sort_by(|a, b| num(b).partial_cmp(&num(a)).unwrap_or(std::cmp::Ordering::Equal)),
+                3 if op.starts_with('<') => ts.sort_by(|a, b| num(a).partial_cmp(&num(b)).unwrap_or(std::cmp::Ordering::Equal)),
+                3 => ts.sort_by(|a, b| num(b).partial_cmp(&num(a)).unwrap_or(std::cmp::Ordering::Equal)),
+                _ => {}
+            }
+            let leaf = |rng: &mut Rng, k: usize| -> String {
+                match rng.below(9) {
+                    0 if depth < 2 => chain(rng, lits, depth + 1),
+                    1 => "id()".into(),
+                    2 => format!("\"s{k}\""),
+                    3 => "lat()".into(),
+                    4 => format!("id()*{}", k + 2),
+                    _ => k.to_string(),
+                }
+            };
+            let mut e = leaf(rng, n);
+            for k in (0..n).rev() {
+                // now and then a level of another form
+                let c = match rng.below(24) {
+                    0 => format!("{}{op}{}", if lat { "lon()" } else { "lat()" }, ts[k]),
+                    1 => format!("{}=={}", if lat { "lat()" } else { "lon()" }, ts[k]),
+                    2 => format!("{}{op}{}", ts[k], if lat { "lat()" } else { "lon()" }),
+                    3 => format!("{}{}{}", if lat { "lat()" } else { "lon()" }, ["<", "<=", ">", ">="][rng.below(4) as usize], ts[k]),
+                    4 => format!("lat()<lon()"),
+                    5 => format!("{}!={}", if lat { "lat()" } else { "lon()" }, ts[k]),
+                    _ => format!("{}{op}{}", if lat { "lat()" } else { "lon()" }, ts[k]),
+                };
+                let l = leaf(rng, k);
+                e = format!("({c}?{l}:{e})");
+            }
+            e
+        }
+        let (mut hits, mut errors) = (0usize, 0usize);
+        for round in 0..1500 {
+            let m = 1 + rng.below(6) as usize;
+            let cols: Vec<String> = (0..m).map(|_| chain(&mut rng, &lits, 0)).collect();
+            let names: Vec<String> = (0..m).map(|k| format!("c{k}")).collect();
+            let entries: Vec<String> = cols.iter().enumerate().map(|(k, e)| format!("c{k}={e}")).collect();
+            let box_ = "(48.819,2.319,48.841,2.341)";
+            let q = match rng.below(5) {
+                0 => format!("[out:csv(v,n;false)];node{box_};for({}){{make c v=_.val,n=count(nodes);out;}}", cols[0]),
+                1 => format!("[out:csv(::id;false)];node{box_}(if:({})==({}));out;", cols[0], cols[m - 1]),
+                2 => format!("[out:csv(::id,{};false)];(node{box_};way{box_};);convert r ::id=id(),{};out;", names.join(","), entries.join(",")),
+                _ => format!("[out:csv(::id,{};false)];node{box_};convert r ::id=id(),{};out;", names.join(","), entries.join(",")),
+            };
+            CHAINS_OFF.set(true);
+            let plain = output_or_rejected(&db, &q);
+            CHAINS_OFF.set(false);
+            CHAIN_HITS.set(0);
+            let got = output_or_rejected(&db, &q);
+            assert_eq!(got, plain, "round {round}: {q}");
+            hits += (CHAIN_HITS.get() > 0) as usize;
+            errors += (plain.contains("error") || plain.starts_with("REJECTED")) as usize;
+        }
+        eprintln!("rv_chains_random: {hits} queries used chains, {errors} with errors");
+        assert!(hits > 300, "{hits}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Patch 02: random boxes (edges on nodes, a step of 1e-7 beside them,
+    /// the antimeridian, the poles, south above north, global bbox) give
+    /// the answers of the geometry test after the scan.
+    #[test]
+    #[ignore]
+    fn rv_node_box_random() {
+        let far = "<node id=\"300001\" lat=\"10.0\" lon=\"179.9995\" {m}/><node id=\"300002\" lat=\"10.0\" lon=\"-179.9995\" {m}/><node id=\"300003\" lat=\"10.0\" lon=\"180.0\" {m}/><node id=\"300004\" lat=\"10.0\" lon=\"-180.0\" {m}/><node id=\"300005\" lat=\"10.0005\" lon=\"179.0\" {m}><tag k=\"name\" v=\"x\"/></node><node id=\"300006\" lat=\"90.0\" lon=\"0.0\" {m}/><node id=\"300007\" lat=\"-90.0\" lon=\"0.0\" {m}/><node id=\"300008\" lat=\"89.9999999\" lon=\"180.0\" {m}/><node id=\"300009\" lat=\"-89.9999999\" lon=\"-180.0\" {m}/><node id=\"300010\" lat=\"48.8400500\" lon=\"2.3400501\" {m}/>\n";
+        let (db, dir) = osm_db("rv-node-box", &grid_osm_with(far, "", ""));
+        let mut rng = Rng(0x1234_5678_9ABC_DEF1);
+        let lat = |rng: &mut Rng| -> String {
+            match rng.below(10) {
+                0..=4 => format!("{:.5}", 48.84005 + rng.below(200) as f64 * 0.0001),
+                5 => format!("{:.7}", 48.84005 + rng.below(200) as f64 * 0.0001 + [1e-7, -1e-7][rng.below(2) as usize]),
+                6 => format!("{:.3}", 48.82 + rng.below(30) as f64 * 0.002),
+                7 => rng.pick(&["90", "-90", "89.9999999", "-89.9999999", "10.0", "9.9", "10.1"]).to_string(),
+                _ => format!("{:.8}", 48.84 + rng.below(1000) as f64 * 0.00002),
+            }
+        };
+        let lon = |rng: &mut Rng| -> String {
+            match rng.below(10) {
+                0..=4 => format!("{:.5}", 2.34005 + rng.below(200) as f64 * 0.0001),
+                5 => format!("{:.7}", 2.34005 + rng.below(200) as f64 * 0.0001 + [1e-7, -1e-7][rng.below(2) as usize]),
+                6 => format!("{:.3}", 2.32 + rng.below(30) as f64 * 0.002),
+                7 => rng.pick(&["180", "-180", "179.9995", "-179.9995", "179.9", "-179.9", "0"]).to_string(),
+                _ => format!("{:.8}", 2.34 + rng.below(1000) as f64 * 0.00002),
+            }
+        };
+        let bbox = |rng: &mut Rng| -> String {
+            let (mut s, mut n) = (lat(rng), lat(rng));
+            if rng.below(6) != 0 && s.parse::<f64>().unwrap() > n.parse::<f64>().unwrap() {
+                std::mem::swap(&mut s, &mut n);
+            }
+            let (mut w, mut e) = (lon(rng), lon(rng));
+            if rng.below(4) != 0 && w.parse::<f64>().unwrap() > e.parse::<f64>().unwrap() {
+                std::mem::swap(&mut w, &mut e);
+            }
+            format!("({s},{w},{n},{e})")
+        };
+        let c = "[out:csv(::type,::id;false)]";
+        let (mut lines, mut errors) = (0usize, 0usize);
+        for round in 0..3000 {
+            let (b, b2) = (bbox(&mut rng), bbox(&mut rng));
+            let q = match rng.below(9) {
+                0 => format!("{c};node{b}{b2};out;"),
+                1 => format!("[bbox:{}]{c};node{b};out;", &b2[1..b2.len() - 1]),
+                2 => format!("{c};node{b}(around:150,48.841,2.341);out;"),
+                3 => format!("{c};node{b}[!name];out;"),
+                4 => format!("{c};node{b}(if:id()<100100);out;"),
+                5 => format!("{c};(node{b};way{b};rel{b};);out;"),
+                6 => format!("{c};node{b}->.a;way(bn.a);out;node.a{b2};out;"),
+                7 => format!("{c};node{b}(poly:\"48.84 2.34 48.86 2.34 48.85 2.36\");out;"),
+                _ => format!("{c};node{b};out;"),
+            };
+            NODE_BOX_PLAIN.set(true);
+            let plain = output_or_rejected(&db, &q);
+            NODE_BOX_PLAIN.set(false);
+            let got = output_or_rejected(&db, &q);
+            assert_eq!(got, plain, "round {round}: {q}");
+            lines += plain.lines().count();
+            errors += (plain.contains("error") || plain.starts_with("REJECTED")) as usize;
+        }
+        eprintln!("rv_node_box_random: {lines} lines, {errors} with errors");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+}
+
+/// Review tests (rv-around): differential fuzz of the around changes.
+#[cfg(test)]
+mod rv_tests {
+    use super::*;
+    use crate::geo::{Pt, great_circle_dist, ARC_TO_METER};
+    use rustc_hash::FxHashMap;
+
+    struct Rng(u64);
+    impl Rng {
+        fn f(&mut self) -> f64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            (self.0 >> 11) as f64 / (1u64 << 53) as f64
+        }
+    }
+
+    fn wrap(lon: f64) -> f64 {
+        let l = (lon + 180.0).rem_euclid(360.0) - 180.0;
+        if l == -180.0 && lon > 0.0 { 180.0 } else { l }
+    }
+
+    fn dest(lat: f64, lon: f64, bearing: f64, dist: f64) -> (f64, f64) {
+        let (p1, l1, th, d) = (lat.to_radians(), lon.to_radians(), bearing, dist / ARC_TO_METER);
+        let p2 = (p1.sin() * d.cos() + p1.cos() * d.sin() * th.cos()).clamp(-1.0, 1.0).asin();
+        let l2 = l1 + (th.sin() * d.sin() * p1.cos()).atan2(d.cos() - p1.sin() * p2.sin());
+        (p2.to_degrees().clamp(-90.0, 90.0), wrap(l2.to_degrees()))
+    }
+
+    fn grow(r: &Rect) -> Rect {
+        Rect { y0: r.y0.saturating_sub(1), x0: r.x0.saturating_sub(1), y1: r.y1.saturating_add(1), x1: r.x1.saturating_add(1) }
+    }
+
+    /// The fine source of `Engine::around_fine`, from a position map.
+    fn fine_of(src: &AroundSource, pos: &FxHashMap<Id, Pt>, boxes: &[Rect], r: f64) -> Option<AroundSource> {
+        let ways = src.lazy_near(boxes);
+        if ways.is_empty() {
+            return None;
+        }
+        let mut fine = AroundSource::default();
+        let mut pts = Vec::new();
+        for w in ways {
+            pts.clear();
+            if w.iter().all(|id| pos.get(id).map(|p| pts.push((p.lat(), p.lon()))).is_some()) {
+                fine.add_line(&pts);
+            }
+        }
+        fine.prepare_index(r);
+        Some(fine)
+    }
+
+    /// Patch 06: a source with lazy ways answers as the source with all
+    /// vertices, at the poles, near the antimeridian, for radii from 0 to
+    /// 2000 km, for points, lines and relations, tested in batches; and every
+    /// candidate that passes lies in the cover and in the cells.
+    #[test]
+    #[ignore = "randomized, about 11 s: cargo test --release --lib rv_lazy_ways_match_all_vertices -- --ignored"]
+    fn rv_lazy_ways_match_all_vertices() {
+        let mut rng = Rng(0x1234_5678_9abc_def1);
+        let places: [(f64, f64); 10] = [(47.0, 8.0), (0.0, 0.0), (70.0, 20.0), (84.9, -40.0), (89.95, 10.0), (-89.93, 100.0), (60.0, 179.997), (-17.0, -179.997), (65.0, 180.0), (-60.0, 0.0)];
+        let radii: [f64; 9] = [0.0, 0.1, 1.0, 1.04, 10.0, 300.0, 5000.0, 100_000.0, 2_000_000.0];
+        let (mut hits, mut total, mut lazy_n) = (0usize, 0usize, 0usize);
+        for (pi, &(clat, clon)) in places.iter().enumerate() {
+            for &r in &radii {
+                let spread: f64 = 0.03;
+                let cos = clat.to_radians().cos().max(0.02);
+                let mut pos: FxHashMap<Id, Pt> = FxHashMap::default();
+                let mut lazy = AroundSource::default();
+                let mut plain = AroundSource::default();
+                let mut nid: Id = 1;
+                // a few nodes as points
+                for _ in 0..5 {
+                    let p = Pt::from_ll((clat + (rng.f() - 0.5) * spread).clamp(-90.0, 90.0), wrap(clon + (rng.f() - 0.5) * spread / cos));
+                    lazy.points.push((p.lat(), p.lon()));
+                    plain.points.push((p.lat(), p.lon()));
+                }
+                for k in 0..80 {
+                    let n = 1 + (rng.f() * 6.0) as usize;
+                    let (slat, slon) = (clat + (rng.f() - 0.5) * spread, clon + (rng.f() - 0.5) * spread / cos);
+                    let mut nodes = Vec::new();
+                    let mut first = None;
+                    for j in 0..n {
+                        // closed ways, repeated nodes, a missing node
+                        if j == n - 1 && n > 3 && k % 5 == 0 {
+                            nodes.push(first.unwrap());
+                            continue;
+                        }
+                        if j > 0 && k % 7 == 1 && j == 1 {
+                            nodes.push(*nodes.last().unwrap());
+                            continue;
+                        }
+                        let p = Pt::from_ll((slat + (rng.f() - 0.5) * 0.008).clamp(-90.0, 90.0), wrap(slon + (rng.f() - 0.5) * 0.008 / cos));
+                        pos.insert(nid, p);
+                        nodes.push(nid);
+                        first.get_or_insert(nid);
+                        nid += 1;
+                    }
+                    if k % 13 == 3 {
+                        nodes.push(999_999_999);
+                    }
+                    let mut bbox = Rect::EMPTY;
+                    let mut missing = false;
+                    for id in &nodes {
+                        match pos.get(id) {
+                            Some(p) => bbox.extend(*p),
+                            None => missing = true,
+                        }
+                    }
+                    let w = Way { id: k as Id, nodes, tags: Default::default(), bbox, idx: 0, missing };
+                    let geom = EGeom::Line(w.nodes.iter().map(|id| pos.get(id).copied()).collect());
+                    plain.add(&geom);
+                    if bbox.is_empty() {
+                        continue;
+                    }
+                    let is_lazy = !w.bbox.may_cross() && (w.bbox.y1 >> 16) - (w.bbox.y0 >> 16) < LAZY_TILES && (w.bbox.x1 >> 16) - (w.bbox.x0 >> 16) < LAZY_TILES;
+                    if is_lazy {
+                        lazy.add_lazy(&w);
+                        lazy_n += 1;
+                    } else {
+                        lazy.add(&geom);
+                    }
+                }
+                lazy.prepare(r);
+                plain.prepare(r);
+                let rects = lazy.bbox_rects(r).into_owned();
+                let deg = r * 360.0 / 40_000_000.0;
+                // candidates in batches of 16
+                let mut batch: Vec<EGeom> = Vec::new();
+                for c in 0..1600 {
+                    let reach = (deg * 1.3 + spread * 0.7).min(170.0);
+                    let rp = |rng: &mut Rng| Pt::from_ll((clat + (rng.f() - 0.5) * 2.0 * reach).clamp(-90.0, 90.0), wrap(clon + (rng.f() - 0.5) * 2.0 * reach / cos));
+                    let p = rp(&mut rng);
+                    let g = match c % 6 {
+                        0 | 1 => EGeom::Point(p),
+                        2 => EGeom::Line(vec![Some(p), Some(Pt::from_ll((p.lat() + (rng.f() - 0.5) * 0.01).clamp(-90.0, 90.0), wrap(p.lon() + (rng.f() - 0.5) * 0.01)))]),
+                        3 => EGeom::Line(vec![Some(p), Some(rp(&mut rng)), Some(rp(&mut rng))]),
+                        4 => EGeom::Line(vec![Some(p), Some(Pt::from_ll(p.lat(), wrap(p.lon() + 0.02 * (rng.f() - 0.5) + if pi >= 6 && pi <= 8 { 180.0 } else { 0.0 })))]),
+                        _ => EGeom::Multi { points: vec![rp(&mut rng)], lines: vec![vec![Some(p), Some(rp(&mut rng))], vec![Some(rp(&mut rng)), None]] },
+                    };
+                    batch.push(g);
+                    if batch.len() < 16 {
+                        continue;
+                    }
+                    let boxes: Vec<Rect> = batch.iter().filter_map(geom_box).collect();
+                    let fine = fine_of(&lazy, &pos, &boxes, r);
+                    for g in batch.drain(..) {
+                        let want = around_match(&plain, &g, r);
+                        let got = around_match_with(&lazy, fine.as_ref(), &g, r);
+                        assert_eq!(got, want, "place {clat},{clon} radius {r}: {g:?}");
+                        total += 1;
+                        hits += want as usize;
+                        if want {
+                            let mut b = Rect::EMPTY;
+                            for q in g.points() {
+                                b.extend(q);
+                            }
+                            let a = if matches!(g, EGeom::Point(_)) { b } else { b.arc_box() };
+                            if !a.may_cross() {
+                                assert!(rects.iter().any(|x| grow(x).intersects(&a)), "outside the cover: place {clat},{clon} radius {r}: {g:?}");
+                                assert!(lazy.near_box(&rects, &a), "outside the cells: place {clat},{clon} radius {r}: {g:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("rv_lazy: {hits} hits of {total}, {lazy_n} lazy ways");
+        assert!(hits > 5000 && hits < total - 5000, "{hits} {total}");
+    }
+
+    /// Patch 08: the bounds before the distance do not change any answer at
+    /// the boundary of the circle, for points on the quantized grid next to
+    /// the boundary, at small and large radii and near the poles.
+    #[test]
+    fn rv_point_bounds_at_the_boundary() {
+        let mut rng = Rng(0x2545_f491_4f6c_dd1d);
+        let exact = |c: (f64, f64), p: Pt, r: f64| (r > 0.0 && great_circle_dist(c.0, c.1, p.lat(), p.lon()) <= r) || ((c.0 - p.lat()).abs() < 1e-7 && (c.1 - p.lon()).abs() < 1e-7);
+        let mut checked = 0usize;
+        let mut ins = 0usize;
+        for r in [0.0f64, 0.05, 0.1, 0.5, 0.999, 1.0, 1.0000001, 1.01, 1.05, 1.5, 2.0, 7.3, 100.0, 12_345.0, 1e6, 5e6, 9.5e6, 9.6e6, 1e7, 1.9e7] {
+            for (lat, lon) in [(0.0f64, 0.0f64), (47.3, 8.5), (-33.9, 151.2), (80.0, -170.0), (89.99, 45.0), (89.99999, 0.0), (-89.9999, 179.9999), (90.0, 0.0), (-90.0, 10.0), (12.0, 179.99999)] {
+                let c = Pt::from_ll(lat, lon);
+                let c = (c.lat(), c.lon());
+                let mut src = AroundSource::default();
+                src.points.push(c);
+                src.prepare(r);
+                for _ in 0..150 {
+                    let dir = rng.f() * std::f64::consts::TAU;
+                    // bisection on the distance along the direction
+                    let (mut lo, mut hi) = (0.0f64, (r * 1.5).max(0.5));
+                    for _ in 0..80 {
+                        let mid = (lo + hi) / 2.0;
+                        let (a, b) = dest(c.0, c.1, dir, mid);
+                        if great_circle_dist(c.0, c.1, a, b) <= r { lo = mid } else { hi = mid }
+                    }
+                    let (a, b) = dest(c.0, c.1, dir, lo);
+                    let q = Pt::from_ll(a, b);
+                    for dy in -2i64..=2 {
+                        for dx in -2i64..=2 {
+                            let y = (q.y as i64 + dy).clamp(Pt::from_ll(-90.0, 0.0).y as i64, Pt::from_ll(90.0, 0.0).y as i64) as u32;
+                            let x = (q.x as i64 + dx).clamp(Pt::from_ll(0.0, -180.0).x as i64, Pt::from_ll(0.0, 180.0).x as i64) as u32;
+                            let p = Pt { y, x };
+                            let want = exact(c, p, r);
+                            assert_eq!(around_match(&src, &EGeom::Point(p), r), want, "radius {r} at {c:?}: {} {}", p.lat(), p.lon());
+                            checked += 1;
+                            ins += want as usize;
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("rv_bounds: {checked} checked, {ins} inside");
+        assert!(ins > 10_000 && checked - ins > 10_000);
+    }
+
+    /// Patch 04 (and 03): long segments in pieces. Every point and short line
+    /// that passes lies in the cover and in the cells, the index answers as
+    /// the scan, and a polyline answers as segments tested at both ends.
+    #[test]
+    fn rv_long_segments_cover_fuzz() {
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let mut hits = 0usize;
+        let mut cut = 0usize;
+        for case in 0..400 {
+            let r: f64 = [0.0, 1.0, 25.0, 700.0, 5000.0, 50_000.0, 500_000.0][case % 7];
+            let a = ((rng.f() - 0.5) * 168.0, (rng.f() - 0.5) * 360.0);
+            let len = [5e3, 5e4, 3e5, 1e6, 3e6, 9e6][(case / 7) % 6] * (0.5 + rng.f());
+            let b = dest(a.0, a.1, rng.f() * std::f64::consts::TAU, len);
+            // special cases: exactly 180 degrees apart, ends at the antimeridian
+            let (a, b) = match case % 23 {
+                0 => ((a.0 * 0.5, 170.0), (a.0 * 0.5 + 10.0, -10.0)),
+                1 => ((a.0 * 0.5, 179.5), (a.0 * 0.5 + 3.0, 170.0)),
+                2 => ((83.0, a.1), (84.5, wrap(a.1 + 170.0))),
+                _ => (a, b),
+            };
+            let qa = Pt::from_ll(a.0, a.1);
+            let qb = Pt::from_ll(b.0, b.1);
+            let (a, b) = ((qa.lat(), qa.lon()), (qb.lat(), qb.lon()));
+            let mid = dest(a.0, a.1, rng.f() * std::f64::consts::TAU, len * 0.3);
+            let qm = Pt::from_ll(mid.0, mid.1);
+            let mid = (qm.lat(), qm.lon());
+            // a polyline a - b - mid, and the same with both ends tested
+            let mut line = AroundSource::default();
+            line.add_line(&[a, b, mid]);
+            let mut both = AroundSource::default();
+            both.segments.push(crate::geo::Segment::new(a.0, a.1, b.0, b.1));
+            both.segments.push(crate::geo::Segment::new(b.0, b.1, mid.0, mid.1));
+            // indexed copy with more segments far away
+            let mut many = AroundSource::default();
+            many.add_line(&[a, b, mid]);
+            for _ in 0..40 {
+                let c = (-a.0 * 0.5, wrap(a.1 + 90.0 + rng.f()));
+                many.add_line(&[c, (c.0 + 0.001, wrap(c.1 + 0.001))]);
+            }
+            let mut plain_many = AroundSource::default();
+            plain_many.segments = many.segments.clone();
+            line.prepare(r);
+            many.prepare(r);
+            let rects = line.bbox_rects(r).into_owned();
+            cut += (rects.len() > 6) as usize;
+            let many_rects = many.bbox_rects(r).into_owned();
+            let (ca, cb, cm) = (crate::geo::cartesian(a.0, a.1), crate::geo::cartesian(b.0, b.1), crate::geo::cartesian(mid.0, mid.1));
+            for k in 0..600 {
+                let (u, v) = if k % 2 == 0 { (ca, cb) } else { (cb, cm) };
+                let t = rng.f() * 1.04 - 0.02;
+                let w = u.scale(1.0 - t).add(&v.scale(t));
+                let w = w.scale(1.0 / w.dot(&w).sqrt());
+                let (plat, plon) = (w.0.asin().to_degrees(), w.1.atan2(w.2).to_degrees());
+                let off = r * [1.0, 0.999, 1.001, 1.02, 0.5][k % 5] + rng.f() * 2.0;
+                let (qlat, qlon) = dest(plat, plon, rng.f() * std::f64::consts::TAU, off);
+                let p = Pt::from_ll(qlat, qlon);
+                let q = Pt::from_ll((p.lat() + (rng.f() - 0.5) * 0.002).clamp(-90.0, 90.0), wrap(p.lon() + (rng.f() - 0.5) * 0.002));
+                for g in [EGeom::Point(p), EGeom::Line(vec![Some(p), Some(q)])] {
+                    let want = around_match(&both, &g, r);
+                    assert_eq!(around_match(&line, &g, r), want, "case {case} {a:?} {b:?} {mid:?} r {r}: {g:?}");
+                    assert_eq!(around_match(&many, &g, r), around_match(&plain_many, &g, r), "index: case {case} {a:?} {b:?} r {r}: {g:?}");
+                    if want {
+                        hits += 1;
+                        let mut bx = Rect::point(p);
+                        if matches!(g, EGeom::Line(_)) {
+                            bx.extend(q);
+                        }
+                        let bx = if matches!(g, EGeom::Point(_)) { bx } else { bx.arc_box() };
+                        if !bx.may_cross() {
+                            assert!(rects.iter().any(|x| grow(x).intersects(&bx)), "outside the cover: case {case} {a:?} {b:?} {mid:?} r {r}: {g:?}");
+                            assert!(many.near_box(&many_rects, &bx), "outside the cells: case {case} {a:?} {b:?} {mid:?} r {r}: {g:?}");
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("rv_long: {hits} hits, {cut} cut covers");
+        assert!(hits > 50_000 && cut > 50, "{hits} {cut}");
     }
 }

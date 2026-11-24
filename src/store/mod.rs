@@ -383,33 +383,127 @@ fn check_format(path: &Path, found: Option<&[u8]>) -> Result<()> {
 // ---------------------------------------------------------------------------
 // Chunk lookups shared by snapshots and write transactions.
 
-/// Chunks that may hold elements in the ranges (sorted by level and start),
-/// each once, in key order.
-fn chunks_in_ranges<'t>(db: Database<Bytes, Bytes>, txn: &'t RoTxn, ranges: &[CodeRange]) -> Result<Vec<&'t [u8]>> {
-    let mut out = Vec::new();
-    let mut last: Option<ChunkKey> = None;
+/// The entries of `db` that hold keys of the cell ranges (ascending), each
+/// once, in key order. `key` writes the low or the high key (`true`) of a
+/// range; the cell is 5 bytes at `cell_at` in every key. An entry holds
+/// the keys from its own up to that of the next entry (a chunk its
+/// elements, a tag index entry its cells): the entries of a range are the
+/// last one at or before its low key, when `holder` accepts that key, and
+/// those up to its high key. Entries at or before `after` are left out,
+/// and none at or past `upper` is read. `visit` gets key and value, and
+/// stops the walk with false (which is then returned).
+///
+/// One cursor walks the entries along the ranges. A search per range
+/// (two, in fact) cost a statement over a country area tens of thousands
+/// of searches per tag value, also for a value with one entry, and a
+/// region scan as many per element kind. `next` is the first entry after
+/// `last` (the last one visited or stepped over) once the cursor is
+/// placed: a range that ends before its cell costs one comparison.
+/// Entries before the one that holds the low key of a range are stepped
+/// over, up to STEPS of them per range; then a search places the cursor
+/// anew (few ranges among many entries).
+#[allow(clippy::too_many_arguments)]
+fn walk_ranges<'t>(db: Database<Bytes, Bytes>, txn: &'t RoTxn, upper: Bound<&[u8]>, after: Option<&[u8]>, ranges: &[CodeRange], cell_at: usize, key: impl Fn(&CodeRange, bool, &mut Vec<u8>), holder: impl Fn(&[u8]) -> bool, mut visit: impl FnMut(&'t [u8], &'t [u8]) -> Result<bool>) -> Result<bool> {
+    const STEPS: usize = 16;
+    let mut last: Option<Vec<u8>> = after.map(|a| a.to_vec());
+    let seen = |last: &mut Option<Vec<u8>>, k: &[u8]| match last {
+        Some(l) => {
+            l.clear();
+            l.extend_from_slice(k);
+        }
+        None => *last = Some(k.to_vec()),
+    };
+    let (mut lo, mut hi) = (Vec::new(), Vec::new());
+    let mut cursor: Option<heed::RoRange<'t, Bytes, Bytes>> = None;
+    let mut next: Option<(&'t [u8], &'t [u8])> = None;
     for r in ranges {
-        let lo = chunk_key(Cell { level: r.level, code: r.lo }, 0);
-        let hi = chunk_key(Cell { level: r.level, code: r.hi }, u64::MAX);
-        if last.is_some_and(|l| l >= hi) {
+        if cursor.is_some() {
+            // nothing after the last entry: no later range has any
+            let Some((k, _)) = next else { return Ok(true) };
+            // the next entry lies in a cell after the range: the entries
+            // up to the high key have been visited
+            if k.get(cell_at..cell_at + 5).is_some_and(|c| c > &Cell { level: r.level, code: r.hi }.to_bytes()[..]) {
+                continue;
+            }
+        }
+        key(r, true, &mut hi);
+        if last.as_ref().is_some_and(|l| *l >= hi) {
             continue;
         }
-        // The chunk holding the start of the range may begin before it.
-        let start = match db.get_lower_than_or_equal_to(txn, &lo)? {
-            Some((k, _)) => to_chunk_key(k)?,
-            None => lo,
-        };
-        let prev = last;
-        let lower = match &prev {
-            Some(l) if *l >= start => Bound::Excluded(&l[..]),
-            _ => Bound::Included(&start[..]),
-        };
-        for item in db.range(txn, &(lower, Bound::Included(&hi[..])))? {
-            let (k, v) = item?;
-            out.push(v);
-            last = Some(to_chunk_key(k)?);
+        key(r, false, &mut lo);
+        let mut placed = false;
+        if let Some(it) = cursor.as_mut() {
+            let mut steps = 0;
+            loop {
+                let Some((k, v)) = next else { return Ok(true) };
+                if k >= &lo[..] {
+                    // in the range, or past its low key: then the entry
+                    // that holds the low key is the one before, which was
+                    // visited (an entry is stepped over only when the
+                    // next one is at or before the low key too)
+                    placed = true;
+                    break;
+                }
+                if steps == STEPS {
+                    break;
+                }
+                steps += 1;
+                let following = it.next().transpose()?;
+                seen(&mut last, k);
+                next = following;
+                if following.is_some_and(|(n, _)| n <= &lo[..]) {
+                    // not the entry that holds the low key
+                    continue;
+                }
+                // the entry that holds the low key of the range
+                if holder(k) && !visit(k, v)? {
+                    return Ok(false);
+                }
+                placed = true;
+                break;
+            }
+        }
+        if !placed {
+            let start = match db.get_lower_than_or_equal_to(txn, &lo)? {
+                Some((k, _)) if holder(k) => k,
+                _ => &lo[..],
+            };
+            let lower = match &last {
+                Some(l) if l.as_slice() >= start => Bound::Excluded(l.as_slice()),
+                _ => Bound::Included(start),
+            };
+            let mut it = db.range(txn, &(lower, upper))?;
+            next = it.next().transpose()?;
+            cursor = Some(it);
+        }
+        let Some(it) = cursor.as_mut() else { continue };
+        while let Some((k, v)) = next {
+            if k > &hi[..] {
+                break;
+            }
+            seen(&mut last, k);
+            next = it.next().transpose()?;
+            if !visit(k, v)? {
+                return Ok(false);
+            }
         }
     }
+    Ok(true)
+}
+
+/// Chunks that may hold elements in the ranges (sorted by level and start),
+/// each once, in key order (`walk_ranges`).
+fn chunks_in_ranges<'t>(db: Database<Bytes, Bytes>, txn: &'t RoTxn, ranges: &[CodeRange]) -> Result<Vec<&'t [u8]>> {
+    let mut out = Vec::new();
+    let key = |r: &CodeRange, high: bool, k: &mut Vec<u8>| {
+        k.clear();
+        k.extend_from_slice(&if high { chunk_key(Cell { level: r.level, code: r.hi }, u64::MAX) } else { chunk_key(Cell { level: r.level, code: r.lo }, 0) });
+    };
+    walk_ranges(db, txn, Bound::Unbounded, None, ranges, 0, key, |_| true, |k, v| {
+        to_chunk_key(k)?;
+        out.push(v);
+        Ok(true)
+    })?;
     Ok(out)
 }
 
@@ -477,21 +571,106 @@ fn chunks_for_pairs<'t>(db: Database<Bytes, Bytes>, txn: &'t RoTxn, pairs: &[(Ce
     Ok(out)
 }
 
-/// (id, cell) of the ids found in the id index (ids sorted and unique).
-fn lookup_cells(db: Database<Bytes, Bytes>, txn: &RoTxn, sorted: &[Id]) -> Result<Vec<(Id, Cell)>> {
-    let mut out = Vec::with_capacity(sorted.len());
-    let mut wanted = Vec::new();
+/// Buckets of the id index picked on the thread pool as one item.
+const LOOKUP_GROUP: usize = 64;
+
+/// Fewer buckets than this are picked on the calling thread.
+const LOOKUP_PAR_MIN: usize = 512;
+
+/// The buckets of the id index that hold the ids (sorted and unique): the
+/// range of each bucket in `sorted` and its value. A bucket up to `STEPS`
+/// entries after the last one is reached by stepping a cursor, which
+/// costs less than a search from the root of the tree (the nodes of the
+/// ways of a town lie in neighbouring buckets).
+fn id_buckets<'t>(db: Database<Bytes, Bytes>, txn: &'t RoTxn, sorted: &[Id]) -> Result<Vec<(std::ops::Range<usize>, &'t [u8])>> {
+    const STEPS: u64 = 4;
+    let mut out = Vec::new();
+    // a cursor after the bucket `at`
+    let mut cursor: Option<heed::RoRange<Bytes, Bytes>> = None;
+    let mut at = 0u64;
     let mut i = 0;
     while i < sorted.len() {
         let (start, bucket) = (i, sorted[i] >> codec::ID_BUCKET_BITS);
-        wanted.clear();
         while i < sorted.len() && sorted[i] >> codec::ID_BUCKET_BITS == bucket {
-            wanted.push((sorted[i] & ((1 << codec::ID_BUCKET_BITS) - 1)) as u16);
             i += 1;
         }
-        if let Some(v) = db.get(txn, &bucket.to_be_bytes())? {
-            codec::pick_id_bucket(v, &wanted, |j, c| out.push((sorted[start + j], c)))?;
+        let mut found = None;
+        let mut stepped = false;
+        if let Some(it) = cursor.as_mut().filter(|_| bucket > at && bucket - at <= STEPS) {
+            for _ in 0..STEPS {
+                match it.next() {
+                    Some(e) => {
+                        let (k, v) = e?;
+                        let k = u64::from_be_bytes(k.try_into().map_err(|_| anyhow::anyhow!("corrupt id index key"))?);
+                        at = k;
+                        if k == bucket {
+                            found = Some(v);
+                        }
+                        if k >= bucket {
+                            break;
+                        }
+                    }
+                    None => {
+                        at = u64::MAX;
+                        break;
+                    }
+                }
+            }
+            // the cursor is at or past the bucket now (keys are bucket
+            // numbers, each step goes up by one at least); else search
+            stepped = at >= bucket;
         }
+        if !stepped {
+            let key = bucket.to_be_bytes();
+            let mut it = db.range(txn, &(Bound::Included(&key[..]), Bound::Unbounded))?;
+            match it.next() {
+                Some(e) => {
+                    let (k, v) = e?;
+                    let k = u64::from_be_bytes(k.try_into().map_err(|_| anyhow::anyhow!("corrupt id index key"))?);
+                    at = k;
+                    if k == bucket {
+                        found = Some(v);
+                    }
+                }
+                None => at = u64::MAX,
+            }
+            cursor = Some(it);
+        }
+        if let Some(v) = found {
+            out.push((start..i, v));
+        }
+    }
+    Ok(out)
+}
+
+/// (id, cell) of the ids found in the id index (ids sorted and unique).
+/// The buckets are found on the calling thread (a transaction belongs to
+/// one thread) and, when there are many, picked on the thread pool.
+fn lookup_cells(db: Database<Bytes, Bytes>, txn: &RoTxn, sorted: &[Id]) -> Result<Vec<(Id, Cell)>> {
+    let buckets = id_buckets(db, txn, sorted)?;
+    let pick = |part: &[(std::ops::Range<usize>, &[u8])], out: &mut Vec<(Id, Cell)>| -> Result<()> {
+        let mut wanted: Vec<u16> = Vec::new();
+        for (range, v) in part {
+            let ids = &sorted[range.clone()];
+            wanted.clear();
+            wanted.extend(ids.iter().map(|id| (id & ((1 << codec::ID_BUCKET_BITS) - 1)) as u16));
+            codec::pick_id_bucket(v, &wanted, |j, c| out.push((ids[j], c)))?;
+        }
+        Ok(())
+    };
+    let mut out = Vec::with_capacity(sorted.len());
+    if buckets.len() < LOOKUP_PAR_MIN {
+        pick(&buckets, &mut out)?;
+        return Ok(out);
+    }
+    let groups: Vec<&[(std::ops::Range<usize>, &[u8])]> = buckets.chunks(LOOKUP_GROUP).collect();
+    let parts = crate::exec::par_map(&groups, 2, |part| -> Result<Vec<(Id, Cell)>> {
+        let mut found = Vec::with_capacity(part.iter().map(|(r, _)| r.len()).sum());
+        pick(part, &mut found)?;
+        Ok(found)
+    });
+    for part in parts {
+        out.extend(part?);
     }
     Ok(out)
 }
@@ -588,6 +767,14 @@ impl<'e> Snapshot<'e> {
     pub fn meta_chunks(&self, kind: Kind, ids: &[Id]) -> Result<Vec<(&[u8], Vec<Id>)>> {
         let pairs = sorted_pairs(self.cells_of(kind, ids)?);
         Ok(chunks_for_pairs(self.db.k(kind).meta, &self.txn, &pairs)?.into_iter().map(|(_, v, ids)| (v, ids)).collect())
+    }
+
+    /// Meta data chunks of elements at known (cell, id) positions (meta
+    /// data lies under the cell of its element), with the ids each holds
+    /// (sorted): `meta_chunks` without the id index. `pairs` are sorted
+    /// and unique; the chunks take them in order, each a run of them.
+    pub fn meta_chunks_at(&self, kind: Kind, pairs: &[(Cell, Id)]) -> Result<Vec<(&[u8], Vec<Id>)>> {
+        Ok(chunks_for_pairs(self.db.k(kind).meta, &self.txn, pairs)?.into_iter().map(|(_, v, ids)| (v, ids)).collect())
     }
 
     /// Tag index entries of `key` (and `value`), optionally only in cells
@@ -922,41 +1109,23 @@ impl<'e> Snapshot<'e> {
             }
             return Ok(Scan::Next);
         };
-        let mut last: Option<Vec<u8>> = after.map(|a| a.to_vec());
-        let at = |level: u8, code: u32| -> Vec<u8> {
-            let mut k = p.to_vec();
-            k.extend_from_slice(&Cell { level, code }.to_bytes());
-            k
+        // The entries of the value along the ranges (`walk_ranges`).
+        let past = successor(p);
+        let upper = if past.is_empty() { Bound::Unbounded } else { Bound::Excluded(&past[..]) };
+        let key = |r: &CodeRange, high: bool, k: &mut Vec<u8>| {
+            k.clear();
+            k.extend_from_slice(p);
+            k.extend_from_slice(&Cell { level: r.level, code: if high { r.hi } else { r.lo } }.to_bytes());
         };
-        for r in ranges {
-            let lo = at(r.level, r.lo);
-            let hi = at(r.level, r.hi);
-            if last.as_ref().is_some_and(|l| *l >= hi) {
-                continue;
+        let whole = |k: &[u8]| k.len() == p.len() + 5;
+        let mut end = Scan::Next;
+        walk_ranges(db, &self.txn, upper, after, ranges, p.len(), key, |k| k.starts_with(p) && whole(k), |k, v| {
+            if whole(k) {
+                end = visit_entry(p, vstart, k, v, Some(ranges), f)?;
             }
-            // The entry holding the start of the range may begin before it.
-            let start = match db.get_lower_than_or_equal_to(&self.txn, &lo)? {
-                Some((k, _)) if k.starts_with(p) && k.len() == p.len() + 5 => k.to_vec(),
-                _ => lo,
-            };
-            let prev = last.clone();
-            let lower = match &prev {
-                Some(l) if *l >= start => Bound::Excluded(&l[..]),
-                _ => Bound::Included(&start[..]),
-            };
-            for item in db.range(&self.txn, &(lower, Bound::Included(&hi[..])))? {
-                let (k, v) = item?;
-                last = Some(k.to_vec());
-                if k.len() != p.len() + 5 {
-                    continue;
-                }
-                match visit_entry(p, vstart, k, v, Some(ranges), f)? {
-                    Scan::Next => {}
-                    s => return Ok(s),
-                }
-            }
-        }
-        Ok(Scan::Next)
+            Ok(end == Scan::Next)
+        })?;
+        Ok(end)
     }
 
     /// Distinct tag keys of a kind (walks the index by seeking past each key).
@@ -1464,6 +1633,360 @@ fn area_block_key(tile: u32, id: u32) -> [u8; 8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The chunk lookup as it was before `walk_ranges`: two searches per range.
+    fn chunks_in_ranges_plain<'t>(db: Database<Bytes, Bytes>, txn: &'t RoTxn, ranges: &[CodeRange]) -> Vec<&'t [u8]> {
+        let mut out = Vec::new();
+        let mut last: Option<ChunkKey> = None;
+        for r in ranges {
+            let lo = chunk_key(Cell { level: r.level, code: r.lo }, 0);
+            let hi = chunk_key(Cell { level: r.level, code: r.hi }, u64::MAX);
+            if last.is_some_and(|l| l >= hi) {
+                continue;
+            }
+            let start = match db.get_lower_than_or_equal_to(txn, &lo).unwrap() {
+                Some((k, _)) => to_chunk_key(k).unwrap(),
+                None => lo,
+            };
+            let prev = last;
+            let lower = match &prev {
+                Some(l) if *l >= start => Bound::Excluded(&l[..]),
+                _ => Bound::Included(&start[..]),
+            };
+            for item in db.range(txn, &(lower, Bound::Included(&hi[..]))).unwrap() {
+                let (k, v) = item.unwrap();
+                out.push(v);
+                last = Some(to_chunk_key(k).unwrap());
+            }
+        }
+        out
+    }
+
+    /// Region scans and tag index scans over cell ranges (`walk_ranges`)
+    /// give what a search per range gave (chunks) and what a scan of the
+    /// whole value gives for the cells in the ranges (tag index), for few
+    /// and many ranges, of small and large rectangles, on nodes (one
+    /// level) and ways (all levels).
+    #[test]
+    fn range_walks_match_plain_scans() {
+        use crate::geo::Rect;
+        let dir = std::env::temp_dir().join(format!("store-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        // nodes in clusters over the world, a tag on most; ways of two
+        // nodes, short and long (stored at different levels)
+        let mut osm = String::from("<osm version=\"0.6\">\n");
+        let n = 120_000u64;
+        let mut pos = Vec::new();
+        let (mut clat, mut clon) = (0.0, 0.0);
+        for i in 0..n {
+            if i % 400 == 0 {
+                (clat, clon) = (-70.0 + rnd(14_000) as f64 / 100.0, -175.0 + rnd(35_000) as f64 / 100.0);
+            }
+            let (lat, lon) = (clat + rnd(2000) as f64 / 10_000.0, clon + rnd(2000) as f64 / 10_000.0);
+            pos.push((lat, lon));
+            let v = match rnd(60) {
+                0..20 => "a".to_string(),
+                20 => "b".to_string(),
+                21..30 => format!("u{}", rnd(5000)),
+                _ => String::new(),
+            };
+            let v = if i % 40_000 == 7 { "rare".to_string() } else { v };
+            let tag = if v.is_empty() { String::new() } else { format!("<tag k=\"k\" v=\"{v}\"/>") };
+            osm += &format!("<node id=\"{}\" lat=\"{lat:.5}\" lon=\"{lon:.5}\">{tag}</node>\n", i + 1);
+        }
+        for w in 0..30_000u64 {
+            let a = rnd(n);
+            let b = match rnd(10) {
+                0 => rnd(n),
+                1..4 => (a + 400 * rnd(30)) % n,
+                _ => (a + 1 + rnd(300)) % n,
+            };
+            let v = ["a", "b", "rare", "c"][[0, 0, 0, 0, 1, 3, 3, 3][rnd(8) as usize] + (w % 9000 == 5) as usize * 2 % 4];
+            osm += &format!("<way id=\"{}\"><nd ref=\"{}\"/><nd ref=\"{}\"/><tag k=\"k\" v=\"{v}\"/></way>\n", w + 1, a + 1, b + 1);
+        }
+        let file = dir.join("in.osm");
+        std::fs::write(&file, osm + "</osm>\n").unwrap();
+        let db = Db::open(&dir.join("db")).unwrap();
+        crate::import::import_file(&db, &file, &mut Default::default()).unwrap();
+        let snap = db.snapshot().unwrap();
+        assert!(snap.chunk_count(Kind::Node).unwrap() >= 40);
+        let (mut chunks_seen, mut cells_seen) = (0, 0);
+        for (count, size) in [(1, 0.01), (1, 30.0), (3, 0.5), (40, 0.02), (40, 3.0), (500, 0.001), (500, 0.3), (3000, 0.05), (3000, 0.0002), (20_000, 0.01)] {
+            for round in 0..3 {
+                // around nodes (hits) and anywhere (misses)
+                let rects: Vec<Rect> = (0..count)
+                    .map(|_| {
+                        let (lat, lon) = if rnd(4) > 0 || round == 2 { pos[rnd(n) as usize] } else { (-80.0 + rnd(1600) as f64 / 10.0, -179.0 + rnd(3500) as f64 / 10.0) };
+                        let p0 = crate::geo::Pt::from_ll((lat - size / 2.0).max(-89.0), (lon - size / 2.0).max(-179.9));
+                        let p1 = crate::geo::Pt::from_ll((lat + size / 2.0).min(89.0), (lon + size / 2.0).min(179.9));
+                        Rect { y0: p0.y, x0: p0.x, y1: p1.y, x1: p1.x }
+                    })
+                    .collect();
+                for kind in [Kind::Node, Kind::Way] {
+                    let ranges = crate::exec::fetch::ranges_for(kind, &rects);
+                    let got = chunks_in_ranges(db.k(kind).data, &snap.txn, &ranges).unwrap();
+                    let want = chunks_in_ranges_plain(db.k(kind).data, &snap.txn, &ranges);
+                    assert_eq!(got.iter().map(|v| v.as_ptr()).collect::<Vec<_>>(), want.iter().map(|v| v.as_ptr()).collect::<Vec<_>>(), "{kind:?} chunks of {count} rectangles of {size}");
+                    chunks_seen += got.len();
+                    for value in [Some("a"), Some("b"), Some("rare"), Some("c"), Some("none"), None] {
+                        let mut got: Vec<(Vec<u8>, Cell, Vec<Id>)> = Vec::new();
+                        snap.scan_tags(kind, "k", value, Some(&ranges), |val, cell, ids| {
+                            got.push((val.to_vec(), cell, ids.to_vec()));
+                            Ok(Scan::Next)
+                        })
+                        .unwrap();
+                        let mut want: Vec<(Vec<u8>, Cell, Vec<Id>)> = Vec::new();
+                        snap.scan_tags(kind, "k", value, None, |val, cell, ids| {
+                            if cell_in_ranges(cell, &ranges) {
+                                want.push((val.to_vec(), cell, ids.to_vec()));
+                            }
+                            Ok(Scan::Next)
+                        })
+                        .unwrap();
+                        assert_eq!(got, want, "{kind:?} k={value:?} in {count} rectangles of {size}");
+                        cells_seen += got.len();
+                    }
+                }
+            }
+        }
+        assert!(chunks_seen > 1000 && cells_seen > 10_000, "{chunks_seen} chunks, {cells_seen} cells");
+        drop(snap);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `cells_of` finds what a search and a full decode of each bucket
+    /// find: ids in neighbouring buckets (cursor steps), far apart (new
+    /// searches), in buckets and at ids that do not exist, few (picked on
+    /// the calling thread) and many (on the pool).
+    #[test]
+    fn cells_of_matches_a_plain_lookup() {
+        // long sections on the pool
+        let _one = crate::exec::tests::pool_test();
+        let dir = std::env::temp_dir().join(format!("store-cells-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // node ids in stretches with gaps of whole buckets between them
+        let mut ids: Vec<Id> = Vec::new();
+        let mut seed = 0x9E37_79B9_7F4A_7C15u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut id = 1u64;
+        while ids.len() < 400_000 {
+            let run = 1 + rnd(3000);
+            for _ in 0..run {
+                id += 1 + rnd(3) * rnd(2);
+                ids.push(id);
+            }
+            id += rnd(6) * 512 * rnd(2) + rnd(40_000) * (rnd(8) == 0) as u64;
+        }
+        let mut osm = String::from("<osm version=\"0.6\">\n");
+        for (i, id) in ids.iter().enumerate() {
+            osm += &format!("<node id=\"{id}\" lat=\"{:.4}\" lon=\"{:.4}\"/>\n", -80.0 + (i % 1600) as f64 * 0.1, -170.0 + (i / 1600) as f64 * 0.1 + rnd(5) as f64);
+        }
+        let file = dir.join("in.osm");
+        std::fs::write(&file, osm + "</osm>\n").unwrap();
+        let db = Db::open(&dir.join("db")).unwrap();
+        crate::import::import_file(&db, &file, &mut Default::default()).unwrap();
+        let snap = db.snapshot().unwrap();
+        let plain = |ids: &[Id]| -> Vec<(Id, Cell)> {
+            let mut sorted = ids.to_vec();
+            sorted.sort_unstable();
+            sorted.dedup();
+            let mut out = Vec::new();
+            for id in sorted {
+                if let Some(v) = db.k(Kind::Node).ids.get(&snap.txn, &(id >> codec::ID_BUCKET_BITS).to_be_bytes()).unwrap() {
+                    let lo = (id & ((1 << codec::ID_BUCKET_BITS) - 1)) as u16;
+                    out.extend(codec::decode_id_bucket(v).unwrap().into_iter().filter(|e| e.0 == lo).map(|e| (id, e.1)));
+                }
+            }
+            out
+        };
+        let last = *ids.last().unwrap();
+        let mut found_some = 0;
+        for (n, spread) in [(1, last), (10, last), (300, 5000), (300, last), (5000, 600_000), (20_000, last), (150_000, last), (700_000, last + 3_000_000)] {
+            for _ in 0..3 {
+                let from = rnd(last);
+                let want: Vec<Id> = (0..n).map(|_| from + rnd(spread)).collect();
+                let got = snap.cells_of(Kind::Node, &want).unwrap();
+                assert_eq!(got, plain(&want), "{n} ids over {spread}");
+                found_some += got.len();
+            }
+        }
+        // every id, and every second one
+        assert_eq!(snap.cells_of(Kind::Node, &ids).unwrap().len(), ids.len());
+        let half: Vec<Id> = ids.iter().step_by(2).copied().collect();
+        assert_eq!(snap.cells_of(Kind::Node, &half).unwrap(), plain(&half));
+        assert!(found_some > 100_000, "{found_some}");
+        drop(snap);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review (rv-area): `walk_ranges` against a plain model on small
+    /// random tables, with entries at the ends of the ranges, ranges at
+    /// every level (level 0, `hi` = u32::MAX), merged ranges and ranges
+    /// that overlap (sorted by level and start only, as `is_in` makes
+    /// them), with and without `after`, for chunk keys and tag keys (other
+    /// values around the one read).
+    #[test]
+    fn review_walk_ranges_model() {
+        let dir = std::env::temp_dir().join(format!("store-rvwalk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("db")).unwrap();
+        let mut seed = 0x0DDB_1A5E_5BAD_5EEDu64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n.max(1)
+        };
+        let (data, tags) = (db.k(Kind::Node).data, db.k(Kind::Node).tags);
+        let p: Vec<u8> = b"k\0v\0".to_vec();
+        let (mut visits, mut cases) = (0usize, 0usize);
+        for round in 0..3000 {
+            // ranges: a few levels, codes from a small pool so that they
+            // and the entries meet at their ends
+            let pool: Vec<u32> = (0..2 + rnd(12)).map(|_| match rnd(6) {
+                0 => 0,
+                1 => u32::MAX,
+                2 => u32::MAX - rnd(3) as u32,
+                _ => rnd(1 << 12) as u32 * 4096 + rnd(3) as u32,
+            }).collect();
+            let levels: Vec<u8> = (0..1 + rnd(3)).map(|_| if rnd(5) == 0 { 0 } else { [3u8, 9, 15, 16][rnd(4) as usize] }).collect();
+            let mut raw: Vec<CodeRange> = Vec::new();
+            for _ in 0..rnd(14) {
+                let level = levels[rnd(levels.len() as u64) as usize];
+                let (a, b) = (pool[rnd(pool.len() as u64) as usize], pool[rnd(pool.len() as u64) as usize]);
+                let (lo, hi) = (a.min(b), a.max(b).saturating_add(rnd(3) as u32));
+                raw.push(if level == 0 { CodeRange { level, lo: 0, hi: 0 } } else { CodeRange { level, lo, hi } });
+            }
+            let ranges = if round % 2 == 0 {
+                crate::geo::merge_ranges(raw)
+            } else {
+                // as `is_in`: sorted by level and start, exact copies removed
+                raw.sort_by_key(|r| (r.level, r.lo));
+                raw.dedup();
+                raw
+            };
+            // entries: cells at and next to the ends of the ranges and of the pool
+            let mut cells: Vec<Cell> = Vec::new();
+            for _ in 0..rnd(40) {
+                let level = if rnd(4) == 0 { [0u8, 3, 9, 15, 16, 200][rnd(6) as usize] } else { levels[rnd(levels.len() as u64) as usize] };
+                let base = if !ranges.is_empty() && rnd(3) > 0 {
+                    let r = ranges[rnd(ranges.len() as u64) as usize];
+                    [r.lo, r.hi][rnd(2) as usize]
+                } else {
+                    pool[rnd(pool.len() as u64) as usize]
+                };
+                let code = match rnd(3) {
+                    0 => base.wrapping_sub(1),
+                    1 => base,
+                    _ => base.wrapping_add(1),
+                };
+                cells.push(Cell { level, code: if level == 0 { 0 } else { code } });
+            }
+            let ids = [0u64, 1, 77, u64::MAX - 1, u64::MAX];
+            let mut chunk_keys: Vec<Vec<u8>> = cells.iter().map(|c| chunk_key(*c, ids[rnd(5) as usize]).to_vec()).collect();
+            chunk_keys.sort();
+            chunk_keys.dedup();
+            let mut tag_keys: Vec<Vec<u8>> = cells.iter().map(|c| [&p[..], &c.to_bytes()].concat()).collect();
+            tag_keys.sort();
+            tag_keys.dedup();
+            {
+                let mut w = db.env.write_txn().unwrap();
+                data.clear(&mut w).unwrap();
+                tags.clear(&mut w).unwrap();
+                for k in &chunk_keys {
+                    data.put(&mut w, k, k).unwrap();
+                }
+                for k in &tag_keys {
+                    tags.put(&mut w, k, k).unwrap();
+                }
+                // other values before and after the one read
+                for (q, n) in [(&b"k\0u\0"[..], 3), (&b"k\0v\0\x01"[..], 0), (&b"k\0w\0"[..], 3), (&b"k\0"[..], 0)] {
+                    for i in 0..n {
+                        let k = [q, &Cell { level: 16, code: i * 1000 }.to_bytes()].concat();
+                        tags.put(&mut w, &k, &k).unwrap();
+                    }
+                }
+                w.commit().unwrap();
+            }
+            let txn = db.env.read_txn().unwrap();
+            // model: an entry is visited when it is after `after`, at or
+            // before the high key of a range, and at or after its low key
+            // or the last entry at or before it
+            let model = |keys: &[Vec<u8>], lo_of: &dyn Fn(&CodeRange) -> Vec<u8>, hi_of: &dyn Fn(&CodeRange) -> Vec<u8>, after: Option<&[u8]>| -> Vec<Vec<u8>> {
+                let mut out = Vec::new();
+                for (i, k) in keys.iter().enumerate() {
+                    if after.is_some_and(|a| k.as_slice() <= a) {
+                        continue;
+                    }
+                    let next = keys.get(i + 1);
+                    if ranges.iter().any(|r| *k <= hi_of(r) && (*k >= lo_of(r) || next.is_none_or(|n| *n > lo_of(r)))) {
+                        out.push(k.clone());
+                    }
+                }
+                out
+            };
+            // chunks
+            let lo_c = |r: &CodeRange| chunk_key(Cell { level: r.level, code: r.lo }, 0).to_vec();
+            let hi_c = |r: &CodeRange| chunk_key(Cell { level: r.level, code: r.hi }, u64::MAX).to_vec();
+            let want = model(&chunk_keys, &lo_c, &hi_c, None);
+            let got: Vec<Vec<u8>> = chunks_in_ranges(data, &txn, &ranges).unwrap().into_iter().map(|v| v.to_vec()).collect();
+            assert_eq!(got, want, "round {round} chunks, ranges {ranges:?}, keys {chunk_keys:?}");
+            if round % 2 == 0 {
+                // the function before the patch, where the ranges do not overlap
+                let old: Vec<Vec<u8>> = chunks_in_ranges_plain(data, &txn, &ranges).into_iter().map(|v| v.to_vec()).collect();
+                assert_eq!(got, old, "round {round} chunks (old)");
+            }
+            visits += got.len();
+            // tag entries of the value, with and without `after`
+            let lo_t = |r: &CodeRange| [&p[..], &Cell { level: r.level, code: r.lo }.to_bytes()].concat();
+            let hi_t = |r: &CodeRange| [&p[..], &Cell { level: r.level, code: r.hi }.to_bytes()].concat();
+            let past = successor(&p);
+            let mut afters: Vec<Option<Vec<u8>>> = vec![None];
+            afters.extend(tag_keys.iter().take(3).cloned().map(Some));
+            if let Some(k) = tag_keys.get(tag_keys.len() / 2) {
+                afters.push(Some(k.clone()));
+            }
+            for after in afters {
+                let want = model(&tag_keys, &lo_t, &hi_t, after.as_deref());
+                let mut got: Vec<Vec<u8>> = Vec::new();
+                let key = |r: &CodeRange, high: bool, k: &mut Vec<u8>| {
+                    k.clear();
+                    k.extend_from_slice(&p);
+                    k.extend_from_slice(&Cell { level: r.level, code: if high { r.hi } else { r.lo } }.to_bytes());
+                };
+                let whole = |k: &[u8]| k.len() == p.len() + 5;
+                let done = walk_ranges(tags, &txn, Bound::Excluded(&past[..]), after.as_deref(), &ranges, p.len(), key, |k| k.starts_with(&p) && whole(k), |k, _| {
+                    got.push(k.to_vec());
+                    Ok(true)
+                })
+                .unwrap();
+                assert!(done);
+                assert_eq!(got, want, "round {round} tags after {after:?}, ranges {ranges:?}, keys {tag_keys:?}");
+                visits += got.len();
+                cases += 1;
+            }
+        }
+        assert!(visits > 10_000 && cases > 3000, "{visits} visits, {cases} cases");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn midpoints_lie_between() {

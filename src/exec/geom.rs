@@ -124,11 +124,11 @@ pub fn rel_geoms<R: Borrow<Relation>>(f: &Fetch, rels: &[R]) -> Result<Vec<EGeom
 /// none of them and are left out without loading their nodes, as are ways
 /// with a missing node or without nodes, which never pass. Members stored
 /// in a cell whose rectangle (`Cell::loose_rect`, which holds the box of
-/// every element of the cell) `near_cell` rejects are not read: it accepts
-/// every rectangle that holds a box `near` accepts or a point that may
-/// pass. The cells come from the id index. Long routes and large
-/// boundaries near a small region need only a few of their members.
-pub fn rel_geoms_near<R: Borrow<Relation>>(f: &Fetch, rels: &[R], near: impl Fn(&Rect) -> bool, near_cell: impl Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
+/// every element of the cell) `near` rejects are not read: it accepts every
+/// rectangle that holds a box it accepts or a point that may pass. The
+/// cells come from the id index. Long routes and large boundaries near a
+/// small region need only a few of their members.
+pub fn rel_geoms_near<R: Borrow<Relation>>(f: &Fetch, rels: &[R], near: impl Fn(&Rect) -> bool) -> Result<Vec<EGeom>> {
     let members = |t: ElemType| -> Vec<Id> {
         let mut v: Vec<Id> = rels.iter().flat_map(|r| r.borrow().members.iter().filter(|m| m.mtype == t).map(|m| m.id)).collect();
         v.sort_unstable();
@@ -137,8 +137,30 @@ pub fn rel_geoms_near<R: Borrow<Relation>>(f: &Fetch, rels: &[R], near: impl Fn(
     };
     // the test of each cell once
     let mut tested: HashMap<Cell, bool> = HashMap::default();
+    // The members of long routes lie in many cells, and a cell test against
+    // a large `around` source is not cheap: the limits are checked between
+    // the tests.
+    let mut tests = 0usize;
     let mut stored_near = |kind: Kind, ids: &[Id]| -> Result<Vec<(Cell, Id)>> {
-        Ok(f.snap.cells_of(kind, ids)?.into_iter().filter(|(_, c)| *tested.entry(*c).or_insert_with(|| near_cell(&c.loose_rect()))).map(|(id, c)| (c, id)).collect())
+        let mut out = Vec::new();
+        for (id, c) in f.snap.cells_of(kind, ids)? {
+            let hit = match tested.get(&c) {
+                Some(hit) => *hit,
+                None => {
+                    tests += 1;
+                    if tests % 256 == 0 {
+                        f.limits.check()?;
+                    }
+                    let hit = near(&c.loose_rect());
+                    tested.insert(c, hit);
+                    hit
+                }
+            };
+            if hit {
+                out.push((c, id));
+            }
+        }
+        Ok(out)
     };
     let mut ways = f.ways_untagged_at(stored_near(Kind::Way, &members(ElemType::Way))?)?;
     #[cfg(test)]
@@ -237,18 +259,69 @@ pub fn rel_geoms_for_bbox<R: Borrow<Relation>>(f: &Fetch, rels: &[R], rects: &[c
         .collect())
 }
 
-/// Input geometry for `around`: points and segments.
+/// Input geometry for `around`: points and segments. The ends of the
+/// segments are points of the source too: `around_match` tests them with
+/// their segment (the box of a point lies within the box of a segment
+/// ending there), so `points` holds only the others (nodes, lines of one
+/// vertex), and the index and the cover take half the items. A vertex
+/// between two segments of a line is tested once (`first_end`).
 #[derive(Default)]
 pub struct AroundSource {
     pub points: Vec<(f64, f64)>,
     pub segments: Vec<Segment>,
     /// Grid over the source, built by `prepare` for larger inputs.
     pub index: Option<AroundIndex>,
+    /// `bbox_rects` of the radius given to `prepare`, for the clauses of
+    /// every element type: 82 000 forests in a country are 1.5 x 10^7
+    /// points and segments, which take most of a second to cover.
+    cover: Option<(f64, Vec<crate::geo::Rect>)>,
+    /// Cost of reading the region of the cover, set by its first use.
+    pub cost: std::sync::OnceLock<u64>,
+    /// Per segment, whether its first end is the second end of the segment
+    /// before it (`add_line`): that end is tested there. Segments past the
+    /// end of this list are tested at both ends.
+    chained: Vec<bool>,
+    /// Ways of a large set whose vertices are not loaded (`add_lazy`).
+    lazy: LazyWays,
+    /// `cartesian` of the points, set by `prepare` (`point_c`).
+    points_c: Vec<crate::geo::V3>,
+}
+
+/// The ways of an `around` source that are known by their stored box only.
+/// A set of 82 000 forests has 7.7 x 10^6 vertices, whose positions,
+/// segments and index take most of the time of the statement, while the
+/// candidates (the hotels of the country) come near a tenth of the ways.
+/// The cover and the index take the box of such a way (with the bulge of
+/// its edges, `Rect::arc_box`), which holds all its segments; the tests on
+/// candidates take the vertices of the ways whose box they come near
+/// (`lazy_near`, built into a source of its own by the caller).
+#[derive(Default)]
+struct LazyWays {
+    /// The node ids of all ways, one after the other.
+    nodes: Vec<Id>,
+    /// Per way: where its ids start, and its stored box.
+    ways: Vec<(u32, Rect)>,
+    /// Per way: its box in the index (set by `prepare`), None when wide.
+    boxes: Vec<Option<BBox>>,
+    /// Ways whose vertices were loaded so far, over all calls.
+    loaded: std::sync::atomic::AtomicUsize,
+    /// All ways with their vertices, once the calls together have loaded
+    /// as many as there are: the candidates are everywhere (a statement
+    /// without a tag filter, in batches that each span the region).
+    full: std::sync::OnceLock<std::sync::Arc<AroundSource>>,
+}
+
+/// The box of all points within `radius` of the edges of a way with the
+/// stored box `b` (not `Rect::may_cross`).
+fn lazy_box(b: &Rect, radius: f64) -> BBox {
+    use crate::geo::{ilon_of_x, lat_of, lon_of};
+    let a = b.arc_box();
+    radius_box(lat_of(a.y0), lat_of(a.y1), lon_of(ilon_of_x(a.x0)), lon_of(ilon_of_x(a.x1)), radius)
 }
 
 /// Grid over the boxes within the radius of each source point and segment
-/// (items: points first, then segments), so that a test only looks at
-/// nearby items.
+/// (items: points first, then segments, then the lazy ways), so that a test
+/// only looks at nearby items.
 pub struct AroundIndex {
     cell: f64,
     cells: HashMap<(i32, i32), Vec<u32>>,
@@ -265,77 +338,119 @@ fn grid_span(cell: f64, south: f64, west: f64, north: f64, east: f64, limit: usi
 }
 
 impl AroundIndex {
-    fn build(src: &AroundSource, radius: f64) -> AroundIndex {
+    /// The index, and the boxes of the lazy ways in it.
+    fn build(src: &AroundSource, radius: f64) -> (AroundIndex, Vec<Option<BBox>>) {
         // Boxes slightly larger than the C++ radius box, so that the exact
         // test never misses (also covers the 1e-7 equality for radius 0).
         let slack = 1e-6;
-        let mut boxes: Vec<Option<BBox>> = Vec::with_capacity(src.points.len() + src.segments.len());
-        for &(lat, lon) in &src.points {
-            boxes.push(Some(radius_box(lat, lat, lon, lon, radius * 1.01)));
+        // (item, box); an item without a usable box is wide. A long segment
+        // has a box for each of its pieces (`segment_spans`).
+        let mut boxes: Vec<(u32, BBox)> = Vec::with_capacity(src.points.len() + src.segments.len());
+        let mut wide = Vec::new();
+        let fits = |b: BBox| -> Option<BBox> {
+            let b = BBox { south: b.south - slack, west: b.west - slack, north: b.north + slack, east: b.east + slack };
+            (b.west >= -180.0 && b.east <= 180.0 && b.south > -90.0 && b.north < 90.0).then_some(b)
+        };
+        for (i, &(lat, lon)) in src.points.iter().enumerate() {
+            match fits(radius_box(lat, lat, lon, lon, radius * 1.01)) {
+                Some(b) => boxes.push((i as u32, b)),
+                None => wide.push(i as u32),
+            }
         }
-        for s in &src.segments {
+        let np = src.points.len();
+        for (k, s) in src.segments.iter().enumerate() {
+            let i = (np + k) as u32;
             if (s.a.1 - s.b.1).abs() > 180.0 {
-                boxes.push(None);
+                wide.push(i);
                 continue;
             }
-            let (lo, hi) = s.lat_extent();
-            boxes.push(Some(radius_box(lo, hi, s.a.1.min(s.b.1), s.a.1.max(s.b.1), radius * 1.01)));
+            let first = boxes.len();
+            let mut ok = true;
+            segment_spans(s, radius, |lo, hi, w, e, r| match fits(radius_box(lo, hi, w, e, r * 1.01)) {
+                Some(b) => boxes.push((i, b)),
+                None => ok = false,
+            });
+            if !ok {
+                boxes.truncate(first);
+                wide.push(i);
+            }
         }
-        let boxes: Vec<Option<BBox>> = boxes
-            .into_iter()
-            .map(|b| {
-                b.map(|b| BBox { south: b.south - slack, west: b.west - slack, north: b.north + slack, east: b.east + slack })
-                    .filter(|b| b.west >= -180.0 && b.east <= 180.0 && b.south > -90.0 && b.north < 90.0)
-            })
-            .collect();
+        let base = (np + src.segments.len()) as u32;
+        let mut lazy_boxes = Vec::with_capacity(src.lazy.ways.len());
+        for (k, (_, b)) in src.lazy.ways.iter().enumerate() {
+            let fit = fits(lazy_box(b, radius * 1.01));
+            match fit {
+                Some(b) => boxes.push((base + k as u32, b)),
+                None => wide.push(base + k as u32),
+            }
+            lazy_boxes.push(fit);
+        }
         // Cell size: about the box size of a point, coarser if the
         // segments would land in too many cells.
         let mut cell = (radius * 720.0 / 40_000_000.0).max(1e-4);
         let budget = 8 * boxes.len() + 100_000;
         while cell < 10.0 {
-            let total: usize = boxes.iter().flatten().map(|b| grid_span(cell, b.south, b.west, b.north, b.east, usize::MAX).map_or(0, |(y0, y1, x0, x1)| (y1 - y0 + 1) as usize * (x1 - x0 + 1) as usize)).sum();
+            let total: usize = boxes.iter().map(|(_, b)| grid_span(cell, b.south, b.west, b.north, b.east, usize::MAX).map_or(0, |(y0, y1, x0, x1)| (y1 - y0 + 1) as usize * (x1 - x0 + 1) as usize)).sum();
             if total <= budget {
                 break;
             }
             cell *= 2.0;
         }
         let mut cells: HashMap<(i32, i32), Vec<u32>> = HashMap::default();
-        let mut wide = Vec::new();
-        for (i, b) in boxes.iter().enumerate() {
-            match b.and_then(|b| grid_span(cell, b.south, b.west, b.north, b.east, budget)) {
+        // an item whose boxes cannot all be placed is wide: its entries
+        // in the cells stay, and are found twice at most
+        let mut last_wide = None;
+        for (i, b) in &boxes {
+            match grid_span(cell, b.south, b.west, b.north, b.east, budget) {
                 Some((y0, y1, x0, x1)) => {
                     for y in y0..=y1 {
                         for x in x0..=x1 {
-                            cells.entry((y, x)).or_default().push(i as u32);
+                            // the boxes of an item follow each other
+                            let v = cells.entry((y, x)).or_default();
+                            if v.last() != Some(i) {
+                                v.push(*i);
+                            }
                         }
                     }
                 }
-                None => wide.push(i as u32),
+                None if last_wide != Some(*i) => {
+                    wide.push(*i);
+                    last_wide = Some(*i);
+                    if *i >= base {
+                        lazy_boxes[(*i - base) as usize] = None;
+                    }
+                }
+                None => {}
             }
         }
-        AroundIndex { cell, cells, wide }
+        (AroundIndex { cell, cells, wide }, lazy_boxes)
     }
 
-    /// Items whose box may contain the point.
-    pub fn at_point(&self, lat: f64, lon: f64, out: &mut Vec<u32>) {
-        out.clear();
-        out.extend_from_slice(&self.wide);
-        if let Some((y, _, x, _)) = grid_span(self.cell, lat, lon, lat, lon, 1) {
-            if let Some(v) = self.cells.get(&(y, x)) {
-                out.extend_from_slice(v);
-            }
-        }
+    /// Items whose box may contain the point: the wide ones and those of
+    /// its cell (a cell of a source with a radius of hundreds of km holds
+    /// 10^4 items, which are not copied for each point).
+    pub fn at_point(&self, lat: f64, lon: f64) -> impl Iterator<Item = u32> + '_ {
+        let cell = grid_span(self.cell, lat, lon, lat, lon, 1).and_then(|(y, _, x, _)| self.cells.get(&(y, x)));
+        self.wide.iter().copied().chain(cell.into_iter().flatten().copied())
     }
 
-    /// Whether the box of an item may meet the box (degrees, west <= east);
-    /// None if unknown: items across the antimeridian or at a pole, or a
-    /// box over more than `max_cells` cells.
-    fn box_hit(&self, south: f64, west: f64, north: f64, east: f64, max_cells: usize) -> Option<bool> {
+    /// Whether the box of an item may meet the box (degrees, west <= east):
+    /// the cells of the box are looked up when there are at most `probe`,
+    /// else the cells in use are compared when there are at most `scan`.
+    /// None if unknown: items across the antimeridian or at a pole, or both
+    /// limits passed.
+    fn box_hit(&self, south: f64, west: f64, north: f64, east: f64, probe: usize, scan: usize) -> Option<bool> {
         if !self.wide.is_empty() {
             return None;
         }
-        let (y0, y1, x0, x1) = grid_span(self.cell, south, west, north, east, max_cells)?;
-        Some((y0..=y1).any(|y| (x0..=x1).any(|x| self.cells.contains_key(&(y, x)))))
+        if let Some((y0, y1, x0, x1)) = grid_span(self.cell, south, west, north, east, probe) {
+            return Some((y0..=y1).any(|y| (x0..=x1).any(|x| self.cells.contains_key(&(y, x)))));
+        }
+        if self.cells.len() > scan {
+            return None;
+        }
+        let (y0, y1, x0, x1) = grid_span(self.cell, south, west, north, east, usize::MAX)?;
+        Some(self.cells.keys().any(|&(y, x)| (y0..=y1).contains(&y) && (x0..=x1).contains(&x)))
     }
 
     /// Items whose box may meet the segment; false if all items must be tested.
@@ -381,6 +496,59 @@ fn radius_box(lat_lo: f64, lat_hi: f64, lon_lo: f64, lon_hi: f64, radius: f64) -
     BBox { south, north, west: lon_lo - dlon, east: lon_hi + dlon }
 }
 
+/// The boxes that hold a segment of an `around` source, for the radius
+/// box of each: latitudes (with the apex of the arc), longitudes west to
+/// east (east past 180 degrees for a segment across the antimeridian) and
+/// the radius to take. A segment that runs far in both directions (a line
+/// `(around:r,lat,lon,lat,lon)` between two towns) is cut into pieces, so
+/// that the boxes follow it like stairs: its one box holds a region many
+/// times that within the radius, all of which would be read. A piece
+/// reaches about as far in the shorter direction as the radius, and not
+/// under 700 m, the size of a tile. The pieces are arcs of the same great
+/// circle; their ends are rounded, for which their radius is 1 mm longer.
+fn segment_spans(s: &Segment, radius: f64, mut f: impl FnMut(f64, f64, f64, f64, f64)) {
+    const DEG: f64 = 40_000_000.0 / 360.0;
+    const MAX_PIECES: f64 = 256.0;
+    let (dlat, dlon) = ((s.a.0 - s.b.0).abs(), (s.a.1 - s.b.1).abs());
+    let step = radius.max(700.0);
+    let whole = |f: &mut dyn FnMut(f64, f64, f64, f64, f64)| {
+        let (lo, hi) = s.lat_extent();
+        let (w, e) = if dlon > 180.0 {
+            // Across the antimeridian: from the eastern end eastwards.
+            (s.a.1.max(s.b.1), s.a.1.min(s.b.1) + 360.0)
+        } else {
+            (s.a.1.min(s.b.1), s.a.1.max(s.b.1))
+        };
+        f(lo, hi, w, e, radius);
+    };
+    // the common case first, without trigonometry: a degree of longitude
+    // is at most as long as one of latitude
+    if dlat.min(dlon) * DEG <= step || dlon > 180.0 || !radius.is_finite() {
+        return whole(&mut f);
+    }
+    let short = (dlat * DEG).min(dlon * DEG * ((s.a.0 + s.b.0) / 2.0).to_radians().cos());
+    let n = (short / step).ceil().min(MAX_PIECES);
+    // arcs up to a quarter circle, away from the poles
+    if n < 2.0 || s.ca.dot(&s.cb) <= 0.0 || s.a.0.abs().max(s.b.0.abs()) > 85.0 {
+        return whole(&mut f);
+    }
+    let n = n as usize;
+    let mut prev = s.a;
+    for i in 1..=n {
+        let next = if i == n {
+            s.b
+        } else {
+            let t = i as f64 / n as f64;
+            let v = s.ca.scale(1.0 - t).add(&s.cb.scale(t));
+            let v = v.scale(1.0 / v.dot(&v).sqrt());
+            (v.0.clamp(-1.0, 1.0).asin().to_degrees(), v.1.atan2(v.2).to_degrees())
+        };
+        let (lo, hi) = Segment::new(prev.0, prev.1, next.0, next.1).lat_extent();
+        f(lo, hi, prev.1.min(next.1), prev.1.max(next.1), radius + 0.001);
+        prev = next;
+    }
+}
+
 fn box_rects(b: BBox) -> Vec<crate::geo::Rect> {
     if b.east - b.west >= 360.0 {
         return BBox { west: -180.0, east: 180.0, ..b }.rects();
@@ -396,34 +564,167 @@ fn box_rects(b: BBox) -> Vec<crate::geo::Rect> {
 }
 
 impl AroundSource {
-    /// Build the grid index when the source is large enough to need one.
+    /// Build the grid index when the source is large enough to need one,
+    /// and the cover of the radius.
     pub fn prepare(&mut self, radius: f64) {
-        if self.points.len() + self.segments.len() > 32 {
-            self.index = Some(AroundIndex::build(self, radius));
+        self.prepare_index(radius);
+        self.cover = Some((radius, self.cover_rects(radius)));
+    }
+
+    /// `prepare` without the cover, for a source that only answers tests.
+    pub fn prepare_index(&mut self, radius: f64) {
+        self.points_c = self.points.iter().map(|p| crate::geo::cartesian(p.0, p.1)).collect();
+        if self.points.len() + self.segments.len() > 32 || self.has_lazy() {
+            let (index, boxes) = AroundIndex::build(self, radius);
+            self.index = Some(index);
+            self.lazy.boxes = boxes;
         }
+    }
+
+    /// `cartesian` of point `i`: the test of a way against the source asks
+    /// for it with every segment of the way.
+    #[inline]
+    pub fn point_c(&self, i: usize) -> crate::geo::V3 {
+        match self.points_c.get(i) {
+            Some(c) if self.points_c.len() == self.points.len() => *c,
+            _ => crate::geo::cartesian(self.points[i].0, self.points[i].1),
+        }
+    }
+
+    /// Add a way of the input set by its node ids and stored box, without
+    /// its vertices (`LazyWays`): not for a box that is empty or
+    /// `Rect::may_cross`. Before `prepare`.
+    pub fn add_lazy(&mut self, w: &Way) {
+        self.lazy.ways.push((self.lazy.nodes.len() as u32, w.bbox));
+        self.lazy.nodes.extend_from_slice(&w.nodes);
+    }
+
+    pub fn has_lazy(&self) -> bool {
+        !self.lazy.ways.is_empty()
+    }
+
+    /// The source of all lazy ways with their vertices, when it was built.
+    pub fn lazy_full(&self) -> Option<std::sync::Arc<AroundSource>> {
+        self.lazy.full.get().cloned()
+    }
+
+    /// Keeps the source of all lazy ways for the tests that follow.
+    pub fn set_lazy_full(&self, full: std::sync::Arc<AroundSource>) {
+        let _ = self.lazy.full.set(full);
+    }
+
+    /// Counts `n` more lazy ways as loaded; whether that makes more than
+    /// there are, so that the next load should take all of them, once.
+    pub fn lazy_loaded(&self, n: usize) -> bool {
+        self.lazy.loaded.fetch_add(n, std::sync::atomic::Ordering::Relaxed) + n > self.lazy.ways.len()
+    }
+
+    /// The node ids of every lazy way.
+    pub fn lazy_all(&self) -> Vec<&[Id]> {
+        (0..self.lazy.ways.len()).map(|k| self.lazy_ids(k)).collect()
+    }
+
+    fn lazy_ids(&self, k: usize) -> &[Id] {
+        let start = self.lazy.ways[k].0 as usize;
+        let end = self.lazy.ways.get(k + 1).map_or(self.lazy.nodes.len(), |w| w.0 as usize);
+        &self.lazy.nodes[start..end]
+    }
+
+    /// The node ids of each lazy way that may come within the radius of an
+    /// element with one of the boxes (key space; with the bulge of its
+    /// edges where it has edges, `Rect::arc_box`): the ways whose box in
+    /// the index meets a box. All of them for a box over more than 4096
+    /// cells of the grid (also boxes across the antimeridian, which span
+    /// it). After `prepare`.
+    pub fn lazy_near(&self, boxes: &[Rect]) -> Vec<&[Id]> {
+        use crate::geo::{ilon_of_x, lat_of, lon_of};
+        let count = self.lazy.ways.len();
+        let Some(ix) = &self.index else { return Vec::new() };
+        let base = (self.points.len() + self.segments.len()) as u32;
+        let mut need = vec![false; count];
+        let mut all = false;
+        for i in &ix.wide {
+            if *i >= base {
+                need[(*i - base) as usize] = true;
+            }
+        }
+        let m = 1e-6;
+        for b in boxes {
+            if b.is_empty() {
+                continue;
+            }
+            let (s, w, n, e) = (lat_of(b.y0) - m, lon_of(ilon_of_x(b.x0)) - m, lat_of(b.y1) + m, lon_of(ilon_of_x(b.x1)) + m);
+            let Some((y0, y1, x0, x1)) = grid_span(ix.cell, s, w, n, e, 4096) else {
+                all = true;
+                break;
+            };
+            for y in y0..=y1 {
+                for x in x0..=x1 {
+                    let Some(items) = ix.cells.get(&(y, x)) else { continue };
+                    // the lazy ways are the last items of a cell
+                    for i in items.iter().rev().take_while(|i| **i >= base) {
+                        let k = (*i - base) as usize;
+                        if !need[k] {
+                            need[k] = self.lazy.boxes[k].is_none_or(|lb| lb.south <= n && s <= lb.north && lb.west <= e && w <= lb.east);
+                        }
+                    }
+                }
+            }
+        }
+        (0..count).filter(|k| all || need[*k]).map(|k| self.lazy_ids(k)).collect()
     }
 
     /// Add an element's geometry. Ways with missing nodes contribute nothing.
     pub fn add(&mut self, g: &EGeom) {
         match g {
-            EGeom::Line(v) if v.iter().any(|p| p.is_none()) => {}
+            EGeom::Point(p) => self.points.push((p.lat(), p.lon())),
+            EGeom::Line(v) => self.add_way(v),
             EGeom::Multi { points, lines } => {
                 for p in points {
                     self.points.push((p.lat(), p.lon()));
                 }
                 for l in lines {
-                    self.add(&EGeom::Line(l.clone()));
+                    self.add_way(l);
                 }
             }
+            EGeom::Empty => {}
+        }
+    }
+
+    /// The vertices of a way, unless one is missing.
+    fn add_way(&mut self, v: &[Option<Pt>]) {
+        if v.iter().all(|p| p.is_some()) {
+            let pts: Vec<(f64, f64)> = v.iter().flatten().map(|p| (p.lat(), p.lon())).collect();
+            self.add_line(&pts);
+        }
+    }
+
+    /// A line through the points: its segments, or the point of a line of
+    /// one point.
+    pub fn add_line(&mut self, pts: &[(f64, f64)]) {
+        match pts {
+            [] => {}
+            [p] => self.points.push(*p),
             _ => {
-                for p in g.points() {
-                    self.points.push((p.lat(), p.lon()));
-                }
-                for (a, b) in g.segments() {
-                    self.segments.push(Segment::new(a.lat(), a.lon(), b.lat(), b.lon()));
+                let mut prev = (pts[0], crate::geo::cartesian(pts[0].0, pts[0].1));
+                self.chained.resize(self.segments.len(), false);
+                for (k, &q) in pts[1..].iter().enumerate() {
+                    let cq = crate::geo::cartesian(q.0, q.1);
+                    self.segments.push(Segment::with_cartesian(prev.0, q, prev.1, cq));
+                    self.chained.push(k > 0);
+                    prev = (q, cq);
                 }
             }
         }
+    }
+
+    /// Whether the first end of segment `i` needs its own test: not when
+    /// it is the second end of segment `i - 1`, which is tested with that
+    /// one. The index gives segment `i - 1` wherever it gives a test that
+    /// the shared end can pass: its box holds the box of that end.
+    #[inline]
+    pub fn first_end(&self, i: usize) -> bool {
+        !self.chained.get(i).copied().unwrap_or(false)
     }
 
     /// Whether a stored element box (key space, not `Rect::may_cross`) may
@@ -431,13 +732,15 @@ impl AroundSource {
     /// `bbox_rects`, grown by one unit). With a grid index, its cells answer
     /// instead of every rectangle when the box covers fewer cells than an
     /// eighth of the rectangles (a cell lookup costs more than a rectangle
-    /// test); the boxes of the cells' items contain the rectangles.
+    /// test); the boxes of the cells' items contain the rectangles. A box
+    /// over more cells (a large cell of the store) is compared with the
+    /// cells in use when they are fewer than an eighth of the rectangles.
     pub fn near_box(&self, rects: &[crate::geo::Rect], b: &crate::geo::Rect) -> bool {
         use crate::geo::{ilon_of_x, lat_of, lon_of};
         if let Some(ix) = &self.index {
             let m = 1e-6;
             let (s, w, n, e) = (lat_of(b.y0) - m, lon_of(ilon_of_x(b.x0)) - m, lat_of(b.y1) + m, lon_of(ilon_of_x(b.x1)) + m);
-            if let Some(hit) = ix.box_hit(s, w, n, e, (rects.len() / 8).min(4096)) {
+            if let Some(hit) = ix.box_hit(s, w, n, e, (rects.len() / 8).min(4096), rects.len() / 8) {
                 return hit;
             }
         }
@@ -445,21 +748,25 @@ impl AroundSource {
         rects.iter().any(|r| grow(r).intersects(b))
     }
 
-    /// Conservative rectangles covering everything within `radius`.
-    pub fn bbox_rects(&self, radius: f64) -> Vec<crate::geo::Rect> {
+    /// Conservative rectangles covering everything within `radius`; those
+    /// of `prepare` when it had the same radius.
+    pub fn bbox_rects(&self, radius: f64) -> std::borrow::Cow<'_, [crate::geo::Rect]> {
+        match &self.cover {
+            Some((r, rects)) if r.to_bits() == radius.to_bits() => std::borrow::Cow::Borrowed(rects),
+            _ => std::borrow::Cow::Owned(self.cover_rects(radius)),
+        }
+    }
+
+    fn cover_rects(&self, radius: f64) -> Vec<crate::geo::Rect> {
         let mut out = Vec::new();
         for &(lat, lon) in &self.points {
             out.extend(box_rects(radius_box(lat, lat, lon, lon, radius)));
         }
         for s in &self.segments {
-            let (lo, hi) = s.lat_extent();
-            let (w, e) = if (s.a.1 - s.b.1).abs() > 180.0 {
-                // Across the antimeridian: from the eastern end eastwards.
-                (s.a.1.max(s.b.1), s.a.1.min(s.b.1) + 360.0)
-            } else {
-                (s.a.1.min(s.b.1), s.a.1.max(s.b.1))
-            };
-            out.extend(box_rects(radius_box(lo, hi, w, e, radius)));
+            segment_spans(s, radius, |lo, hi, w, e, r| out.extend(box_rects(radius_box(lo, hi, w, e, r))));
+        }
+        for (_, b) in &self.lazy.ways {
+            out.extend(box_rects(lazy_box(b, radius)));
         }
         out
     }

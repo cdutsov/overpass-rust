@@ -4,6 +4,72 @@ The changes in each release of overpass-rust, newest first. "Overpass API"
 here means the C++ server, version 0.7.62, whose answers overpass-rust
 reproduces.
 
+## 0.3.0 (2026-11-24)
+
+### Faster
+
+- On the planet, real queries give the same answers as on 0.2.9 and take
+  less time. Those that take under 1 s use 1.6 times less time and 1.4 times
+  less CPU. In a sample of real queries of the common shapes, up to 20 s,
+  those that take 1 s or more on 0.2.9 use 3.4 times less time and 1.7 times
+  less CPU; their median falls from 1.4 s to 0.15 s.
+- `around` with a large set of ways as the source. Each way of the set is
+  first known by its stored bounding box, and the positions of its nodes are
+  read only for the ways near a candidate. The cells within the radius are
+  found once per statement, a node shared by two segments of a way is tested
+  once, and a long segment is covered in pieces along its path, where 0.2.9
+  used one box around both ends. A point is compared with bounds of latitude
+  and longitude before its distance on the sphere is computed. Examples: the
+  forests of Switzerland to hotels within 300 m take 1.0 s (8.6 s on 0.2.9),
+  the buildings of Zurich to relations within 10 m 0.8 s (9.5 s), and hiking
+  routes within 300 m of the forests of Switzerland 6 to 8 s (over 100 s).
+- `around` that finds relations reuses the nodes and ways the statement has
+  read and reads the other members without their tags: `foreach` over 600
+  peaks with `nwr(around.p:3000)` takes 6.5 s (11.1 s on 0.2.9).
+- `(area)` over large areas. The cell ranges of an area are walked with one
+  cursor through the database, where 0.2.9 made two searches per range. A
+  large area is read as rows of tiles. For an area of more than 4,096 block
+  tiles, a block tile is read only when a test needs it. The cell ranges of
+  the areas of a query are kept for its later statements. Real area queries,
+  weighted by how often each shape occurs, take 2.7 times less time and 1.5
+  times less CPU.
+- `out meta` finds the version, timestamp and user of an element in the cell
+  of the element, without a lookup in the id index, and decodes them only for
+  the elements the query keeps. Real bounding-box queries with `out meta`,
+  the most frequent shape, take 1.5 times less time and 1.3 times less CPU.
+- `node(bbox)` tests each node against the box while it decodes a chunk, so
+  nodes outside the box are not kept and sorted. `way(bn)` tests the bounding
+  box of a way before its nodes, and decodes tags only for the ways it keeps.
+- Statements that scan a region with tag filters skip a chunk whose key table
+  does not hold a key the filters need, before reading anything else of it.
+  `[~"k"~"v"]` tests the key regex once per key of a chunk. Regex searches in
+  the tag index test the first two bytes a match can start with before they
+  run the regex. A case-insensitive regex on the names of shops in Russia
+  takes 0.9 s (2.2 s on 0.2.9), and one on all names of the planet 1.4 s
+  (2.1 s).
+- A union moves a set that nothing else holds instead of copying it. A
+  statement inside a union skips the elements the union already holds when
+  nothing else reads its result.
+- Grid statistics with `for` over chains of `?:` that compare `lat()` or
+  `lon()` with numbers find the level of a chain by bisection and compare the
+  coordinate as a number. They take about 3 times less time.
+- Timestamps, the `out meta` attributes in XML, bounding boxes and centers are
+  written straight into the output. Output buffers take their size from the
+  previous batch, and large parts go to the connection without an extra copy.
+
+### Changed
+
+- `[maxsize:]` counts the nodes of `node(bbox)` after the box test, so it
+  follows the memory the query holds. A query close to the limit can pass
+  where 0.2.9 stopped with "out of memory"; a query that passed on 0.2.9
+  passes on 0.3.0 too.
+
+### Fixed
+
+- An `around` statement that tests relations checks the time and memory
+  limits while it tests their cells. On 0.2.9 such a statement could run well
+  past `[timeout:]`.
+
 ## 0.2.9 (2026-11-24)
 
 ### Faster

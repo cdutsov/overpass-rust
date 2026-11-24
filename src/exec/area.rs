@@ -6,7 +6,7 @@ use super::areageom::{self, Block, HIT, IC, INTERSECT, RelPos, TOGGLE_EAST, TOGG
 use super::eval::{Cx, El, Evaluator};
 use super::query::Plan;
 use super::set::{Set, sort_dedup};
-use super::fetch::ranges_for;
+use super::fetch::{ranges_for, ranges_for_many};
 use crate::geo::{Cell, CodeRange, MAX_LEVEL, Pt, Rect, cell_in_ranges, ilat, ilon, level_ranges, level_ranges_many, merge_ranges};
 use crate::model::*;
 use crate::store::Kind;
@@ -25,6 +25,11 @@ thread_local! {
     pub(super) static MEMBERS_ALL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
     /// Member ways the last relation test decoded.
     pub(super) static MEMBER_WAYS_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Block tiles of an `(area)` clause from which its tiles are read on
+    /// demand, in place of FINE_TILES.
+    static ON_DEMAND_OVER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+    /// Area tiles read (blocks of one area in one tile).
+    static TILES_READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// Polygons of one `(area)` clause.
@@ -43,15 +48,95 @@ pub struct AreaCtx {
 /// of areas (`Fetch::area_db`): the statements of a union over one area
 /// share it.
 pub struct AreaDb {
-    /// Blocks per block tile: (area id, polylines), ascending id.
-    tiles: BTreeMap<u32, Vec<(u32, Vec<Block>)>>,
+    /// Blocks per block tile: (area id, polylines), ascending id. Those of
+    /// areas with more than FINE_TILES block tiles are read when a test
+    /// first needs the tile (`load`, on the query thread): a statement
+    /// with a handful of candidates in a country does not read the tens
+    /// of thousands of tiles of the country.
+    tiles: Tiles,
+    /// The block tiles of the areas whose tiles are read on demand, each
+    /// with an area that lists it: (tile, area id), ascending.
+    /// Empty when every tile was read at the start. By tile, as a set of
+    /// thousands of areas (the communes of a country) would otherwise be
+    /// gone through for every tile read.
+    pending: Vec<(u32, u32)>,
     /// Rectangles that hold all the tests pass: by node tile
-    /// (`fine_rects`), else the block tiles.
+    /// (`fine_rects`), else the block tiles; for areas read on demand the
+    /// block tiles joined along their rows (`tile_rows`: a country is
+    /// some thousand rows instead of 10^5 tiles).
     rects: Vec<Rect>,
-    /// The block tiles as rectangles.
-    tile_rects: Vec<Rect>,
+    /// The block tiles as rectangles, one per area and tile (`tile_rects`).
+    by_tile: std::sync::OnceLock<Vec<Rect>>,
     /// Node tiles inside an area as a whole, by block tile (`fine_rects`).
     inside: FxHashMap<u32, [u16; 16]>,
+    /// `ranges_for` of `rects` for nodes, and for ways and relations (the
+    /// same cells), once computed (`ranges`): the ranges of a country
+    /// come from tens of thousands of rectangles, and the relation test
+    /// of every statement of a union needs both.
+    node_ranges: std::sync::OnceLock<Vec<CodeRange>>,
+    way_ranges: std::sync::OnceLock<Vec<CodeRange>>,
+}
+
+/// The blocks of the DB areas of a clause in one block tile.
+type TileBlocks = Vec<(u32, Vec<Block>)>;
+
+/// The block tiles of a clause, ascending, each with its blocks once they
+/// are read: two vectors, as a country has 10^5 tiles and a map with a
+/// node per few tiles took as long to build and drop as the rest of a
+/// small statement.
+#[derive(Default)]
+struct Tiles {
+    keys: Vec<u32>,
+    slots: Vec<std::sync::OnceLock<TileBlocks>>,
+}
+
+impl Tiles {
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
+
+    fn get(&self, tile: u32) -> Option<&std::sync::OnceLock<TileBlocks>> {
+        self.keys.binary_search(&tile).ok().map(|i| &self.slots[i])
+    }
+
+    /// In ascending order of the tiles.
+    fn iter(&self) -> impl Iterator<Item = (u32, &std::sync::OnceLock<TileBlocks>)> {
+        self.keys.iter().copied().zip(&self.slots)
+    }
+}
+
+/// Block tiles as rectangles, neighbours in a row joined, by row and
+/// column: what `fetch::ranges_for_many` makes of the tiles first.
+fn tile_rows(tiles: &[u32]) -> Vec<Rect> {
+    let mut keys: Vec<u64> = tiles
+        .iter()
+        .map(|&t| {
+            let (ty, tx) = crate::geo::unmorton(t);
+            (ty as u64) << 32 | tx as u64
+        })
+        .collect();
+    keys.sort_unstable();
+    keys.dedup();
+    let mut out: Vec<Rect> = Vec::new();
+    let mut last = None;
+    for k in keys {
+        let (ty, tx) = ((k >> 32) as u32, k as u32);
+        let r = tile_rect(crate::geo::morton(ty, tx));
+        if let (Some(l), Some((ly, lx))) = (out.last_mut(), last) {
+            if ly == ty && lx + 16 == tx && l.y0 == r.y0 && l.y1 == r.y1 && r.x0 == l.x1.wrapping_add(1) {
+                l.x1 = r.x1;
+                last = Some((ty, tx));
+                continue;
+            }
+        }
+        out.push(r);
+        last = Some((ty, tx));
+    }
+    out
 }
 
 fn ic(p: Pt) -> IC {
@@ -174,7 +259,9 @@ impl AreaDb {
         let mut out: Vec<Rect> = Vec::new();
         let mut too_many = false;
         let mut kept = 0usize;
-        for (&tile, areas) in &self.tiles {
+        for (tile, areas) in self.tiles.iter() {
+            // every tile is read here: on-demand areas have more tiles
+            let Some(areas) = areas.get() else { return Ok((None, FxHashMap::default())) };
             check()?;
             let (south, west) = areageom::tile_sw(tile);
             let (south, west) = (south as i64, west as i64);
@@ -229,7 +316,7 @@ impl AreaDb {
                 for c in 0..16 {
                     if *row >> c & 1 == 0 {
                         let centre = ((south + ((r as i64) << 16) + 0x8000) as u32, (west + ((c as i64) << 16) + 0x8000) as i32);
-                        if self.point(centre, true) {
+                        if self.point(centre, true) == Some(true) {
                             *row |= 1 << c;
                             whole[r] |= 1 << c;
                         }
@@ -283,8 +370,9 @@ impl AreaDb {
 
     /// The areas with their rectangles and inside tiles; `rects`: the
     /// block tiles. Also tells whether the rectangles follow the node tiles.
-    fn build(tiles: BTreeMap<u32, Vec<(u32, Vec<Block>)>>, rects: Vec<Rect>, check: impl Fn() -> Result<()>) -> Result<(AreaDb, bool)> {
-        let mut db = AreaDb { tiles, tile_rects: rects.clone(), rects, inside: FxHashMap::default() };
+    fn build(tiles: BTreeMap<u32, TileBlocks>, rects: Vec<Rect>, check: impl Fn() -> Result<()>) -> Result<(AreaDb, bool)> {
+        let (keys, slots) = tiles.into_iter().map(|(t, blocks)| (t, std::sync::OnceLock::from(blocks))).unzip();
+        let mut db = AreaDb { tiles: Tiles { keys, slots }, pending: Vec::new(), by_tile: std::sync::OnceLock::from(rects.clone()), rects, inside: FxHashMap::default(), node_ranges: Default::default(), way_ranges: Default::default() };
         let (fine, inside) = db.fine_rects(check)?;
         db.inside = inside;
         let is_fine = fine.is_some();
@@ -294,9 +382,86 @@ impl AreaDb {
         Ok((db, is_fine))
     }
 
+    /// Large areas (`pending`: (block tile, area id), ascending) whose
+    /// tiles are read on demand; `tiles`: all their block tiles, ascending.
+    /// The rectangles are the block tiles joined along their rows (an
+    /// area that large has no finer ones).
+    fn on_demand(pending: Vec<(u32, u32)>, tiles: Vec<u32>) -> AreaDb {
+        let rects = tile_rows(&tiles);
+        let slots = tiles.iter().map(|_| std::sync::OnceLock::new()).collect();
+        AreaDb { tiles: Tiles { keys: tiles, slots }, pending, by_tile: Default::default(), rects, inside: FxHashMap::default(), node_ranges: Default::default(), way_ranges: Default::default() }
+    }
+
+    /// The block tiles as rectangles, one per area and tile: what a clause
+    /// with closed ways beside the DB areas takes for its candidates.
+    fn tile_rects(&self) -> &[Rect] {
+        self.by_tile.get_or_init(|| self.pending.iter().map(|&(t, _)| tile_rect(t)).collect())
+    }
+
+    /// Cell ranges where elements of the kind that may pass a test against
+    /// the areas are stored: `ranges_for(kind, &self.rects)`, kept.
+    fn ranges(&self, kind: Kind) -> &[CodeRange] {
+        match kind {
+            // rows of tiles give the ranges of the tiles (`ranges_for_many`)
+            Kind::Node => self.node_ranges.get_or_init(|| if self.lazy() { ranges_for_many(Kind::Node, &self.rects) } else { ranges_for(Kind::Node, &self.rects) }),
+            _ => self.way_ranges.get_or_init(|| if self.lazy() { ranges_for_many(Kind::Way, &self.rects) } else { ranges_for(Kind::Way, &self.rects) }),
+        }
+    }
+
+    /// Whether tiles are read on demand (`load`).
+    fn lazy(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Reads the blocks of the given tiles that are not read yet. Only on
+    /// the query thread (the transaction belongs to it); the tests on the
+    /// pool see a tile as read or not (`blocks`).
+    fn load(&self, snap: &crate::store::Snapshot, tiles: impl IntoIterator<Item = u32>) -> Result<()> {
+        let mut last = None;
+        for t in tiles {
+            if last == Some(t) {
+                continue;
+            }
+            last = Some(t);
+            let Some(slot) = self.tiles.get(t) else { continue };
+            if slot.get().is_some() {
+                continue;
+            }
+            let mut blocks: TileBlocks = Vec::new();
+            let from = self.pending.partition_point(|&(pt, _)| pt < t);
+            for &(_, id) in self.pending[from..].iter().take_while(|(pt, _)| *pt == t) {
+                if let Some(b) = snap.area_blocks(t, id)? {
+                    #[cfg(test)]
+                    TILES_READ.set(TILES_READ.get() + 1);
+                    blocks.push((id, b.into_iter().map(Block::new).collect()));
+                }
+            }
+            let _ = slot.set(blocks);
+        }
+        Ok(())
+    }
+
+    /// Reads every tile not read yet.
+    fn load_all(&self, snap: &crate::store::Snapshot) -> Result<()> {
+        if self.lazy() {
+            self.load(snap, self.tiles.iter().filter(|(_, slot)| slot.get().is_none()).map(|(t, _)| t))?;
+        }
+        Ok(())
+    }
+
+    /// The blocks of a tile: `Some(&[])` where no area has any, None when
+    /// the tile is not read yet (`load`).
+    fn blocks(&self, tile: u32) -> Option<&[(u32, Vec<Block>)]> {
+        match self.tiles.get(tile) {
+            Some(slot) => slot.get().map(|b| b.as_slice()),
+            None => Some(&[]),
+        }
+    }
+
     /// Point test against the DB areas (`add_border`: the border counts).
-    fn point(&self, p: IC, add_border: bool) -> bool {
-        let Some(areas) = self.tiles.get(&areageom::block_tile(p.0, p.1)) else { return false };
+    /// None when the tile of the point is not read yet.
+    fn point(&self, p: IC, add_border: bool) -> Option<bool> {
+        let areas = self.blocks(areageom::block_tile(p.0, p.1))?;
         for (_, blocks) in areas {
             let mut inside = 0u8;
             for b in blocks {
@@ -309,10 +474,10 @@ impl AreaDb {
                 }
             }
             if inside != 0 {
-                return true;
+                return Some(true);
             }
         }
-        false
+        Some(false)
     }
 }
 
@@ -358,26 +523,54 @@ impl AreaCtx {
     /// edges are great-circle arcs, which may pass north or south of the
     /// box: at each level the rectangles of the implicit areas are grown by
     /// the bulge of an arc one cell wide (`arc_bulge`).
-    fn way_ranges(&self) -> Vec<CodeRange> {
-        let mut out = ranges_for(Kind::Way, if self.implicit_rects.is_empty() { &self.db.rects } else { &self.db.tile_rects });
-        if !self.implicit_rects.is_empty() {
-            for level in 0..=MAX_LEVEL {
-                let m = arc_bulge(1u64 << (32 - level as u32));
-                let grown: Vec<Rect> = self.implicit_rects.iter().map(|r| Rect { y0: r.y0.saturating_sub(m), y1: r.y1.saturating_add(m), ..*r }).collect();
-                out.extend(level_ranges_many(level, &grown, true));
-            }
+    fn way_ranges(&self) -> std::borrow::Cow<'_, [CodeRange]> {
+        if self.implicit_rects.is_empty() {
+            return std::borrow::Cow::Borrowed(self.db.ranges(Kind::Way));
         }
-        merge_ranges(out)
+        let mut out = ranges_for(Kind::Way, self.db.tile_rects());
+        for level in 0..=MAX_LEVEL {
+            let m = arc_bulge(1u64 << (32 - level as u32));
+            let grown: Vec<Rect> = self.implicit_rects.iter().map(|r| Rect { y0: r.y0.saturating_sub(m), y1: r.y1.saturating_add(m), ..*r }).collect();
+            out.extend(level_ranges_many(level, &grown, true));
+        }
+        std::borrow::Cow::Owned(merge_ranges(out))
+    }
+
+    /// `ranges_for(kind, &self.rects)`: kept with the DB areas for a clause
+    /// without closed ways (whose rectangles are those of the DB areas).
+    pub fn cell_ranges(&self, kind: Kind) -> std::borrow::Cow<'_, [CodeRange]> {
+        if self.implicit_rects.is_empty() {
+            return std::borrow::Cow::Borrowed(self.db.ranges(kind));
+        }
+        std::borrow::Cow::Owned(ranges_for(kind, &self.rects))
     }
 
     /// Point test against the DB areas (`add_border`: the border counts).
-    fn db_point(&self, p: IC, add_border: bool) -> bool {
+    /// None when the tile of the point is not read yet (`AreaDb::load`).
+    fn db_point_read(&self, p: IC, add_border: bool) -> Option<bool> {
         self.db.point(p, add_border)
     }
 
-    /// The vertex test of `db_way`: a vertex inside a DB area.
+    /// The tests where every tile is read (areas built for a test).
+    #[cfg(test)]
+    fn db_point(&self, p: IC, add_border: bool) -> bool {
+        self.db_point_read(p, add_border).unwrap()
+    }
+
+    #[cfg(test)]
     fn db_vertex(&self, v: IC) -> bool {
-        let Some(areas) = self.db.tiles.get(&areageom::block_tile(v.0, v.1)) else { return false };
+        self.db_vertex_read(v).unwrap()
+    }
+
+    #[cfg(test)]
+    fn db_way(&self, geom: &[IC]) -> bool {
+        self.db_way_read(geom).unwrap()
+    }
+
+    /// The vertex test of `db_way_read`: a vertex inside a DB area. None
+    /// when its tile is not read yet.
+    fn db_vertex_read(&self, v: IC) -> Option<bool> {
+        let areas = self.db.blocks(areageom::block_tile(v.0, v.1))?;
         for (_, blocks) in areas {
             let mut st = 0u8;
             for b in blocks {
@@ -389,16 +582,18 @@ impl AreaCtx {
                 st ^= c;
             }
             if st & (TOGGLE_EAST | TOGGLE_WEST) != 0 {
-                return true;
+                return Some(true);
             }
         }
-        false
+        Some(false)
     }
 
     /// Way test against the DB areas (C++ `collect_ways`, add_border = false).
-    fn db_way(&self, geom: &[IC]) -> bool {
+    /// None when a tile of the way is not read yet and the tiles before it
+    /// did not decide (`AreaDb::load`).
+    fn db_way_read(&self, geom: &[IC]) -> Option<bool> {
         if self.db.tiles.is_empty() || geom.is_empty() {
-            return false;
+            return Some(false);
         }
         let mut pieces = areageom::Blocks::new();
         areageom::add_way_to_blocks(geom, &mut pieces);
@@ -410,7 +605,10 @@ impl AreaCtx {
         // order of the tiles does not matter.
         let way_tiles: std::collections::BTreeSet<u32> = verts.keys().chain(pieces.keys()).copied().collect();
         for tile in &way_tiles {
-            let Some(areas) = self.db.tiles.get(tile) else { continue };
+            let areas = self.db.blocks(*tile)?;
+            if areas.is_empty() {
+                continue;
+            }
             if let Some(vs) = verts.get(tile) {
                 for v in vs {
                     for (_, blocks) in areas {
@@ -424,7 +622,7 @@ impl AreaCtx {
                             st ^= c;
                         }
                         if st & (TOGGLE_EAST | TOGGLE_WEST) != 0 {
-                            return true;
+                            return Some(true);
                         }
                     }
                 }
@@ -438,7 +636,7 @@ impl AreaCtx {
                     for b in blocks {
                         let r = b.intersects_inner(&local, &mut scratch);
                         if r == INTERSECT {
-                            return true;
+                            return Some(true);
                         } else if r == HIT {
                             status.insert(*aid, HIT);
                             break;
@@ -447,11 +645,11 @@ impl AreaCtx {
                     }
                 }
                 if status.values().any(|s| *s != 0 && s & HIT == 0) {
-                    return true;
+                    return Some(true);
                 }
             }
         }
-        false
+        Some(false)
     }
 }
 
@@ -498,17 +696,37 @@ impl<'s, W: Write> Engine<'s, W> {
             None => {
                 // the areas kept before go first: never two sets at once
                 *self.f.area_db.borrow_mut() = None;
-                let mut tiles: BTreeMap<u32, Vec<(u32, Vec<Block>)>> = BTreeMap::new();
-                let mut rects = Vec::new();
-                for a in &areas {
-                    for &t in &a.used {
-                        if let Some(b) = self.f.snap.area_blocks(t, a.id as u32)? {
-                            tiles.entry(t).or_default().push((a.id as u32, b.into_iter().map(Block::new).collect()));
-                            rects.push(tile_rect(t));
+                // The block tiles of the clause. More than FINE_TILES (a
+                // country: no finer rectangles): read when a test needs
+                // them (`AreaDb::load`).
+                let mut all: Vec<u32> = areas.iter().flat_map(|a| a.used.iter().copied()).collect();
+                all.sort_unstable();
+                all.dedup();
+                #[cfg(not(test))]
+                let on_demand = all.len() > FINE_TILES;
+                #[cfg(test)]
+                let on_demand = all.len() > ON_DEMAND_OVER.get().unwrap_or(FINE_TILES);
+                let db = if on_demand {
+                    let mut pending: Vec<(u32, u32)> = areas.iter().flat_map(|a| a.used.iter().map(|&t| (t, a.id as u32))).collect();
+                    pending.sort_unstable();
+                    pending.dedup();
+                    AreaDb::on_demand(pending, all)
+                } else {
+                    let mut tiles: BTreeMap<u32, TileBlocks> = BTreeMap::new();
+                    let mut rects = Vec::new();
+                    for a in &areas {
+                        for &t in &a.used {
+                            if let Some(b) = self.f.snap.area_blocks(t, a.id as u32)? {
+                                #[cfg(test)]
+                                TILES_READ.set(TILES_READ.get() + 1);
+                                tiles.entry(t).or_default().push((a.id as u32, b.into_iter().map(Block::new).collect()));
+                                rects.push(tile_rect(t));
+                            }
                         }
                     }
-                }
-                let db = Arc::new(AreaDb::build(tiles, rects, || self.check())?.0);
+                    AreaDb::build(tiles, rects, || self.check())?.0
+                };
+                let db = Arc::new(db);
                 *self.f.area_db.borrow_mut() = Some((key, db.clone()));
                 db
             }
@@ -519,19 +737,42 @@ impl<'s, W: Write> Engine<'s, W> {
         // of the closed ways do not hold all their test passes (ways over
         // degrees), and the nodes found beyond them are those in the block
         // tiles of the DB areas, as before.
-        let db_rects = if implicit_rects.is_empty() { &db.rects } else { &db.tile_rects };
+        let db_rects = if implicit_rects.is_empty() { &db.rects[..] } else { db.tile_rects() };
         let rects = db_rects.iter().chain(&implicit_rects).copied().collect();
         Ok(AreaCtx { db, implicit, implicit_rects, rects })
     }
 
+    /// The point test against the DB areas of the clause; the tile of the
+    /// point is read first where tiles are read on demand.
+    fn db_point(&self, ctx: &AreaCtx, p: IC, add_border: bool) -> Result<bool> {
+        if let Some(inside) = ctx.db_point_read(p, add_border) {
+            return Ok(inside);
+        }
+        ctx.db.load(self.f.snap, [areageom::block_tile(p.0, p.1)])?;
+        ctx.db_point_read(p, add_border).ok_or_else(|| anyhow::anyhow!("area tile not read"))
+    }
+
     pub fn area_keep_nodes(&self, ctx: &AreaCtx, nodes: &[&Node]) -> Result<Vec<bool>> {
-        Ok(nodes
-            .iter()
-            .map(|n| {
+        // One part of the nodes at a time: the tiles read on demand are
+        // read for the part, then its nodes are tested on this thread (on
+        // the pool the same tests took more CPU for less wall time).
+        let mut out = Vec::with_capacity(nodes.len());
+        for part in nodes.chunks(65_536) {
+            self.check()?;
+            if ctx.db.lazy() {
+                ctx.db.load(self.f.snap, part.iter().map(|n| areageom::block_tile(n.pos.y, n.pos.ilon())))?;
+            }
+            for n in part {
                 let p = ic(n.pos);
-                ctx.implicit.point(p.0, p.1, true) != RelPos::Outside || ctx.db_point(p, true)
-            })
-            .collect())
+                let inside = ctx.implicit.point(p.0, p.1, true) != RelPos::Outside
+                    || match ctx.db_point_read(p, true) {
+                        Some(inside) => inside,
+                        None => self.db_point(ctx, p, true)?,
+                    };
+                out.push(inside);
+            }
+        }
+        Ok(out)
     }
 
     pub fn area_keep_ways(&self, ctx: &AreaCtx, ways: &[&Way]) -> Result<Vec<bool>> {
@@ -556,22 +797,74 @@ impl<'s, W: Write> Engine<'s, W> {
                 let pos = self.f.node_positions(&firsts)?;
                 for (w, f) in all.iter().zip(first_in.iter_mut()).filter(|(_, f)| !**f) {
                     if let Some(p) = w.nodes.first().filter(|_| !w.missing).and_then(|n| pos.get(n)) {
-                        *f = ctx.db_vertex(ic(*p));
+                        let v = ic(*p);
+                        *f = match ctx.db_vertex_read(v) {
+                            Some(inside) => inside,
+                            None => {
+                                ctx.db.load(self.f.snap, [areageom::block_tile(v.0, v.1)])?;
+                                ctx.db_vertex_read(v).ok_or_else(|| anyhow::anyhow!("area tile not read"))?
+                            }
+                        };
                     }
                 }
             }
             let part: Vec<&Way> = all.iter().zip(&first_in).filter(|(_, f)| !**f).map(|(w, _)| *w).collect();
             let ids: Vec<Id> = part.iter().flat_map(|w| w.nodes.iter().copied()).collect();
             let pos = self.f.node_positions(&ids)?;
-            let keep = |w: &&Way| -> bool {
+            if ctx.db.lazy() {
+                // The tests run on the pool, the tiles are read here: those
+                // the box of each way meets (its edges lie in the box; one
+                // across the antimeridian gives a box around the world).
+                // A way that meets more than WAY_TILES is left to the pass
+                // below.
+                const WAY_TILES: u64 = 1024;
+                for w in &part {
+                    let mut b: Option<Rect> = None;
+                    for n in &w.nodes {
+                        let Some(p) = pos.get(n) else {
+                            // a node is missing: the way fails without a test
+                            b = None;
+                            break;
+                        };
+                        b = Some(match b {
+                            Some(r) => Rect { y0: r.y0.min(p.y), x0: r.x0.min(p.x), y1: r.y1.max(p.y), x1: r.x1.max(p.x) },
+                            None => Rect::point(*p),
+                        });
+                    }
+                    let Some(b) = b else { continue };
+                    let (ty0, ty1, tx0, tx1) = (b.y0 >> 20, b.y1 >> 20, b.x0 >> 20, b.x1 >> 20);
+                    if (ty1 - ty0 + 1) as u64 * (tx1 - tx0 + 1) as u64 > WAY_TILES {
+                        continue;
+                    }
+                    for ty in ty0..=ty1 {
+                        ctx.db.load(self.f.snap, (tx0..=tx1).map(|tx| crate::geo::morton(ty << 4, tx << 4)))?;
+                    }
+                }
+            }
+            // None: a tile of the way is not read
+            let keep = |w: &&Way| -> Option<bool> {
                 let g: Option<Vec<IC>> = w.nodes.iter().map(|n| pos.get(n).map(|p| ic(*p))).collect();
                 match g {
-                    Some(g) => (!ctx.implicit.is_empty() && ctx.implicit.way(&g)) || ctx.db_way(&g),
-                    None => false,
+                    Some(g) => {
+                        if !ctx.implicit.is_empty() && ctx.implicit.way(&g) {
+                            return Some(true);
+                        }
+                        ctx.db_way_read(&g)
+                    }
+                    None => Some(false),
                 }
             };
-            let mut rest = super::par_map(&part, 64, keep).into_iter();
-            out.extend(first_in.iter().map(|f| *f || rest.next().unwrap_or(false)));
+            let mut tested = super::par_map(&part, 64, keep);
+            if tested.iter().any(|t| t.is_none()) {
+                // ways over many tiles, and whatever the boxes missed:
+                // with every tile read
+                ctx.db.load_all(self.f.snap)?;
+                for (w, t) in part.iter().zip(tested.iter_mut()).filter(|(_, t)| t.is_none()) {
+                    *t = keep(w);
+                }
+            }
+            let mut rest = tested.into_iter();
+            out.extend(first_in.iter().map(|f| *f || rest.next().flatten().unwrap_or(false)));
         }
         Ok(out)
     }
@@ -603,17 +896,14 @@ impl<'s, W: Write> Engine<'s, W> {
         let rels: Vec<&Relation> = all_rels.iter().zip(&whole).filter(|(_, w)| !**w).map(|(r, _)| *r).collect();
         let rels = &rels[..];
         // A node passes only inside the rectangles of the areas.
-        let nids: Vec<Id> = near(Kind::Node, &members(ElemType::Node, rels), &ranges_for(Kind::Node, &ctx.rects))?.into_iter().map(|(_, id)| id).collect();
-        let nok: FxHashSet<Id> = self
-            .f
-            .node_positions(&nids)?
-            .into_iter()
-            .filter(|(_, p)| {
-                let q = ic(*p);
-                ctx.implicit.point(q.0, q.1, false) == RelPos::Inside || ctx.db_point(q, false)
-            })
-            .map(|(id, _)| id)
-            .collect();
+        let nids: Vec<Id> = near(Kind::Node, &members(ElemType::Node, rels), &ctx.cell_ranges(Kind::Node))?.into_iter().map(|(_, id)| id).collect();
+        let mut nok: FxHashSet<Id> = FxHashSet::default();
+        for (id, p) in self.f.node_positions(&nids)? {
+            let q = ic(p);
+            if ctx.implicit.point(q.0, q.1, false) == RelPos::Inside || self.db_point(ctx, q, false)? {
+                nok.insert(id);
+            }
+        }
         let by_node = |r: &Relation| r.members.iter().any(|m| m.mtype == ElemType::Node && nok.contains(&m.id));
         let mut ok: Vec<bool> = rels.iter().map(|r| by_node(r)).collect();
         let way_ranges = ctx.way_ranges();
@@ -835,6 +1125,366 @@ mod tests {
         let (mut db, _) = AreaDb::build(tiles, rects.clone(), || Ok(())).unwrap();
         FINE.with(|f| *f.borrow_mut() = Some(std::mem::replace(&mut db.rects, rects.clone())));
         AreaCtx { db: Arc::new(db), implicit: Tilewise::default(), implicit_rects: Vec::new(), rects }
+    }
+
+    /// Block tiles joined along their rows give the cell ranges of the
+    /// tiles one by one, and hold the same points: blobs, stripes, single
+    /// tiles, tiles at the edges of the grid.
+    #[test]
+    fn tile_rows_give_the_ranges_of_the_tiles() {
+        let mut seed = 0x1234_5678_9ABC_DEF1u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        for round in 0..40 {
+            let mut tiles: Vec<u32> = Vec::new();
+            for _ in 0..1 + rnd(6) {
+                // a blob of block tiles (node tile coordinates in steps of 16)
+                let (cy, cx) = (rnd(4096) as u32, rnd(4096) as u32);
+                let (h, w) = (1 + rnd(if round % 4 == 0 { 2 } else { 60 }) as u32, 1 + rnd(90) as u32);
+                for dy in 0..h {
+                    let (from, to) = (rnd(w as u64 / 2 + 1) as u32, w - rnd(w as u64 / 2 + 1) as u32);
+                    for dx in from..to {
+                        if rnd(40) > 0 {
+                            tiles.push(crate::geo::morton(((cy + dy) % 4096) << 4, ((cx + dx) % 4096) << 4));
+                        }
+                    }
+                }
+            }
+            tiles.sort_unstable();
+            tiles.dedup();
+            let one_by_one: Vec<Rect> = tiles.iter().map(|&t| tile_rect(t)).collect();
+            let rows = tile_rows(&tiles);
+            assert!(rows.len() <= tiles.len());
+            for kind in [Kind::Node, Kind::Way] {
+                assert_eq!(ranges_for_many(kind, &rows), ranges_for_many(kind, &one_by_one), "round {round}, {} tiles in {} rows", tiles.len(), rows.len());
+            }
+            let holds = |rects: &[Rect], y: u32, x: u32| rects.iter().any(|r| r.y0 <= y && y <= r.y1 && r.x0 <= x && x <= r.x1);
+            for _ in 0..2000 {
+                let r = one_by_one[rnd(one_by_one.len() as u64) as usize];
+                // in a tile, and around its corners
+                let (y, x) = (r.y0.wrapping_add(rnd(0x10_0004) as u32).wrapping_sub(2), r.x0.wrapping_add(rnd(0x10_0004) as u32).wrapping_sub(2));
+                assert_eq!(holds(&rows, y, x), holds(&one_by_one, y, x), "{y} {x}");
+            }
+        }
+    }
+
+    /// Areas whose tiles are read on demand answer as with every tile
+    /// read at the start: nodes, ways (short ones, ones over more tiles
+    /// than are read ahead, ones with a missing node), relations by member
+    /// nodes and ways, one area, areas that overlap, and an area with a
+    /// closed way beside it. A statement with a few candidates reads a
+    /// few tiles.
+    #[test]
+    fn tiles_on_demand_as_all_at_once() {
+        // node tests on the pool
+        let _one = crate::exec::tests::pool_test();
+        let dir = std::env::temp_dir().join(format!("area-on-demand-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut seed = 0x5DEE_CE66_D1CE_4E5Bu64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let mut osm = String::from("<osm version=\"0.6\">\n");
+        let mut nid = 0u64;
+        let mut node = |osm: &mut String, lat: f64, lon: f64, tag: &str| {
+            nid += 1;
+            *osm += &format!("<node id=\"{nid}\" lat=\"{lat:.7}\" lon=\"{lon:.7}\">{tag}</node>\n");
+            nid
+        };
+        // rings: an L of 3 x 4 degrees (some 900 block tiles), a square
+        // that overlaps it, a small one apart, and a closed way
+        let rings: [&[(f64, f64)]; 4] = [
+            &[(10.0, 20.0), (10.0, 24.0), (11.2, 24.0), (11.2, 21.5), (13.0, 21.5), (13.0, 20.0)],
+            &[(10.6, 23.2), (10.6, 25.1), (12.1, 25.1), (12.1, 23.2)],
+            &[(12.3, 25.6), (12.3, 26.2), (12.9, 26.2), (12.9, 25.6)],
+            &[(12.0, 22.0), (12.0, 23.0), (12.8, 23.0), (12.8, 22.0)],
+        ];
+        let mut ring_nodes: Vec<Vec<u64>> = Vec::new();
+        for ring in rings {
+            // a vertex every 0.05 degrees or so along the edges
+            let mut ids = Vec::new();
+            for (k, &(la, lo)) in ring.iter().enumerate() {
+                let (lb, lob) = ring[(k + 1) % ring.len()];
+                let steps = (((lb - la).abs() + (lob - lo).abs()) / 0.05).ceil() as u64;
+                for i in 0..steps {
+                    let t = i as f64 / steps as f64;
+                    ids.push(node(&mut osm, la + (lb - la) * t, lo + (lob - lo) * t, ""));
+                }
+            }
+            ids.push(ids[0]);
+            ring_nodes.push(ids);
+        }
+        let first_free = 4000u64;
+        let mut base = 0;
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        for i in 0..first_free {
+            let (lat, lon) = (9.5 + rnd(40_000) as f64 / 10_000.0, 19.5 + rnd(72_000) as f64 / 10_000.0);
+            pts.push((lat, lon));
+            let tag = format!("<tag k=\"k\" v=\"n{}\"/>", if i == 77 { 99 } else { i % 5 });
+            let id = node(&mut osm, lat, lon, &tag);
+            if i == 0 {
+                base = id - 1;
+            }
+        }
+        // ways along random walks from a node; nodes of their own
+        let mut ways = String::new();
+        let mut way_ids = Vec::new();
+        for w in 0..1500u64 {
+            let (mut lat, mut lon) = pts[rnd(first_free) as usize];
+            let step = match rnd(20) {
+                0 => 2.5,
+                1..4 => 0.3,
+                _ => 0.02,
+            };
+            let mut nds = Vec::new();
+            for _ in 0..2 + rnd(5) {
+                nds.push(node(&mut osm, lat.clamp(9.0, 14.0), lon.clamp(19.0, 27.0), ""));
+                lat += (rnd(2001) as f64 / 1000.0 - 1.0) * step;
+                lon += (rnd(2001) as f64 / 1000.0 - 1.0) * step;
+            }
+            if w % 97 == 5 {
+                nds.push(999_999_999);
+            }
+            if w % 50 == 7 {
+                // closed
+                nds.push(nds[0]);
+            }
+            let nds: String = nds.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect();
+            ways += &format!("<way id=\"{}\">{nds}<tag k=\"k\" v=\"w{}\"/></way>\n", w + 1, w % 3);
+            way_ids.push(w + 1);
+        }
+        for (k, ids) in ring_nodes.iter().enumerate() {
+            let nds: String = ids.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect();
+            ways += &format!("<way id=\"{}\">{nds}</way>\n", 9000 + k);
+        }
+        let mut rels = String::new();
+        for r in 0..300u64 {
+            let mut ms = String::new();
+            for _ in 0..rnd(4) {
+                ms += &format!("<member type=\"node\" ref=\"{}\" role=\"\"/>", base + 1 + rnd(first_free));
+            }
+            for _ in 0..rnd(12) {
+                ms += &format!("<member type=\"way\" ref=\"{}\" role=\"\"/>", 1 + rnd(1500));
+            }
+            rels += &format!("<relation id=\"{}\">{ms}<tag k=\"k\" v=\"r{}\"/></relation>\n", r + 1, r % 2);
+        }
+        for (k, name) in ["L", "Square", "Apart"].iter().enumerate() {
+            rels += &format!("<relation id=\"{}\"><member type=\"way\" ref=\"{}\" role=\"outer\"/><tag k=\"type\" v=\"boundary\"/><tag k=\"boundary\" v=\"administrative\"/><tag k=\"admin_level\" v=\"4\"/><tag k=\"name\" v=\"{name}\"/></relation>\n", 500 + k, 9000 + k);
+        }
+        let file = dir.join("in.osm");
+        std::fs::write(&file, osm + &ways + &rels + "</osm>\n").unwrap();
+        let db = crate::store::Db::open(&dir.join("db")).unwrap();
+        let mut report = crate::import::ImportReport::default();
+        crate::import::import_file(&db, &file, &mut report).unwrap();
+        crate::import::set_base_timestamp(&db, Some("test"), &report).unwrap();
+        crate::update::areas::make_areas(&db).unwrap();
+        let output = |q: &str| -> (String, usize) {
+            TILES_READ.set(0);
+            let opts = crate::exec::RunOptions { cli: true, ..Default::default() };
+            let out = match crate::exec::run(&db, q, Vec::new(), &opts) {
+                Ok(p) => p.w,
+                Err((Some(p), _)) => p.w,
+                Err((None, e)) => panic!("{q}: {e}"),
+            };
+            (String::from_utf8(out).unwrap(), TILES_READ.get())
+        };
+        let c = "[out:csv(::type,::id;false)];";
+        let sets = [
+            "area[name=L]->.a;",
+            "area[name=Square]->.a;",
+            "(area[name=L];area[name=Square];)->.a;",
+            "(area[name=L];area[name=Square];area[name=Apart];)->.a;",
+            "(area[name=L];way(9003);)->.a;",
+        ];
+        let statements = [
+            "node(area.a);",
+            "way(area.a);",
+            "rel(area.a);",
+            "node(area.a)[k=n1];",
+            "node(area.a)[k=n99];",
+            "way(area.a)[k~\"^w[12]$\"];",
+            "nwr(area.a)[k];",
+            "(node(area.a)[k=n2];way(area.a)[k=w1];rel(area.a)[k=r0];);",
+            "rel(area.a)[k=r1];way(r);",
+        ];
+        let (mut lines, mut fewer) = (0, 0);
+        for set in sets {
+            for st in statements {
+                let q = format!("{c}{set}{st}out ids;");
+                ON_DEMAND_OVER.set(None);
+                let (whole, read_whole) = output(&q);
+                ON_DEMAND_OVER.set(Some(0));
+                let (lazy, read_lazy) = output(&q);
+                ON_DEMAND_OVER.set(None);
+                assert_eq!(lazy, whole, "{q}");
+                assert!(read_lazy <= read_whole, "{q}: {read_lazy} tiles on demand, {read_whole} at once");
+                lines += whole.lines().count();
+                fewer += (read_lazy * 4 < read_whole) as usize;
+                if st.contains("n99") && !set.contains("9003") {
+                    assert!(read_whole > 100 && read_lazy <= 3, "{q}: {read_lazy} tiles on demand, {read_whole} at once");
+                }
+            }
+        }
+        assert!(lines > 3000 && fewer >= 5, "{lines} lines, {fewer} queries with a quarter of the tiles");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review (rv-area): on-demand tiles and tile rows at the antimeridian
+    /// and around a pole answer as every tile read at the start: an area
+    /// across 180 degrees, one around the south pole, one near the north
+    /// pole, a closed way across 180 degrees beside them, ways across 180
+    /// degrees (boxes around the world: the pass after `load_all`).
+    #[test]
+    #[ignore = "randomized, about 8 s: cargo test --release --lib review_on_demand_at_the_antimeridian_and_poles -- --ignored"]
+    fn review_on_demand_at_the_antimeridian_and_poles() {
+        let _one = crate::exec::tests::pool_test();
+        let dir = std::env::temp_dir().join(format!("area-rv-dateline-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut seed = 0x7F4A_7C15_9E37_79B9u64;
+        let mut rnd = |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let wrap = |lon: f64| (lon + 180.0).rem_euclid(360.0) - 180.0;
+        let mut osm = String::from("<osm version=\"0.6\">\n");
+        let mut nid = 0u64;
+        let mut node = |osm: &mut String, lat: f64, lon: f64, tag: &str| {
+            nid += 1;
+            *osm += &format!("<node id=\"{nid}\" lat=\"{lat:.7}\" lon=\"{:.7}\">{tag}</node>\n", wrap(lon));
+            nid
+        };
+        // corners in unwrapped longitude
+        let rings: [&[(f64, f64)]; 4] = [
+            &[(-17.0, 178.0), (-17.0, 181.0), (-15.0, 181.0), (-15.0, 178.0)],
+            &[(-80.0, -180.0), (-80.0, -60.0), (-79.0, 60.0), (-80.0, 179.99)],
+            &[(80.0, 10.0), (80.0, 30.0), (84.0, 30.0), (84.0, 10.0)],
+            &[(-16.5, 179.5), (-16.5, 180.5), (-16.0, 180.5), (-16.0, 179.5)],
+        ];
+        let mut ring_nodes: Vec<Vec<u64>> = Vec::new();
+        for (r, ring) in rings.iter().enumerate() {
+            let mut ids = Vec::new();
+            for (k, &(la, lo)) in ring.iter().enumerate() {
+                if r == 1 && k == ring.len() - 1 {
+                    // around the pole: the ring closes across 180 degrees
+                    ids.push(node(&mut osm, la, lo, ""));
+                    continue;
+                }
+                let (lb, lob) = ring[(k + 1) % ring.len()];
+                let steps = (((lb - la).abs() + (lob - lo).abs()) / 0.05).ceil().max(1.0) as u64;
+                for i in 0..steps {
+                    let t = i as f64 / steps as f64;
+                    ids.push(node(&mut osm, la + (lb - la) * t, lo + (lob - lo) * t, ""));
+                }
+            }
+            ids.push(ids[0]);
+            ring_nodes.push(ids);
+        }
+        // points near 180 degrees, near the south pole, near the north area
+        let mut pts: Vec<(f64, f64)> = Vec::new();
+        for i in 0..4000u64 {
+            let (lat, lon) = match i % 3 {
+                0 => (-18.0 + rnd(50_000) as f64 / 10_000.0, 176.0 + rnd(80_000) as f64 / 10_000.0),
+                1 => (-89.9 + rnd(130_000) as f64 / 10_000.0, -180.0 + rnd(3_600_000) as f64 / 10_000.0),
+                _ => (79.0 + rnd(60_000) as f64 / 10_000.0, 5.0 + rnd(300_000) as f64 / 10_000.0),
+            };
+            pts.push((lat, lon));
+            let tag = format!("<tag k=\"k\" v=\"n{}\"/>", i % 5);
+            node(&mut osm, lat, lon, &tag);
+        }
+        let mut ways = String::new();
+        for w in 0..1500u64 {
+            let (mut lat, mut lon) = pts[rnd(4000) as usize];
+            let step = match rnd(10) {
+                0 => 3.0,
+                1..4 => 0.4,
+                _ => 0.03,
+            };
+            let mut nds = Vec::new();
+            for _ in 0..2 + rnd(4) {
+                nds.push(node(&mut osm, lat.clamp(-89.95, 89.95), lon, ""));
+                lat += (rnd(2001) as f64 / 1000.0 - 1.0) * step;
+                lon += (rnd(2001) as f64 / 1000.0 - 1.0) * step;
+            }
+            if w % 40 == 3 {
+                nds.push(nds[0]);
+            }
+            let nds: String = nds.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect();
+            ways += &format!("<way id=\"{}\">{nds}<tag k=\"k\" v=\"w{}\"/></way>\n", w + 1, w % 3);
+        }
+        for (k, ids) in ring_nodes.iter().enumerate() {
+            let nds: String = ids.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect();
+            ways += &format!("<way id=\"{}\">{nds}</way>\n", 9000 + k);
+        }
+        let mut rels = String::new();
+        for r in 0..200u64 {
+            let mut ms = String::new();
+            for _ in 0..rnd(3) {
+                ms += &format!("<member type=\"node\" ref=\"{}\" role=\"\"/>", 1 + rnd(nid));
+            }
+            for _ in 0..rnd(8) {
+                ms += &format!("<member type=\"way\" ref=\"{}\" role=\"\"/>", 1 + rnd(1500));
+            }
+            rels += &format!("<relation id=\"{}\">{ms}<tag k=\"k\" v=\"r{}\"/></relation>\n", r + 1, r % 2);
+        }
+        for (k, name) in ["Dateline", "Polar", "North"].iter().enumerate() {
+            rels += &format!("<relation id=\"{}\"><member type=\"way\" ref=\"{}\" role=\"outer\"/><tag k=\"type\" v=\"boundary\"/><tag k=\"boundary\" v=\"administrative\"/><tag k=\"admin_level\" v=\"4\"/><tag k=\"name\" v=\"{name}\"/></relation>\n", 500 + k, 9000 + k);
+        }
+        let file = dir.join("in.osm");
+        std::fs::write(&file, osm + &ways + &rels + "</osm>\n").unwrap();
+        let db = crate::store::Db::open(&dir.join("db")).unwrap();
+        let mut report = crate::import::ImportReport::default();
+        crate::import::import_file(&db, &file, &mut report).unwrap();
+        crate::import::set_base_timestamp(&db, Some("test"), &report).unwrap();
+        crate::update::areas::make_areas(&db).unwrap();
+        let output = |q: &str| -> String {
+            let opts = crate::exec::RunOptions { cli: true, ..Default::default() };
+            let out = match crate::exec::run(&db, q, Vec::new(), &opts) {
+                Ok(p) => p.w,
+                Err((Some(p), _)) => p.w,
+                Err((None, e)) => panic!("{q}: {e}"),
+            };
+            String::from_utf8(out).unwrap()
+        };
+        let c = "[out:csv(::type,::id;false)];";
+        let n_areas = output(&format!("{c}area[admin_level=4];out ids;")).lines().count();
+        let sets = [
+            "area[name=Dateline]->.a;",
+            "area[name=Polar]->.a;",
+            "area[name=North]->.a;",
+            "(area[name=Dateline];area[name=Polar];area[name=North];)->.a;",
+            "(area[name=Dateline];way(9003);)->.a;",
+            "(area[name=Polar];way(9003);)->.a;",
+        ];
+        let statements = ["node(area.a);", "way(area.a);", "rel(area.a);", "nwr(area.a)[k=n1];", "way(area.a)[k=w2];", "(node(area.a)[k=n2];way(area.a)[k=w1];rel(area.a)[k=r0];);"];
+        let mut lines = 0;
+        for set in sets {
+            for st in statements {
+                let q = format!("{c}{set}{st}out ids;");
+                ON_DEMAND_OVER.set(None);
+                let whole = output(&q);
+                ON_DEMAND_OVER.set(Some(0));
+                let lazy = output(&q);
+                ON_DEMAND_OVER.set(None);
+                assert_eq!(lazy, whole, "{q}");
+                lines += whole.lines().count();
+            }
+        }
+        eprintln!("review_on_demand_at_the_antimeridian_and_poles: {n_areas} areas, {lines} lines");
+        assert!(lines > 1000 && n_areas == 3, "{n_areas} areas, {lines} lines");
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The rectangles by node tile hold every point the point test passes

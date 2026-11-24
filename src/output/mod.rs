@@ -164,18 +164,31 @@ impl std::fmt::Display for Lon {
     }
 }
 
-/// An unsigned integer in decimal.
+/// The numbers 00 to 99 as two digits each.
+const PAIRS: &[u8; 200] = b"0001020304050607080910111213141516171819202122232425262728293031323334353637383940414243444546474849\
+5051525354555657585960616263646566676869707172737475767778798081828384858687888990919293949596979899";
+
+/// An unsigned integer in decimal, two digits per division (ids and
+/// references are most of the numbers of an answer).
 #[inline]
 fn put_u64(b: &mut Vec<u8>, mut v: u64) {
     let mut buf = [0u8; 20];
     let mut i = buf.len();
-    loop {
+    while v >= 100 {
+        let p = 2 * (v % 100) as usize;
+        v /= 100;
+        i -= 2;
+        buf[i] = PAIRS[p];
+        buf[i + 1] = PAIRS[p + 1];
+    }
+    if v >= 10 {
+        let p = 2 * v as usize;
+        i -= 2;
+        buf[i] = PAIRS[p];
+        buf[i + 1] = PAIRS[p + 1];
+    } else {
         i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-        if v == 0 {
-            break;
-        }
+        buf[i] = b'0' + v as u8;
     }
     b.extend_from_slice(&buf[i..]);
 }
@@ -207,6 +220,17 @@ fn put_f7(b: &mut Vec<u8>, v: f64) {
     } else {
         w!(b, "{:.7}", v);
     }
+}
+
+/// Coordinates as `F7`, each after its text, and the text that ends them
+/// (the bounds and the center of an element).
+#[inline]
+fn put_parts<const N: usize>(b: &mut Vec<u8>, before: [&[u8]; N], vals: [f64; N], end: &[u8]) {
+    for (t, v) in before.iter().zip(vals) {
+        b.extend_from_slice(t);
+        put_f7(b, v);
+    }
+    b.extend_from_slice(end);
 }
 
 /// `Lat` and `Lon` of a node into a byte buffer.
@@ -469,6 +493,8 @@ pub struct Printer<W: Write> {
     buf: Vec<u8>,
     first_elem: bool,
     remarks: String,
+    /// Bytes per element of the last large batch (`items`).
+    per_item: usize,
     pub area_level: bool,
     /// Close the JSON document with `);` for JSONP.
     pub jsonp: bool,
@@ -476,7 +502,7 @@ pub struct Printer<W: Write> {
 
 impl<W: Write> Printer<W> {
     pub fn new(w: W, fmt: OutFormat) -> Printer<W> {
-        Printer { w, fmt, buf: Vec::with_capacity(1 << 16), first_elem: true, remarks: String::new(), area_level: false, jsonp: false }
+        Printer { w, fmt, buf: Vec::with_capacity(1 << 16), first_elem: true, remarks: String::new(), per_item: 128, area_level: false, jsonp: false }
     }
 
     pub fn format(&self) -> &OutFormat {
@@ -607,32 +633,46 @@ impl<W: Write> Printer<W> {
             return Ok(());
         }
         let json = matches!(self.fmt, OutFormat::Json);
-        let chunks: Vec<&[(Item, GeomOut, Option<MetaOut>)]> = list.chunks(CHUNK).collect();
-        let Printer { w, fmt, buf, first_elem, .. } = self;
+        // each chunk with whether an element comes before it in the document
+        let lead = !std::mem::replace(&mut self.first_elem, false);
+        let chunks: Vec<(bool, &[(Item, GeomOut, Option<MetaOut>)])> = list.chunks(CHUNK).enumerate().map(|(i, c)| (i > 0 || lead, c)).collect();
+        let Printer { w, fmt, buf, per_item, .. } = self;
         let fmt = &*fmt;
+        // room for a chunk as the last call needed it: a buffer that grows
+        // is copied again and again
+        let room = *per_item + *per_item / 8 + 16;
+        let mut bytes = 0;
         // A chunk formatted on this thread (a busy host, or the start
         // beside another section) is written at once, as by `item`; those
         // of the pool when all of them are done.
-        crate::exec::par_run(&chunks, 4, |chunk| -> io::Result<Vec<u8>> {
-            let mut b = Vec::with_capacity(chunk.len() * 128);
+        let r = crate::exec::par_run(&chunks, 4, |(lead, chunk)| -> io::Result<Vec<u8>> {
+            let mut b = Vec::with_capacity(chunk.len() * room);
             for (i, (it, g, m)) in chunk.iter().enumerate() {
-                if json && i > 0 {
+                if json && (i > 0 || *lead) {
                     b.extend_from_slice(b",\n");
                 }
                 Self::format_item(fmt, &mut b, it, fl, g, m.as_ref());
             }
             Ok(b)
         }, |p| {
-            if json && !std::mem::replace(first_elem, false) {
-                buf.extend_from_slice(b",\n");
+            bytes += p.len();
+            if p.len() < 1 << 15 {
+                buf.extend_from_slice(&p);
+                if buf.len() >= 1 << 16 {
+                    w.write_all(buf)?;
+                    buf.clear();
+                }
+                return Ok(());
             }
-            buf.extend_from_slice(&p);
-            if buf.len() >= 1 << 16 {
+            // a large part goes to the writer as it is, after what waits
+            if !buf.is_empty() {
                 w.write_all(buf)?;
                 buf.clear();
             }
-            Ok(())
-        })
+            w.write_all(&p)
+        });
+        *per_item = (bytes / list.len()).clamp(64, 1 << 16);
+        r
     }
 
     // ------------------------------------------------------------------ XML
@@ -662,11 +702,15 @@ impl<W: Write> Printer<W> {
         }
         if !matches!(item, Item::Derived { .. }) && fl & META != 0 {
             if let Some(m) = meta {
-                w!(b, " version=\"{}\" timestamp=\"{}\" changeset=\"{}\" uid=\"{}\"",
-                        m.meta.version,
-                        format_timestamp(m.meta.timestamp),
-                        m.meta.changeset,
-                        m.meta.uid);
+                b.extend_from_slice(b" version=\"");
+                put_u64(b, m.meta.version as u64);
+                b.extend_from_slice(b"\" timestamp=\"");
+                put_timestamp(b, m.meta.timestamp);
+                b.extend_from_slice(b"\" changeset=\"");
+                put_u64(b, m.meta.changeset);
+                b.extend_from_slice(b"\" uid=\"");
+                put_u64(b, m.meta.uid as u64);
+                b.push(b'"');
                 if let Some(u) = m.user {
                     b.extend_from_slice(b" user=\"");
                     escape_xml(u, b);
@@ -766,7 +810,9 @@ impl<W: Write> Printer<W> {
             }
         }
         if open {
-            w!(b, "  </{name}>\n");
+            b.extend_from_slice(b"  </");
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(b">\n");
         } else {
             b.extend_from_slice(b"/>\n");
         }
@@ -799,7 +845,7 @@ impl<W: Write> Printer<W> {
         if !matches!(item, Item::Derived { .. }) && fl & META != 0 {
             if let Some(m) = meta {
                 b.extend_from_slice(b",\n  \"timestamp\": \"");
-                b.extend_from_slice(format_timestamp(m.meta.timestamp).as_bytes());
+                put_timestamp(b, m.meta.timestamp);
                 b.extend_from_slice(b"\",\n  \"version\": ");
                 put_u64(b, m.meta.version as u64);
                 b.extend_from_slice(b",\n  \"changeset\": ");
@@ -1023,14 +1069,14 @@ fn xml_bounds_center(b: &mut Vec<u8>, fl: u32, geom: &GeomOut, open: &mut bool, 
     if fl & BOUNDS != 0 {
         if let Some(bb) = geom.bounds {
             child(b, open);
-            w!(b, "    <bounds minlat=\"{}\" minlon=\"{}\" maxlat=\"{}\" maxlon=\"{}\"/>\n", F7(bb.0), F7(bb.1), F7(bb.2), F7(bb.3));
+            put_parts(b, [b"    <bounds minlat=\"", b"\" minlon=\"", b"\" maxlat=\"", b"\" maxlon=\""], [bb.0, bb.1, bb.2, bb.3], b"\"/>\n");
             return;
         }
     }
     if fl & CENTER != 0 {
         if let Some(c) = geom.center {
             child(b, open);
-            w!(b, "    <center lat=\"{}\" lon=\"{}\"/>\n", F7(c.0), F7(c.1));
+            put_parts(b, [b"    <center lat=\"", b"\" lon=\""], [c.0, c.1], b"\"/>\n");
         }
     }
 }
@@ -1038,17 +1084,13 @@ fn xml_bounds_center(b: &mut Vec<u8>, fl: u32, geom: &GeomOut, open: &mut bool, 
 fn json_bounds_center(b: &mut Vec<u8>, fl: u32, geom: &GeomOut) {
     if fl & BOUNDS != 0 {
         if let Some(bb) = geom.bounds {
-            w!(b, ",\n  \"bounds\": {{\n    \"minlat\": {},\n    \"minlon\": {},\n    \"maxlat\": {},\n    \"maxlon\": {}\n  }}",
-                    F7(bb.0),
-                    F7(bb.1),
-                    F7(bb.2),
-                    F7(bb.3));
+            put_parts(b, [b",\n  \"bounds\": {\n    \"minlat\": ", b",\n    \"minlon\": ", b",\n    \"maxlat\": ", b",\n    \"maxlon\": "], [bb.0, bb.1, bb.2, bb.3], b"\n  }");
             return;
         }
     }
     if fl & CENTER != 0 {
         if let Some(c) = geom.center {
-            w!(b, ",\n  \"center\": {{\n    \"lat\": {},\n    \"lon\": {}\n  }}", F7(c.0), F7(c.1));
+            put_parts(b, [b",\n  \"center\": {\n    \"lat\": ", b",\n    \"lon\": "], [c.0, c.1], b"\n  }");
         }
     }
 }
@@ -1233,6 +1275,61 @@ mod tests {
         assert_eq!(F7(0.0).to_string(), "0.0000000");
         assert_eq!(F7(-7.1125).to_string(), "-7.1125000");
         assert_eq!(F7(51.0125).to_string(), "51.0125000");
+    }
+
+    /// Bounds, center and the meta attributes come out as the format
+    /// strings wrote them.
+    #[test]
+    fn bounds_center_and_meta_as_formatted() {
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x
+        };
+        for _ in 0..2000 {
+            let v: Vec<f64> = (0..4).map(|_| (next() % 3_600_000_000) as f64 / 1e7 - 180.0).collect();
+            let bb = (v[0], v[1], v[2], v[3]);
+            let c = (v[0], v[1]);
+            let mut open = true;
+            let mut child = |_: &mut Vec<u8>, _: &mut bool| {};
+            let g = GeomOut { bounds: Some(bb), center: Some(c), ..Default::default() };
+            let (mut xb, mut xc, mut jb, mut jc) = (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            xml_bounds_center(&mut xb, BOUNDS, &g, &mut open, &mut child);
+            xml_bounds_center(&mut xc, CENTER, &g, &mut open, &mut child);
+            json_bounds_center(&mut jb, BOUNDS, &g);
+            json_bounds_center(&mut jc, CENTER, &g);
+            assert_eq!(String::from_utf8(xb).unwrap(), format!("    <bounds minlat=\"{}\" minlon=\"{}\" maxlat=\"{}\" maxlon=\"{}\"/>\n", F7(bb.0), F7(bb.1), F7(bb.2), F7(bb.3)));
+            assert_eq!(String::from_utf8(xc).unwrap(), format!("    <center lat=\"{}\" lon=\"{}\"/>\n", F7(c.0), F7(c.1)));
+            assert_eq!(String::from_utf8(jb).unwrap(), format!(",\n  \"bounds\": {{\n    \"minlat\": {},\n    \"minlon\": {},\n    \"maxlat\": {},\n    \"maxlon\": {}\n  }}", F7(bb.0), F7(bb.1), F7(bb.2), F7(bb.3)));
+            assert_eq!(String::from_utf8(jc).unwrap(), format!(",\n  \"center\": {{\n    \"lat\": {},\n    \"lon\": {}\n  }}", F7(c.0), F7(c.1)));
+            let m = Meta { version: next() as u32, timestamp: (next() % 2_000_000_000) as i64, changeset: next() >> (next() % 64), uid: next() as u32 };
+            let n = Node { id: next() >> 20, pos: Pt::from_ll(1.0, 2.0), tags: Tags::from_pairs([("k", "v")]) };
+            let mo = MetaOut { meta: m, user: Some("u") };
+            let mut b = Vec::new();
+            Printer::<Vec<u8>>::xml_item(&mut b, &Item::Node(&n), ID | META | TAGS, &GeomOut::default(), Some(&mo));
+            let want = format!(
+                "  <node id=\"{}\" version=\"{}\" timestamp=\"{}\" changeset=\"{}\" uid=\"{}\" user=\"u\">\n    <tag k=\"k\" v=\"v\"/>\n  </node>\n",
+                n.id,
+                m.version,
+                format_timestamp(m.timestamp),
+                m.changeset,
+                m.uid
+            );
+            assert_eq!(String::from_utf8(b).unwrap(), want);
+            let mut b = Vec::new();
+            Printer::<Vec<u8>>::json_item(&mut b, &Item::Node(&n), ID | META, &GeomOut::default(), Some(&mo));
+            let want = format!(
+                "{{\n  \"type\": \"node\",\n  \"id\": {},\n  \"timestamp\": \"{}\",\n  \"version\": {},\n  \"changeset\": {},\n  \"user\": \"u\",\n  \"uid\": {}\n}}",
+                n.id,
+                format_timestamp(m.timestamp),
+                m.version,
+                m.changeset,
+                m.uid
+            );
+            assert_eq!(String::from_utf8(b).unwrap(), want);
+        }
     }
 
     #[test]

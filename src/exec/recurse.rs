@@ -2,12 +2,14 @@
 //! `(bn)`, `(bw)`, `(br)` (docs/spec/query-semantics.md §11).
 
 use super::Engine;
+use super::query::QElem;
 use super::set::{Set, sort_dedup};
 use crate::model::*;
 use crate::ql::ast::{RecurseFilter, RecurseOp};
 use anyhow::Result;
 use rustc_hash::FxHashSet as HashSet;
 use std::io::Write;
+use std::rc::Rc;
 
 fn member_ids(rels: &[Relation], t: ElemType, role: Option<&str>) -> Vec<Id> {
     let mut v: Vec<Id> = rels
@@ -21,12 +23,87 @@ fn member_ids(rels: &[Relation], t: ElemType, role: Option<&str>) -> Vec<Id> {
     v
 }
 
+/// Of `ids` (sorted, distinct): the elements that the sets `known` hold,
+/// and the ids that none of them holds (sorted).
+fn split_known<'a, T: QElem>(known: &'a [Rc<Set>], ids: &[Id]) -> (Vec<&'a T>, Vec<Id>) {
+    if ids.is_empty() {
+        return (Vec::new(), Vec::new());
+    }
+    let mut found: Vec<Option<&'a T>> = vec![None; ids.len()];
+    let mut hits = 0;
+    for set in known {
+        let v = T::from_set(set);
+        if v.is_empty() {
+            continue;
+        }
+        if v.len() < ids.len() / 8 {
+            // a small set: its elements are looked up in the ids
+            for e in v {
+                if let Ok(i) = ids.binary_search(&e.id()) {
+                    hits += found[i].is_none() as usize;
+                    found[i] = Some(e);
+                }
+            }
+            continue;
+        }
+        if ids.len() < v.len() / 8 {
+            // few ids: each is looked up in the set (a walk through a set
+            // of a million elements for each member of a union with many
+            // members cost more than reading the few elements)
+            for (i, id) in ids.iter().enumerate() {
+                if let Ok(k) = v.binary_search_by_key(id, |e| e.id()) {
+                    hits += found[i].is_none() as usize;
+                    found[i] = Some(&v[k]);
+                }
+            }
+            continue;
+        }
+        // both sorted by id: one pass, from the first id of the other
+        let mut j = v.partition_point(|e| e.id() < ids[0]);
+        let mut i = ids.partition_point(|id| v.get(j).is_some_and(|e| *id < e.id()));
+        while i < ids.len() && j < v.len() {
+            match ids[i].cmp(&v[j].id()) {
+                std::cmp::Ordering::Less => i += 1,
+                std::cmp::Ordering::Greater => j += 1,
+                std::cmp::Ordering::Equal => {
+                    hits += found[i].is_none() as usize;
+                    found[i] = Some(&v[j]);
+                    i += 1;
+                    j += 1;
+                }
+            }
+        }
+    }
+    #[cfg(test)]
+    super::KNOWN_HELD.set(super::KNOWN_HELD.get() + hits);
+    let mut missing = Vec::with_capacity(ids.len() - hits);
+    let mut have = Vec::with_capacity(hits);
+    for (id, f) in ids.iter().zip(found) {
+        match f {
+            Some(e) => have.push(e),
+            None => missing.push(*id),
+        }
+    }
+    (have, missing)
+}
+
 impl<'s, W: Write> Engine<'s, W> {
-    fn nodes_of_ways(&self, ways: &[Way]) -> Result<Vec<Node>> {
-        let mut ids: Vec<Id> = ways.iter().flat_map(|w| w.nodes.iter().copied()).collect();
+    /// The elements with the given ids (sorted, distinct). As a member of
+    /// a union that already holds some of them (`Engine::known`), only the
+    /// others: the union is the same, and they are not read again.
+    fn by_ids_new<T: QElem>(&self, ids: &[Id]) -> Result<Vec<T>> {
+        if self.known.is_empty() || ids.is_empty() {
+            return self.f.by_ids::<T>(ids);
+        }
+        let (_, missing) = split_known::<T>(&self.known, ids);
+        self.f.by_ids::<T>(&missing)
+    }
+
+    fn nodes_of_ways<'a>(&self, ways: impl IntoIterator<Item = &'a Way>) -> Result<Vec<Node>> {
+        let mut ids: Vec<Id> = ways.into_iter().flat_map(|w| w.nodes.iter().copied()).collect();
         ids.sort_unstable();
         ids.dedup();
-        self.f.by_ids::<Node>(&ids)
+        self.by_ids_new::<Node>(&ids)
     }
 
     fn ways_of_nodes(&self, nodes: &[Node]) -> Result<Vec<Way>> {
@@ -88,19 +165,21 @@ impl<'s, W: Write> Engine<'s, W> {
         let mut out = Set::default();
         match op {
             RecurseOp::Down | RecurseOp::DownRel => {
-                let rels = if op == RecurseOp::DownRel { self.down_closure(&s.rels)? } else { s.rels.clone() };
-                let mut ways = self.f.by_ids::<Way>(&member_ids(&rels, ElemType::Way, None))?;
-                let mut all_ways = ways.clone();
-                all_ways.extend(s.ways.iter().cloned());
-                sort_dedup(&mut all_ways);
-                let mut nodes = self.nodes_of_ways(&all_ways)?;
-                nodes.extend(self.f.by_ids::<Node>(&member_ids(&rels, ElemType::Node, None))?);
+                let closure = if op == RecurseOp::DownRel { Some(self.down_closure(&s.rels)?) } else { None };
+                let rels: &[Relation] = closure.as_deref().unwrap_or(&s.rels);
+                // The member ways a running union already holds are not
+                // read again (`by_ids_new`); their nodes still count.
+                let known = self.known.clone();
+                let way_ids = member_ids(rels, ElemType::Way, None);
+                let (held, missing) = if known.is_empty() { (Vec::new(), way_ids) } else { split_known::<Way>(&known, &way_ids) };
+                let ways = self.f.by_ids::<Way>(&missing)?;
+                let mut nodes = self.nodes_of_ways(ways.iter().chain(held).chain(&s.ways))?;
+                nodes.extend(self.by_ids_new::<Node>(&member_ids(rels, ElemType::Node, None))?);
                 sort_dedup(&mut nodes);
-                sort_dedup(&mut ways);
                 out.nodes = nodes;
                 out.ways = ways;
-                if op == RecurseOp::DownRel {
-                    out.rels = rels;
+                if let Some(c) = closure {
+                    out.rels = c;
                 }
             }
             RecurseOp::Up | RecurseOp::UpRel => {
@@ -174,7 +253,7 @@ impl<'s, W: Write> Engine<'s, W> {
                     let mut ids: Vec<Id> = s.ways.iter().flat_map(|w| ps.iter().filter_map(|p| at(&w.nodes, *p))).collect();
                     ids.sort_unstable();
                     ids.dedup();
-                    out.nodes = self.f.by_ids::<Node>(&ids)?;
+                    out.nodes = self.by_ids_new::<Node>(&ids)?;
                 }
                 None => out.nodes = self.nodes_of_ways(&s.ways)?,
             },
@@ -212,9 +291,9 @@ impl<'s, W: Write> Engine<'s, W> {
                 ways.retain(|w| ps.iter().any(|p| at(&w.nodes, *p).is_some_and(|n| ids.contains(&n))));
                 out.ways = ways;
             }
-            (RecurseFilter::R, ElemType::Node) => out.nodes = self.f.by_ids::<Node>(&member_ids(&s.rels, ElemType::Node, role))?,
-            (RecurseFilter::R, ElemType::Way) => out.ways = self.f.by_ids::<Way>(&member_ids(&s.rels, ElemType::Way, role))?,
-            (RecurseFilter::R, ElemType::Relation) => out.rels = self.f.by_ids::<Relation>(&member_ids(&s.rels, ElemType::Relation, role))?,
+            (RecurseFilter::R, ElemType::Node) => out.nodes = self.by_ids_new::<Node>(&member_ids(&s.rels, ElemType::Node, role))?,
+            (RecurseFilter::R, ElemType::Way) => out.ways = self.by_ids_new::<Way>(&member_ids(&s.rels, ElemType::Way, role))?,
+            (RecurseFilter::R, ElemType::Relation) => out.rels = self.by_ids_new::<Relation>(&member_ids(&s.rels, ElemType::Relation, role))?,
             (RecurseFilter::Bn, ElemType::Way) => out.ways = self.ways_of_nodes(&s.nodes)?,
             (RecurseFilter::Bn, ElemType::Relation) => {
                 let ids: Vec<Id> = s.nodes.iter().map(|n| n.id).collect();
@@ -234,5 +313,45 @@ impl<'s, W: Write> Engine<'s, W> {
         sort_dedup(&mut out.ways);
         sort_dedup(&mut out.rels);
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod rv_tests {
+    use super::*;
+
+    /// `split_known` gives what a lookup of each id in each set gives, for
+    /// sets far larger and far smaller than the ids and of the same size.
+    #[test]
+    fn split_known_matches_lookups() {
+        let node = |id: Id| Node { id, pos: crate::geo::Pt::from_ll(1.0, 2.0), tags: Default::default() };
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x % n
+        };
+        for round in 0..2000 {
+            let span = [50, 5_000, 500_000][round % 3];
+            let sizes = [0usize, 1, 3, 20, 200, 3_000, 40_000];
+            let mut ids: Vec<Id> = (0..sizes[rnd(7) as usize]).map(|_| rnd(span)).collect();
+            ids.sort_unstable();
+            ids.dedup();
+            let sets: Vec<Rc<Set>> = (0..1 + rnd(3))
+                .map(|_| {
+                    let mut v: Vec<Id> = (0..sizes[rnd(7) as usize]).map(|_| rnd(span)).collect();
+                    v.sort_unstable();
+                    v.dedup();
+                    Rc::new(Set { nodes: v.into_iter().map(node).collect(), ..Default::default() })
+                })
+                .collect();
+            let (have, missing) = split_known::<Node>(&sets, &ids);
+            let held = |id: &Id| sets.iter().any(|s| s.nodes.binary_search_by_key(id, |n| n.id).is_ok());
+            let want_have: Vec<Id> = ids.iter().copied().filter(|i| held(i)).collect();
+            let want_missing: Vec<Id> = ids.iter().copied().filter(|i| !held(i)).collect();
+            assert_eq!(have.iter().map(|n| n.id).collect::<Vec<_>>(), want_have, "{round}");
+            assert_eq!(missing, want_missing, "{round}");
+        }
     }
 }

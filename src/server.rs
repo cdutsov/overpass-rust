@@ -165,9 +165,21 @@ struct ChannelWriter {
 }
 
 impl Write for ChannelWriter {
+    /// Small writes are gathered to pieces of 64 KiB; a large one (the
+    /// printer hands its output over in such pieces) becomes a chunk of its
+    /// own size, copied once.
     fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+        const PIECE: usize = 1 << 16;
+        if data.len() >= PIECE / 2 {
+            self.flush()?;
+            self.push(Bytes::copy_from_slice(data))?;
+            return Ok(data.len());
+        }
+        if self.buf.capacity() == 0 {
+            self.buf.reserve_exact(PIECE + PIECE / 2);
+        }
         self.buf.extend_from_slice(data);
-        if self.buf.len() >= 1 << 16 {
+        if self.buf.len() >= PIECE {
             self.flush()?;
         }
         Ok(data.len())
@@ -177,6 +189,12 @@ impl Write for ChannelWriter {
             return Ok(());
         }
         let chunk = Bytes::from(std::mem::take(&mut self.buf));
+        self.push(chunk)
+    }
+}
+
+impl ChannelWriter {
+    fn push(&mut self, chunk: Bytes) -> std::io::Result<()> {
         let Err(e) = self.spool.push(chunk, self.deadline) else { return Ok(()) };
         // The rest of the answer is not written: the client must not take
         // what it has for all of it.

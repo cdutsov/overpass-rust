@@ -115,6 +115,10 @@ pub struct Engine<'s, W: Write> {
     /// Bytes of the two above beyond the database areas, counted against
     /// the memory limit while they are kept (at most `AREA_KEEP_MAX`).
     area_kept_bytes: u64,
+    /// While a member of a union runs whose result only the union reads
+    /// (`union_only_reads`): the parts the union holds so far. A recursion
+    /// down leaves out the elements they hold (`by_ids_new`).
+    known: Vec<Rc<Set>>,
 }
 
 pub fn stmt_name(k: &StmtKind) -> &'static str {
@@ -134,6 +138,46 @@ pub fn stmt_name(k: &StmtKind) -> &'static str {
         StmtKind::Make { .. } => "make",
         StmtKind::Convert { .. } => "convert",
         StmtKind::Unsupported(_) => "unsupported",
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Members of unions read the elements the union holds again.
+    static KNOWN_OFF: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    /// Ids that members of unions did not read (`recurse::split_known`).
+    static KNOWN_HELD: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether `st`, a member of a union into `into` followed by the member
+/// `next`, is a recursion down (`>`, `>>`, `node(w.a)`, `way(r.a)`, with tag
+/// filters at most) whose result nothing but the union reads: the next
+/// member stores its result under the same name without reading it, or it
+/// is the last member and has the name of the union. Such a member may
+/// leave out the elements that the union already holds.
+fn union_only_reads(st: &Stmt, next: Option<&Stmt>, into: &str) -> bool {
+    let down = match &st.kind {
+        StmtKind::Recurse { op, .. } => matches!(op, RecurseOp::Down | RecurseOp::DownRel),
+        StmtKind::Query { types, filters } => {
+            let recurse = |f: &Filter| matches!(f, Filter::Recurse { kind: RecurseFilter::W | RecurseFilter::R, .. });
+            let tag = |f: &Filter| matches!(f, Filter::HasKey(_) | Filter::NotKey(_) | Filter::Eq(..) | Filter::Ne(..) | Filter::Regex { .. } | Filter::KeyRegex { .. });
+            !types.area && !types.derived && filters.iter().any(recurse) && filters.iter().all(|f| recurse(f) || tag(f))
+        }
+        _ => false,
+    };
+    if !down {
+        return false;
+    }
+    match next {
+        None => st.into == into,
+        Some(n) => {
+            let stores = match &n.kind {
+                StmtKind::Query { .. } | StmtKind::Recurse { .. } | StmtKind::Union(_) | StmtKind::Difference(..) | StmtKind::Make { .. } | StmtKind::Convert { .. } | StmtKind::IsIn { .. } | StmtKind::MapToArea { .. } => true,
+                StmtKind::Item { set } => *set != n.into,
+                _ => false,
+            };
+            stores && n.into == st.into && !query::reads_set(n, &st.into)
+        }
     }
 }
 
@@ -547,6 +591,7 @@ pub fn run_script<W: Write>(snap: &Snapshot, script: Script, w: W, opts: &RunOpt
         area_ctx_last: None,
         area_ranges_last: Vec::new(),
         area_kept_bytes: 0,
+        known: Vec::new(),
     };
     let res = eng.exec_block(&script.stmts);
     let mut err = None;
@@ -611,6 +656,18 @@ impl<'s, W: Write> Engine<'s, W> {
         let size = s.counted_size();
         let bytes = size + derived_bytes(&s);
         self.frames.last_mut().unwrap().insert(name.to_string(), Slot { set: s, size, bytes });
+    }
+
+    /// Store a set that is already stored under another name (or in another
+    /// frame), with the sizes counted then: `.a;`, `.a->.b;` and the set a
+    /// block statement takes into its frame do not count its cells again.
+    fn set_slot(&mut self, name: &str, slot: Slot) {
+        self.set_keys.remove(name);
+        self.frames.last_mut().unwrap().insert(name.to_string(), slot);
+    }
+
+    fn lookup_slot(&self, name: &str) -> Option<&Slot> {
+        self.frames.iter().rev().find_map(|f| f.get(name))
     }
 
     fn interrupted_message(&self) -> String {
@@ -699,8 +756,10 @@ impl<'s, W: Write> Engine<'s, W> {
             }
             StmtKind::Item { set } => {
                 if set != &s.into {
-                    let v = self.get(set);
-                    self.set_rc(&s.into, v);
+                    match self.lookup_slot(set).cloned() {
+                        Some(slot) => self.set_slot(&s.into, slot),
+                        None => self.set_rc(&s.into, Rc::default()),
+                    }
                 }
             }
             StmtKind::Union(stmts) => self.union(stmts, &s.into, s.line)?,
@@ -755,11 +814,14 @@ impl<'s, W: Write> Engine<'s, W> {
     fn take_into_frame(&mut self, name: &str) {
         let caller = self.frames.len() - 2;
         let v = if self.frames[caller].contains_key(name) {
-            self.frames[caller].remove(name).map(|s| s.set)
+            self.frames[caller].remove(name)
         } else {
-            self.lookup_from(caller, name).cloned()
+            self.frames[..caller].iter().rev().find_map(|f| f.get(name)).cloned()
         };
-        self.set_rc(name, v.unwrap_or_default());
+        match v {
+            Some(slot) => self.set_slot(name, slot),
+            None => self.set_rc(name, Rc::default()),
+        }
     }
 
     pub fn push_frame(&mut self) {
@@ -801,16 +863,32 @@ impl<'s, W: Write> Engine<'s, W> {
         // `Slot::bytes` and takes 50 and more
         let mut parts_real = 0u64;
         let mut last: Option<Rc<Set>> = None;
-        for st in stmts {
-            self.exec(st)?;
-            let Some((set, bytes)) = self.frames.iter().rev().find_map(|f| f.get(&st.into)).map(|s| (s.set.clone(), s.bytes)) else { continue };
+        // the derived elements of all parts and their bytes as counted when
+        // the parts were stored
+        let (mut derived_len, mut derived_size) = (0usize, 0u64);
+        for (i, st) in stmts.iter().enumerate() {
+            #[cfg(test)]
+            let off = KNOWN_OFF.get();
+            #[cfg(not(test))]
+            let off = false;
+            if !off && union_only_reads(st, stmts.get(i + 1), into) && !(parts.is_empty() && acc.is_none()) {
+                self.known = acc.iter().chain(&parts).cloned().collect();
+            }
+            let done = self.exec(st);
+            self.known.clear();
+            done?;
+            let Some((set, bytes, size)) = self.frames.iter().rev().find_map(|f| f.get(&st.into)).map(|s| (s.set.clone(), s.bytes, s.size)) else { continue };
             if last.as_ref().is_some_and(|l| Rc::ptr_eq(l, &set)) {
                 continue;
             }
             last = Some(set.clone());
+            derived_len += set.derived.len();
+            derived_size += bytes - size;
             parts_len += set.len();
             parts_bytes += bytes;
-            parts_real += set.approx_bytes();
+            // derived elements as counted when the set was stored: a loop
+            // that adds one per round would visit all of them each round
+            parts_real += set.approx_bytes_elements() + (bytes - size);
             self.held_bytes += bytes;
             parts.push(set);
             let many = parts.len() >= MANY_PARTS && parts_len > 2 * acc_len + 100_000;
@@ -825,8 +903,7 @@ impl<'s, W: Write> Engine<'s, W> {
             }
             let mut all: Vec<Rc<Set>> = acc.take().into_iter().collect();
             all.append(&mut parts);
-            let merged = Set::union_all(&all);
-            drop(all);
+            let merged = Set::union_all(all);
             self.held_bytes -= acc_bytes + parts_bytes;
             let size = merged.counted_size();
             acc_len = merged.len();
@@ -841,17 +918,31 @@ impl<'s, W: Write> Engine<'s, W> {
             self.check()?;
         }
         drop(last);
+        // The frame goes first: the result of the last member stored under
+        // the name of the union is then held by `parts` alone, and its
+        // elements move into the result.
+        self.pop_and_leak(Some(into));
         let acc = match (acc, parts.is_empty()) {
             (Some(a), true) => Rc::try_unwrap(a).unwrap_or_else(|a| (*a).clone()),
             (a, _) => {
                 let mut all: Vec<Rc<Set>> = a.into_iter().collect();
                 all.append(&mut parts);
-                Set::union_all(&all)
+                Set::union_all(all)
             }
         };
         self.held_bytes -= acc_bytes + parts_bytes;
-        self.pop_and_leak(Some(into));
-        self.set(into, acc);
+        let mut acc = acc;
+        if !acc.derived.is_sorted_by_key(|d| d.id) {
+            acc.derived.sort_by_key(|d| d.id);
+        }
+        // No derived element dropped for an equal id: their bytes are the
+        // sum of the parts (a loop that adds one element per round would
+        // count all of them again each round).
+        let size = acc.counted_size();
+        let bytes = size + if acc.derived.len() == derived_len { derived_size } else { derived_bytes(&acc) };
+        #[cfg(test)]
+        assert_eq!(bytes, size + derived_bytes(&acc));
+        self.set_slot(into, Slot { set: Rc::new(acc), size, bytes });
         Ok(())
     }
 
@@ -937,12 +1028,14 @@ impl<'s, W: Write> Engine<'s, W> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::{Load, count_cpus, par_map, par_run, spread, threads};
     use std::time::Duration;
 
-    /// The tests that time sections beside a long one run one at a time.
-    fn pool_test() -> std::sync::MutexGuard<'static, ()> {
+    /// The tests that time sections beside a long one run one at a time,
+    /// and not beside the tests of other modules with long sections of
+    /// their own (which take this too).
+    pub(crate) fn pool_test() -> std::sync::MutexGuard<'static, ()> {
         static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
         LOCK.lock().unwrap_or_else(|e| e.into_inner())
     }

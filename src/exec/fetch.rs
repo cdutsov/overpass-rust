@@ -312,11 +312,7 @@ pub use crate::geo::cell_in_ranges;
 /// together (`level_ranges_many`).
 pub fn ranges_for(kind: Kind, rects: &[Rect]) -> Vec<CodeRange> {
     if rects.len() > 32 {
-        let rows = join_rows(tile_runs(rects));
-        return merge_ranges(match kind {
-            Kind::Node => level_ranges_many(MAX_LEVEL, &rows, false),
-            _ => (0..=MAX_LEVEL).flat_map(|level| level_ranges_many(level, &rows, true)).collect(),
-        });
+        return ranges_for_many(kind, rects);
     }
     let mut r = Vec::new();
     for rect in rects {
@@ -326,6 +322,17 @@ pub fn ranges_for(kind: Kind, rects: &[Rect]) -> Vec<CodeRange> {
         }
     }
     merge_ranges(r)
+}
+
+/// `ranges_for` as it works for many rectangles, whatever their number:
+/// joined into rows and walked together. The tiles of an area and the
+/// same tiles joined into rows beforehand give the same ranges.
+pub fn ranges_for_many(kind: Kind, rects: &[Rect]) -> Vec<CodeRange> {
+    let rows = join_rows(tile_runs(rects));
+    merge_ranges(match kind {
+        Kind::Node => level_ranges_many(MAX_LEVEL, &rows, false),
+        _ => (0..=MAX_LEVEL).flat_map(|level| level_ranges_many(level, &rows, true)).collect(),
+    })
 }
 
 /// Cell ranges where ways or relations whose great-circle edges may meet
@@ -508,6 +515,139 @@ fn par_flat_map<I: Sync, T: Send + MemSize>(limits: &Limits, items: &[I], f: imp
     Ok(out)
 }
 
+/// Pairs of bytes one of which every value that a regex matches holds side
+/// by side: the first two bytes of each match (the prefixes of the pattern
+/// cut to two bytes; a case-insensitive pattern has a few spellings of
+/// them). A scan of the values of a key asks this first: most values hold
+/// none of the pairs and are passed over without the UTF-8 check and the
+/// regex, which were half of the time of a scan of all names. None when
+/// the pattern tells no such pairs (a match may start with anything, or be
+/// shorter than two bytes).
+struct FirstPairs(Box<[u64; 1024]>);
+
+impl FirstPairs {
+    fn of(re: &super::filter::Ere) -> Option<FirstPairs> {
+        use regex_syntax::hir::literal::{ExtractKind, Extractor};
+        // the parser of `filter::required_literals`
+        let hir = regex_syntax::ParserBuilder::new().dot_matches_new_line(true).build().parse(re.as_str()).ok()?;
+        let seq = Extractor::new().kind(ExtractKind::Prefix).limit_literal_len(2).extract(&hir);
+        let lits = seq.literals()?;
+        // Substitutes of word-difference characters (lead byte F1) are not
+        // in values (as in `required_literals`).
+        if lits.is_empty() || lits.iter().any(|l| l.len() < 2 || l.as_bytes().contains(&0xF1)) {
+            return None;
+        }
+        let mut bits = Box::new([0u64; 1024]);
+        for l in lits {
+            let b = l.as_bytes();
+            let i = (b[0] as usize) << 8 | b[1] as usize;
+            bits[i >> 6] |= 1 << (i & 63);
+        }
+        Some(FirstPairs(bits))
+    }
+
+    #[inline]
+    fn may_match(&self, v: &[u8]) -> bool {
+        v.windows(2).any(|w| {
+            let i = (w[0] as usize) << 8 | w[1] as usize;
+            self.0[i >> 6] >> (i & 63) & 1 == 1
+        })
+    }
+}
+
+/// Whether a value of the tag index passes the regex: a truncated value
+/// (it holds a byte 1) is taken and tested on the element.
+#[inline]
+fn value_passes(re: &super::filter::Ere, pairs: Option<&FirstPairs>, val: &[u8]) -> bool {
+    val.contains(&1) || (pairs.is_none_or(|p| p.may_match(val)) && std::str::from_utf8(val).is_ok_and(|s| re.is_match(s)))
+}
+
+/// The places of `elems` in the order of their (cell, id). The elements of
+/// a set come sorted by id and lie in few cells compared with their number
+/// (the nodes of a box in its tiles): they are counted per cell and put in
+/// place, which keeps the ids of a cell in order; a cell whose ids do not
+/// ascend (`out qt`) is sorted. About a quarter of the time of sorting the
+/// pairs.
+fn by_cell(elems: &[(Cell, Id)]) -> Vec<u32> {
+    let value = |c: Cell| codec::cell_value(c);
+    // group number per cell, in order of first appearance
+    let mut group: FxHashMap<u64, u32> = FxHashMap::default();
+    let mut cells: Vec<(u64, u32)> = Vec::new();
+    let mut of: Vec<u32> = Vec::with_capacity(elems.len());
+    let mut last = (u64::MAX, 0u32);
+    for (c, _) in elems {
+        let v = value(*c);
+        if v != last.0 {
+            let g = *group.entry(v).or_insert_with(|| {
+                cells.push((v, 0));
+                cells.len() as u32 - 1
+            });
+            last = (v, g);
+        }
+        cells[last.1 as usize].1 += 1;
+        of.push(last.1);
+    }
+    // where the elements of each group start, the groups in cell order
+    let mut by_value: Vec<u32> = (0..cells.len() as u32).collect();
+    by_value.sort_unstable_by_key(|&g| cells[g as usize].0);
+    let mut next: Vec<u32> = vec![0; cells.len()];
+    let mut at = 0;
+    for &g in &by_value {
+        next[g as usize] = at;
+        at += cells[g as usize].1;
+    }
+    let starts = next.clone();
+    let mut order: Vec<u32> = vec![0; elems.len()];
+    for (i, &g) in of.iter().enumerate() {
+        order[next[g as usize] as usize] = i as u32;
+        next[g as usize] += 1;
+    }
+    for (g, &s) in starts.iter().enumerate() {
+        let run = &mut order[s as usize..next[g] as usize];
+        if run.windows(2).any(|w| elems[w[0] as usize].1 > elems[w[1] as usize].1) {
+            run.sort_unstable_by_key(|&i| elems[i as usize].1);
+        }
+    }
+    order
+}
+
+/// Sort decoded elements by id. They come chunk by chunk in the order of
+/// their (cell, id): ascending ids per cell. For nodes, up to RUNS such
+/// runs are merged (the stable sort finds them: a box of a few tiles, the
+/// nodes of its ways), which costs a third of sorting from scratch; more
+/// of them, or more than 2^18 nodes (the merge takes a buffer of half of
+/// them, which the limits do not count), are sorted in place. Ways and
+/// relations are sorted in place: for elements of their size the merge
+/// was slower than the unstable sort from 8 runs on.
+fn sort_by_id<T: Stored>(v: &mut [T]) {
+    const RUNS: usize = 64;
+    if T::KIND != Kind::Node {
+        v.sort_unstable_by_key(|e| e.id());
+        return;
+    }
+    let mut runs = 1;
+    if v.len() <= 1 << 18 {
+        for w in v.windows(2) {
+            if w[1].id() < w[0].id() {
+                runs += 1;
+                if runs > RUNS {
+                    break;
+                }
+            }
+        }
+    } else {
+        runs = RUNS + 1;
+    }
+    if runs == 1 {
+        return;
+    }
+    if runs <= RUNS {
+        v.sort_by_key(|e| e.id());
+    } else {
+        v.sort_unstable_by_key(|e| e.id());
+    }
+}
+
 impl<'s> Fetch<'s> {
     pub fn new(snap: &'s Snapshot<'s>) -> Fetch<'s> {
         Fetch { snap, pos_cache: RefCell::new(FxHashMap::default()), area_db: RefCell::new(None), user_cache: RefCell::new(FxHashMap::default()), limits: Limits::default() }
@@ -517,7 +657,7 @@ impl<'s> Fetch<'s> {
     pub fn by_ids<T: Stored>(&self, ids: &[Id]) -> Result<Vec<T>> {
         let chunks = self.snap.chunks_with_ids(T::KIND, ids)?;
         let mut out = decode_chunks(&self.limits, &chunks, |(v, _)| *v, |(v, want)| T::decode(v, Pick::Ids(want)))?;
-        out.sort_unstable_by_key(|e| e.id());
+        sort_by_id(&mut out);
         out.dedup_by_key(|e| e.id());
         Ok(out)
     }
@@ -526,7 +666,7 @@ impl<'s> Fetch<'s> {
     pub fn ways_untagged(&self, ids: &[Id]) -> Result<Vec<Way>> {
         let chunks = self.snap.chunks_with_ids(Kind::Way, ids)?;
         let mut out = decode_chunks(&self.limits, &chunks, |(v, _)| *v, |(v, want)| codec::decode_ways(v, Pick::Ids(want), false))?;
-        out.sort_unstable_by_key(|w| w.id);
+        sort_by_id(&mut out);
         Ok(out)
     }
 
@@ -534,7 +674,7 @@ impl<'s> Fetch<'s> {
     pub fn ways_untagged_at(&self, pairs: Vec<(Cell, Id)>) -> Result<Vec<Way>> {
         let chunks = self.snap.chunks_at(Kind::Way, pairs)?;
         let mut out = decode_chunks(&self.limits, &chunks, |(v, _)| *v, |(v, want)| codec::decode_ways(v, Pick::Ids(want), false))?;
-        out.sort_unstable_by_key(|w| w.id);
+        sort_by_id(&mut out);
         Ok(out)
     }
 
@@ -554,7 +694,7 @@ impl<'s> Fetch<'s> {
             es.shrink_to_fit();
             Ok(es)
         })?;
-        out.sort_unstable_by_key(|e| e.id());
+        sort_by_id(&mut out);
         out.dedup_by_key(|e| e.id());
         Ok(out)
     }
@@ -568,9 +708,19 @@ impl<'s> Fetch<'s> {
     pub fn in_ranges_tagged<T: Stored>(&self, ranges: &[CodeRange], filters: &[TagFilter], chunk: &(dyn Fn(&[u8]) -> bool + Sync), keep: &(dyn Fn(&Tags) -> bool + Sync)) -> Result<Vec<T>> {
         let chunks = self.snap.chunks_in_ranges(T::KIND, ranges)?;
         let keys = required_keys(filters);
-        let test = codec::TagTest { chunk, keep, keys: &keys };
+        // the key regex of a `[~"k"~"v"]` filter, asked once per key of a chunk
+        let key_res: Vec<&crate::exec::filter::Ere> = filters.iter().filter_map(|f| match f { TagFilter::KeyRegex { key, .. } => Some(key), _ => None }).collect();
+        let key_fns: Vec<Box<dyn Fn(&str) -> bool + Sync + '_>> = key_res.iter().map(|re| Box::new(move |k: &str| re.is_match(k)) as Box<dyn Fn(&str) -> bool + Sync + '_>).collect();
+        let key_tests: Vec<&(dyn Fn(&str) -> bool + Sync)> = key_fns.iter().map(|b| &**b).collect();
+        // A required key lies in the key table of a chunk as its bytes: where
+        // they do not occur in the payload at all, no element has the key, and
+        // the chunk is dropped before anything of it is read (to reach the key
+        // table of a way chunk every way has to be stepped over).
+        let key_bytes = keys.iter().filter(|k| k.len() >= 3 && k.is_ascii()).map(|k| regex::bytes::Regex::new(&regex::escape(k))).collect::<std::result::Result<Vec<_>, _>>()?;
+        let chunk = &|data: &[u8]| key_bytes.iter().all(|re| re.is_match(data)) && chunk(data);
+        let test = codec::TagTest { chunk, keep, keys: &keys, key_tests: &key_tests };
         let mut out = decode_chunks(&self.limits, &chunks, |v| *v, |v| T::decode_where(v, Pick::Cells(ranges), test))?;
-        out.sort_unstable_by_key(|e| e.id());
+        sort_by_id(&mut out);
         out.dedup_by_key(|e| e.id());
         Ok(out)
     }
@@ -586,7 +736,7 @@ impl<'s> Fetch<'s> {
             es.shrink_to_fit();
             Ok(es)
         })?;
-        out.sort_unstable_by_key(|e| e.id());
+        sort_by_id(&mut out);
         Ok(out)
     }
 
@@ -611,7 +761,7 @@ impl<'s> Fetch<'s> {
                 None => T::decode(v, Pick::Ids(want)),
             })?);
         }
-        out.sort_unstable_by_key(|e| e.id());
+        sort_by_id(&mut out);
         out.dedup_by_key(|e| e.id());
         Ok(out)
     }
@@ -650,7 +800,7 @@ impl<'s> Fetch<'s> {
         if stop.load(Relaxed) {
             return Ok(None);
         }
-        out.sort_unstable_by_key(|e| e.id());
+        sort_by_id(&mut out);
         out.dedup_by_key(|e| e.id());
         Ok(Some(out))
     }
@@ -834,7 +984,8 @@ impl<'s> Fetch<'s> {
         self.limits.check()?;
         let limits = &self.limits;
         // Values failing the regex are skipped as a whole (`scan_candidates`).
-        let accept = |val: &[u8]| re.is_none_or(|re| val.contains(&1) || std::str::from_utf8(val).is_ok_and(|s| re.is_match(s)));
+        let pairs = re.and_then(FirstPairs::of);
+        let accept = |val: &[u8]| re.is_none_or(|re| value_passes(re, pairs.as_ref(), val));
         // The threads stop past the pairs the memory budget has room for;
         // more than that is then an error.
         let out = self.snap.scan_tags_par(kind, &k, prefixes, ranges, SCAN_THREADS, max.min(limits.pairs_room()), || limits.expired(), accept, keep)?;
@@ -880,7 +1031,12 @@ impl<'s> Fetch<'s> {
     /// (not for `key=value`); false ends the scan.
     fn scan_candidates(&self, kind: Kind, f: &TagFilter, ranges: Option<&[CodeRange]>, mut visit: impl FnMut() -> bool, mut push: impl FnMut(Cell, &[Id]) -> Result<Scan>) -> Result<()> {
         // Value test for regexes: values failing it are skipped as a whole.
-        let value_test = |re: &super::filter::Ere, val: &[u8]| val.contains(&1) || std::str::from_utf8(val).is_ok_and(|s| re.is_match(s));
+        let pairs = match f {
+            TagFilter::Regex { re, neg: false, .. } => FirstPairs::of(re),
+            TagFilter::KeyRegex { value, .. } => FirstPairs::of(value),
+            _ => None,
+        };
+        let value_test = |re: &super::filter::Ere, val: &[u8]| value_passes(re, pairs.as_ref(), val);
         let mut accept = |ok: bool| match (visit(), ok) {
             (false, _) => Scan::Stop,
             (true, true) => Scan::Next,
@@ -983,7 +1139,19 @@ impl<'s> Fetch<'s> {
             }
         }
         let ranges = merge_ranges(ranges);
-        self.in_ranges::<Way>(&ranges, |w| w.nodes.iter().any(|n| ids.contains(n)))
+        // A way holds the positions of its nodes in its box (the ranges
+        // above rest on that too): one whose box lies apart from the box
+        // of the nodes uses none of them.
+        let mut span = Rect::EMPTY;
+        for (_, p) in nodes {
+            span.extend(*p);
+        }
+        let boxed = |b: &Rect| b.y0 <= span.y1 && span.y0 <= b.y1 && b.x0 <= span.x1 && span.x0 <= b.x1;
+        let chunks = self.snap.chunks_in_ranges(Kind::Way, &ranges)?;
+        let mut out = decode_chunks(&self.limits, &chunks, |v| *v, |v| codec::decode_ways_using(v, Pick::Cells(&ranges), &boxed, |nds| nds.iter().any(|n| ids.contains(n))))?;
+        sort_by_id(&mut out);
+        out.dedup_by_key(|w| w.id);
+        Ok(out)
     }
 
     /// Relations having any of the given elements as members.
@@ -996,10 +1164,83 @@ impl<'s> Fetch<'s> {
     /// there are many.
     pub fn meta(&self, kind: Kind, ids: &[Id]) -> Result<FxHashMap<Id, Meta>> {
         let chunks = self.snap.meta_chunks(kind, ids)?;
+        self.meta_of(chunks, ids.len())
+    }
+
+    /// `meta` for elements in hand, given as (cell, id) with the cell of
+    /// `Stored::cell`, in the order given (None: no meta data). An element
+    /// and its meta data are stored under that cell, so the id index is
+    /// not read (a bucket of 512 ids per lookup), and the answer needs no
+    /// map: the elements are put in the order of the chunks (`by_cell`),
+    /// which is the order the chunks give their records in. An element
+    /// without meta data at its cell is looked up by the id index, as
+    /// `meta` does.
+    pub fn meta_in_order(&self, kind: Kind, elems: &[(Cell, Id)]) -> Result<Vec<Option<Meta>>> {
+        let mut out: Vec<Option<Meta>> = vec![None; elems.len()];
+        let order = by_cell(elems);
+        let pairs: Vec<(Cell, Id)> = order.iter().map(|&i| elems[i as usize]).collect();
+        if pairs.windows(2).any(|w| w[0] == w[1]) {
+            // an element twice: no caller does that; the plain way
+            let ids: Vec<Id> = elems.iter().map(|e| e.1).collect();
+            let m = self.meta(kind, &ids)?;
+            return Ok(ids.iter().map(|id| m.get(id).copied()).collect());
+        }
+        let chunks = self.snap.meta_chunks_at(kind, &pairs)?;
+        // the run of `pairs` of each chunk; pairs before the first chunk of
+        // the table are in none
+        let mut start = pairs.len() - chunks.iter().map(|c| c.1.len()).sum::<usize>().min(pairs.len());
+        let work: Vec<(&[u8], &[Id], std::ops::Range<usize>)> = chunks
+            .iter()
+            .map(|(v, ids)| {
+                let r = start..start + ids.len();
+                start = r.end;
+                (*v, &ids[..], r)
+            })
+            .collect();
+        let limits = &self.limits;
+        let mut found = 0;
+        super::par_run(&work, PAR_THRESHOLD, |(v, ids, r)| -> Result<(Vec<codec::MetaRec>, std::ops::Range<usize>)> {
+            limits.check()?;
+            Ok((codec::decode_meta(v, Pick::Ids(ids))?, r.clone()))
+        }, |(recs, r)| {
+            // records and pairs of a chunk come in the same order
+            let mut j = r.start;
+            for m in recs {
+                let at = match (j..r.end).find(|&k| pairs[k].1 == m.id) {
+                    Some(k) => k,
+                    None => match r.clone().find(|&k| pairs[k].1 == m.id) {
+                        Some(k) => k,
+                        None => continue,
+                    },
+                };
+                // a slot counts once: a second record of an id (a stale copy
+                // in the chunk) must not stand in for a missing element
+                let slot = &mut out[order[at] as usize];
+                found += slot.is_none() as usize;
+                *slot = Some(m.meta);
+                j = at + 1;
+            }
+            Ok(())
+        })?;
+        if found < elems.len() {
+            let rest: Vec<Id> = elems.iter().zip(&out).filter(|(_, m)| m.is_none()).map(|(e, _)| e.1).collect();
+            let m = self.meta(kind, &rest)?;
+            if !m.is_empty() {
+                for (e, o) in elems.iter().zip(out.iter_mut()) {
+                    if o.is_none() {
+                        *o = m.get(&e.1).copied();
+                    }
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    fn meta_of(&self, chunks: Vec<(&[u8], Vec<Id>)>, n: usize) -> Result<FxHashMap<Id, Meta>> {
         let decode = |(v, want): &(&[u8], Vec<Id>)| -> Result<Vec<(Id, Meta)>> {
             Ok(codec::decode_meta(v, Pick::Ids(want))?.into_iter().map(|m| (m.id, m.meta)).collect())
         };
-        let mut out = FxHashMap::with_capacity_and_hasher(ids.len(), Default::default());
+        let mut out = FxHashMap::with_capacity_and_hasher(n, Default::default());
         let limits = &self.limits;
         super::par_run(&chunks, PAR_THRESHOLD, |c| {
             limits.check()?;
@@ -1024,6 +1265,440 @@ impl<'s> Fetch<'s> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// rv-scan: `FirstPairs` passes every value its regex matches, for
+    /// generated patterns: classes, POSIX classes, alternatives, groups,
+    /// repeats, anchors, `.`, escapes, non-ASCII letters with special case
+    /// rules, with and without `,i`.
+    #[test]
+    #[ignore = "randomized, about 3 s: cargo test --release --lib rv_first_pairs_generated_patterns -- --ignored"]
+    fn rv_first_pairs_generated_patterns() {
+        use super::super::filter::compile_regex;
+        let mut x = 0x0123_4567_89ab_cdefu64;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) % n.max(1)
+        };
+        let alpha: Vec<char> = "abABsSkKiIıİüÜßẞſ\u{212a}ǅǆǄуУ日🙂. xé\u{301}01-\u{200d}‿\u{e48}_".chars().collect();
+        let words = ["\\b", "\\<", "\\>", "\\w", "\\W", "\\B"];
+        let posix = ["[[:alpha:]]", "[[:upper:]]", "[[:lower:]]", "[[:digit:]]", "[[:alnum:]]", "[[:space:]]", "[[:punct:]]"];
+        let quant = ["", "", "", "?", "*", "+", "{2}", "{1,2}", "{0,1}"];
+        fn esc(c: char) -> String {
+            if ".[]()*+?{}|^$\\".contains(c) { format!("\\{c}") } else { c.to_string() }
+        }
+        let (mut with, mut checked, mut matched, mut wsub) = (0, 0u64, 0u64, 0u64);
+        for round in 0..6000 {
+            let mut pat = String::new();
+            if next(4) == 0 {
+                pat.push('^');
+            }
+            let atoms = 1 + next(4);
+            let mut lits: Vec<char> = Vec::new();
+            for _ in 0..atoms {
+                let atom = match next(12) {
+                    0 => ".".to_string(),
+                    10 | 11 => words[next(words.len() as u64) as usize].to_string(),
+                    1 => {
+                        let neg = if next(4) == 0 { "^" } else { "" };
+                        let cs: String = (0..1 + next(3)).map(|_| alpha[next(alpha.len() as u64) as usize]).filter(|c| !"[]^-\\".contains(*c)).collect();
+                        if cs.is_empty() { "a".to_string() } else { format!("[{neg}{cs}]") }
+                    }
+                    2 => posix[next(posix.len() as u64) as usize].to_string(),
+                    3 => {
+                        let a: String = (0..1 + next(3)).map(|_| esc(alpha[next(alpha.len() as u64) as usize])).collect();
+                        let b: String = (0..1 + next(3)).map(|_| esc(alpha[next(alpha.len() as u64) as usize])).collect();
+                        format!("({a}|{b})")
+                    }
+                    _ => {
+                        let c = alpha[next(alpha.len() as u64) as usize];
+                        lits.push(c);
+                        esc(c)
+                    }
+                };
+                pat += &atom;
+                pat += quant[next(quant.len() as u64) as usize];
+            }
+            if next(4) == 0 {
+                pat.push('$');
+            }
+            for ci in [false, true] {
+                let Ok(re) = compile_regex(&pat, ci) else { continue };
+                let Some(pairs) = FirstPairs::of(&re) else { continue };
+                with += 1;
+                for k in 0..300 {
+                    let len = next(7) as usize;
+                    let mut v = String::new();
+                    for _ in 0..len {
+                        let c = if !lits.is_empty() && next(2) == 0 { lits[next(lits.len() as u64) as usize] } else { alpha[next(alpha.len() as u64) as usize] };
+                        // case variants
+                        match next(4) {
+                            0 => v.extend(c.to_uppercase()),
+                            1 => v.extend(c.to_lowercase()),
+                            _ => v.push(c),
+                        }
+                    }
+                    if k % 3 == 0 {
+                        // the pattern text as a value, as far as it is literal
+                        v = pat.chars().filter(|c| !".[]()*+?{}|^$\\:".contains(*c)).collect();
+                    }
+                    checked += 1;
+                    if re.is_match(&v) {
+                        matched += 1;
+                        if words.iter().any(|w| pat.contains(*w)) && v.chars().any(|c| "\u{301}\u{200d}‿\u{e48}".contains(c)) {
+                            wsub += 1;
+                        }
+                        assert!(pairs.may_match(v.as_bytes()), "round {round}: {pat:?} (ci {ci}) matches {v:?}");
+                        assert!(value_passes(&re, Some(&pairs), v.as_bytes()));
+                    }
+                }
+            }
+        }
+        eprintln!("{with} patterns with pairs, {matched} of {checked} values matched, {wsub} with word boundaries and word-difference characters");
+        assert!(with > 1000 && matched > 20_000 && wsub > 50, "{with} patterns with pairs, {matched} of {checked} values matched, {wsub} word");
+    }
+
+    /// rv-scan: after diffs that move nodes (to other tiles, across the
+    /// antimeridian), create nodes that ways waited for, delete nodes and
+    /// change ways and relations: (1) the meta data of every element lies
+    /// at its cell, as `meta_in_order` assumes, and `meta_in_order` gives
+    /// what `meta` gives; (2) `ways_with_nodes` with its box test gives the
+    /// ways that use the nodes; (3) `check_ways` finds no problem.
+    #[test]
+    fn rv_meta_cells_and_way_boxes_after_diffs() {
+        use std::io::BufReader;
+        let dir = std::env::temp_dir().join(format!("rv-meta-diffs-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let m = |v: u64| format!("version=\"{v}\" timestamp=\"2020-0{}-01T00:00:00Z\" changeset=\"{}\" uid=\"{}\" user=\"u{}\"", 1 + v % 9, 100 + v, 1 + v % 7, 1 + v % 7);
+        let mut osm = String::from("<osm version=\"0.6\">\n");
+        // 40 x 40 nodes on tile borders and inside tiles near (47, 8); a few near the antimeridian
+        let tile_lat = 180.0 / 65536.0;
+        let tile_lon = 360.0 / 65536.0;
+        let mut id = 0u64;
+        for i in 0..40 {
+            for j in 0..40 {
+                id += 1;
+                let (lat, lon) = (47.0 + (i / 2) as f64 * tile_lat + if i % 2 == 0 { 1e-7 } else { tile_lat - 1e-7 }, 8.0 + (j / 2) as f64 * tile_lon + if j % 2 == 0 { 1e-7 } else { tile_lon - 1e-7 });
+                osm += &format!("<node id=\"{id}\" {} lat=\"{lat:.7}\" lon=\"{lon:.7}\"/>\n", m(id));
+            }
+        }
+        for k in 0..20u64 {
+            osm += &format!("<node id=\"{}\" {} lat=\"{:.7}\" lon=\"{:.7}\"/>\n", 2000 + k, m(k), -16.5 + k as f64 * 0.01, if k % 2 == 0 { 179.9999 } else { -179.9999 });
+        }
+        // ways: rows, columns, with missing nodes (ids 5000+), one of missing nodes only
+        let mut wid = 0u64;
+        let mut ways: Vec<Vec<u64>> = Vec::new();
+        for i in 0..40u64 {
+            ways.push((0..40).map(|j| 1 + i * 40 + j).collect());
+            ways.push((0..40).map(|j| 1 + j * 40 + i).collect());
+        }
+        for k in 0..30u64 {
+            ways.push(vec![1 + k * 37 % 1600, 5000 + k, 1 + (k * 53 + 7) % 1600]);
+        }
+        ways.push(vec![6000, 6001, 6002]);
+        ways.push((2000..2020).collect());
+        for nds in &ways {
+            wid += 1;
+            let nd: String = nds.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect();
+            osm += &format!("<way id=\"{wid}\" {}>{nd}<tag k=\"highway\" v=\"path\"/></way>\n", m(wid));
+        }
+        for r in 1..=60u64 {
+            let mem = match r % 4 {
+                0 => format!("<member type=\"way\" ref=\"{}\" role=\"\"/><member type=\"node\" ref=\"{}\" role=\"x\"/>", r, r * 13),
+                1 => format!("<member type=\"node\" ref=\"{}\" role=\"\"/><member type=\"node\" ref=\"{}\" role=\"\"/>", 5000 + r, r * 7),
+                2 => format!("<member type=\"relation\" ref=\"{}\" role=\"\"/>", r + 1),
+                _ => String::new(),
+            };
+            osm += &format!("<relation id=\"{r}\" {}>{mem}<tag k=\"type\" v=\"route\"/></relation>\n", m(r));
+        }
+        let file = dir.join("in.osm");
+        std::fs::write(&file, osm + "</osm>\n").unwrap();
+        let db = crate::store::Db::open(&dir.join("db")).unwrap();
+        crate::import::import_file(&db, &file, &mut Default::default()).unwrap();
+        let apply = |body: String| {
+            let b = format!("<osmChange version=\"0.6\">\n{body}</osmChange>\n");
+            let mut t = db.write().unwrap();
+            let mut r = crate::import::ImportReport::default();
+            crate::import::apply_reader(&mut t, BufReader::new(b.as_bytes()), &mut r).unwrap();
+            assert!(r.skipped.is_empty(), "{:?}", r.skipped);
+            t.commit().unwrap();
+        };
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) % n.max(1)
+        };
+        fn at_cells<T: Stored>(f: &Fetch, all: &[T]) -> usize {
+            let mut pairs: Vec<(Cell, Id)> = all.iter().map(|e| (e.cell(), e.id())).collect();
+            pairs.sort_unstable();
+            let mut found = 0;
+            for (v, ids) in f.snap.meta_chunks_at(T::KIND, &pairs).unwrap() {
+                let recs = codec::decode_meta(v, Pick::Ids(&ids)).unwrap();
+                for r in &recs {
+                    // the record lies at the cell of its element
+                    if pairs.binary_search(&(r.cell, r.id)).is_ok() {
+                        found += 1;
+                    }
+                }
+            }
+            found
+        }
+        let check = |round: usize, next: &mut dyn FnMut(u64) -> u64| {
+            let snap = db.snapshot().unwrap();
+            let f = Fetch::new(&snap);
+            let nodes = f.all::<Node>(|_| true).unwrap();
+            let ways = f.all::<Way>(|_| true).unwrap();
+            let rels = f.all::<Relation>(|_| true).unwrap();
+            assert_eq!(at_cells(&f, &nodes), nodes.len(), "round {round}: nodes");
+            assert_eq!(at_cells(&f, &ways), ways.len(), "round {round}: ways");
+            assert_eq!(at_cells(&f, &rels), rels.len(), "round {round}: relations");
+            fn same<T: Stored>(f: &Fetch, all: &[T], round: usize) {
+                let elems: Vec<(Cell, Id)> = all.iter().map(|e| (e.cell(), e.id())).collect();
+                let ids: Vec<Id> = all.iter().map(|e| e.id()).collect();
+                let map = f.meta(T::KIND, &ids).unwrap();
+                let want: Vec<Option<Meta>> = ids.iter().map(|id| map.get(id).copied()).collect();
+                assert!(want.iter().all(|m| m.is_some()), "round {round}");
+                assert_eq!(f.meta_in_order(T::KIND, &elems).unwrap(), want, "round {round}");
+            }
+            same(&f, &nodes, round);
+            same(&f, &ways, round);
+            same(&f, &rels, round);
+            for k in 0..30 {
+                let step = 1 + next(if k % 2 == 0 { 5 } else { 300 });
+                let sub: Vec<(Id, Pt)> = nodes.iter().filter(|_| next(step) == 0).map(|n| (n.id, n.pos)).collect();
+                let set: FxHashSet<Id> = sub.iter().map(|s| s.0).collect();
+                let want: Vec<Id> = ways.iter().filter(|w| w.nodes.iter().any(|n| set.contains(n))).map(|w| w.id).collect();
+                let got: Vec<Id> = f.ways_with_nodes(&sub).unwrap().iter().map(|w| w.id).collect();
+                assert_eq!(got, want, "round {round} subset {k}");
+            }
+            drop(f);
+            drop(snap);
+            let (_, problems) = crate::update::check::check_ways(&db, 0, 1).unwrap();
+            assert!(problems.is_empty(), "round {round}: {problems:?}");
+        };
+        check(0, &mut next);
+        for round in 1..=6 {
+            let mut body = String::from("<modify>\n");
+            let mut v = 10 + round as u64;
+            // nodes moved: a little, to another tile, far away, over the antimeridian
+            for _ in 0..60 {
+                let n = 1 + next(1600);
+                v += 1;
+                let (lat, lon) = match next(4) {
+                    0 => (47.0 + next(40) as f64 * tile_lat * 0.5 + 1e-7, 8.0 + next(40) as f64 * tile_lon * 0.5 + 1e-7),
+                    1 => (47.0 + next(1000) as f64 * 0.001, 8.0 + next(1000) as f64 * 0.001),
+                    2 => (-33.0 + next(100) as f64 * 0.01, 151.0 + next(100) as f64 * 0.01),
+                    _ => (-16.4, if next(2) == 0 { 179.99999 } else { -179.99999 }),
+                };
+                body += &format!("<node id=\"{n}\" {} lat=\"{lat:.7}\" lon=\"{lon:.7}\"/>\n", m(v));
+            }
+            for k in 0..20u64 {
+                if next(2) == 0 {
+                    let n = 2000 + k;
+                    body += &format!("<node id=\"{n}\" {} lat=\"-16.5\" lon=\"{:.7}\"/>\n", m(v + k), if next(2) == 0 { 179.99 } else { -179.99 });
+                }
+            }
+            // nodes that ways and relations waited for
+            for _ in 0..5 {
+                let n = 5000 + next(70);
+                body += &format!("<node id=\"{n}\" {} lat=\"{:.7}\" lon=\"{:.7}\"/>\n", m(v), 46.0 + next(100) as f64 * 0.02, 7.0 + next(100) as f64 * 0.02);
+            }
+            if round == 3 {
+                body += &format!("<node id=\"6001\" {} lat=\"10.0\" lon=\"10.0\"/>\n", m(v));
+            }
+            // ways with other nodes
+            for _ in 0..10 {
+                let w = 1 + next(wid);
+                let nd: String = (0..2 + next(5)).map(|_| format!("<nd ref=\"{}\"/>", if next(5) == 0 { 5000 + next(70) } else { 1 + next(1600) })).collect();
+                body += &format!("<way id=\"{w}\" {}>{nd}<tag k=\"highway\" v=\"track\"/></way>\n", m(v));
+            }
+            // relations with other members
+            for _ in 0..5 {
+                let r = 1 + next(60);
+                body += &format!("<relation id=\"{r}\" {}><member type=\"way\" ref=\"{}\" role=\"\"/><tag k=\"type\" v=\"route\"/></relation>\n", m(v), 1 + next(wid));
+            }
+            body += "</modify>\n<delete>\n";
+            for _ in 0..5 {
+                body += &format!("<node id=\"{}\" {}/>\n", 1 + next(1600), m(v + 1));
+            }
+            body += "</delete>\n";
+            apply(body);
+            check(round, &mut next);
+        }
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A value the regex matches passes its `FirstPairs`, for patterns with
+    /// and without `,i`, classes, alternatives, anchors and non-ASCII letters;
+    /// patterns whose matches may start with anything have none.
+    #[test]
+    fn first_pairs_pass_every_match() {
+        use super::super::filter::compile_regex;
+        let words = ["Dead Sea", "dead sea", "DEAD SEA", "Red Sea", "Zürich", "ZÜRICH", "zürich", "Bahnhofstrasse", "bahnhof", "Rue de la Paix", "RUE", "rue", "Mini", "MINI", "mını", "İstanbul", "istanbul", "ISTANBUL", "Kelvin", "\u{212a}elvin", "ſea", "улица Ленина", "УЛИЦА", "a", "ab", "", "x", "Straße", "STRASSE", "ǅ", "ǆ", "Ǆ"];
+        let mut values: Vec<String> = words.iter().map(|w| w.to_string()).collect();
+        for a in words {
+            for b in words {
+                values.push(format!("{a} {b}"));
+                values.push(format!("{a}{b}"));
+            }
+        }
+        let patterns = ["Dead Sea", "dead", "Sea$", "^Red", "(Bahnhof|Station)", "Zürich", "rue", "Mini", "istanbul", "kelvin", "sea", "улица", "str(a|ä)(ss|ß)e", "[Dd]ead", "D.ad", "ea", "x?Sea", "a*b", ".*Sea", "^$", "S", "ǆ", "Straße", "[[:alpha:]]+ Sea", "(Dead|Red) Sea"];
+        let mut with = 0;
+        let mut dropped = 0;
+        for p in patterns {
+            for ci in [false, true] {
+                let re = compile_regex(p, ci).unwrap();
+                let Some(pairs) = FirstPairs::of(&re) else { continue };
+                with += 1;
+                for v in &values {
+                    if re.is_match(v) {
+                        assert!(pairs.may_match(v.as_bytes()), "{p} (ci {ci}) matches {v:?}");
+                    } else if !pairs.may_match(v.as_bytes()) {
+                        dropped += 1;
+                    }
+                    assert_eq!(value_passes(&re, Some(&pairs), v.as_bytes()), re.is_match(v));
+                }
+            }
+        }
+        assert!(with >= 20 && dropped > 10_000, "{with} patterns with pairs, {dropped} values dropped");
+        for p in [".*Sea", "a*b", "S", "^$", "[[:alpha:]]+ Sea"] {
+            assert!(FirstPairs::of(&compile_regex(p, false).unwrap()).is_none(), "{p}");
+        }
+    }
+
+    /// `by_cell` gives the order of sorting the pairs, for ids that ascend
+    /// (a set), that do not (`out qt`), and for many and few cells.
+    #[test]
+    fn by_cell_orders_as_a_sort() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) % n
+        };
+        for round in 0..400 {
+            let n = next(if round % 20 == 0 { 5000 } else { 60 }) as usize;
+            let cells = 1 + next(if round % 3 == 0 { 3 } else { 300 });
+            let mut elems: Vec<(Cell, Id)> = Vec::new();
+            let mut id = 0;
+            for _ in 0..n {
+                id += 1 + next(50);
+                let c = next(cells) as u32;
+                let cell = if c % 7 == 0 { Cell { level: (c % 16) as u8, code: c << 8 } } else { Cell::tile(c) };
+                elems.push((cell, id));
+            }
+            if round % 4 == 1 {
+                // not by id
+                for i in (1..elems.len()).rev() {
+                    elems.swap(i, next(i as u64 + 1) as usize);
+                }
+            }
+            let got: Vec<(Cell, Id)> = by_cell(&elems).into_iter().map(|i| elems[i as usize]).collect();
+            let mut want = elems.clone();
+            want.sort_unstable();
+            assert_eq!(got, want, "round {round}");
+        }
+    }
+
+    /// `meta_in_order` gives the meta data `meta` finds, in the order
+    /// asked, for elements in any order, with unknown ids, and with cells
+    /// that are not those of the elements (the id index answers then).
+    #[test]
+    fn meta_in_order_as_meta() {
+        let dir = std::env::temp_dir().join(format!("fetch-meta-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut osm = String::from("<osm version=\"0.6\">\n");
+        let n = 30_000u64;
+        for i in 0..n {
+            osm += &format!(
+                "<node id=\"{}\" version=\"{}\" timestamp=\"2020-01-{:02}T00:00:{:02}Z\" changeset=\"{}\" uid=\"{}\" user=\"u{}\" lat=\"{:.5}\" lon=\"{:.5}\"/>\n",
+                i + 1,
+                1 + i % 5,
+                1 + i % 28,
+                i % 60,
+                1000 + i / 7,
+                1 + i % 40,
+                1 + i % 40,
+                47.0 + (i % 300) as f64 * 0.001,
+                8.0 + (i / 300) as f64 * 0.001
+            );
+        }
+        for w in 0..2000u64 {
+            let len = 2 + w % 9 + if w % 100 == 0 { 250 } else { 0 };
+            osm += &format!("<way id=\"{}\" version=\"{}\" timestamp=\"2021-02-03T04:05:06Z\" changeset=\"{}\" uid=\"7\" user=\"u7\">", w + 1, 1 + w % 3, 5000 + w);
+            for k in 0..len {
+                osm += &format!("<nd ref=\"{}\"/>", 1 + (w * 13 + k * (1 + w % 3)) % n);
+            }
+            osm += "<tag k=\"highway\" v=\"path\"/></way>\n";
+        }
+        for r in 0..300u64 {
+            osm += &format!("<relation id=\"{}\" version=\"2\" timestamp=\"2022-03-04T05:06:07Z\" changeset=\"{}\" uid=\"9\" user=\"u9\">", r + 1, 9000 + r);
+            for k in 0..1 + r % 5 {
+                osm += &format!("<member type=\"way\" ref=\"{}\" role=\"\"/>", 1 + (r * 7 + k) % 2000);
+            }
+            osm += "<tag k=\"type\" v=\"route\"/></relation>\n";
+        }
+        let file = dir.join("in.osm");
+        std::fs::write(&file, osm + "</osm>\n").unwrap();
+        let db = crate::store::Db::open(&dir.join("db")).unwrap();
+        crate::import::import_file(&db, &file, &mut Default::default()).unwrap();
+        let snap = db.snapshot().unwrap();
+        let f = Fetch::new(&snap);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = |n: u64| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 11) % n
+        };
+        fn check<T: Stored>(f: &Fetch, all: &[T], next: &mut impl FnMut(u64) -> u64) {
+            assert!(all.len() > 100);
+            for round in 0..40 {
+                let step = 1 + next(if round % 2 == 0 { 3 } else { 200 });
+                let mut elems: Vec<(Cell, Id)> = all.iter().filter(|_| next(step) == 0).map(|e| (e.cell(), e.id())).collect();
+                if round % 5 == 1 {
+                    // ids that do not exist, and elements under another cell
+                    for _ in 0..10 {
+                        elems.push((Cell::tile(next(1 << 30) as u32), 1_000_000 + next(1000)));
+                    }
+                    for e in elems.iter_mut().step_by(7) {
+                        e.0 = Cell::tile(next(1 << 30) as u32);
+                    }
+                    elems.sort_unstable_by_key(|e| e.1);
+                    elems.dedup_by_key(|e| e.1);
+                }
+                if round % 5 == 2 {
+                    for i in (1..elems.len()).rev() {
+                        elems.swap(i, next(i as u64 + 1) as usize);
+                    }
+                }
+                if round % 5 == 3 && !elems.is_empty() {
+                    // an element twice
+                    elems.push(elems[0]);
+                }
+                let ids: Vec<Id> = elems.iter().map(|e| e.1).collect();
+                let map = f.meta(T::KIND, &ids).unwrap();
+                let want: Vec<Option<Meta>> = ids.iter().map(|id| map.get(id).copied()).collect();
+                assert_eq!(f.meta_in_order(T::KIND, &elems).unwrap(), want, "round {round}");
+                if round % 5 == 0 {
+                    assert!(want.iter().all(|m| m.is_some()));
+                }
+            }
+        }
+        check(&f, &f.all::<Node>(|_| true).unwrap(), &mut next);
+        check(&f, &f.all::<Way>(|_| true).unwrap(), &mut next);
+        check(&f, &f.all::<Relation>(|_| true).unwrap(), &mut next);
+        drop(snap);
+        drop(db);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// A decode on the pool (`par_run`) stops at the deadline, at a cancel
     /// and at the memory limit of the query, with the error of that limit,

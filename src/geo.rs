@@ -732,9 +732,13 @@ pub struct Segment {
 
 impl Segment {
     pub fn new(lat1: f64, lon1: f64, lat2: f64, lon2: f64) -> Segment {
-        let ca = cartesian(lat1, lon1);
-        let cb = cartesian(lat2, lon2);
-        Segment { a: (lat1, lon1), b: (lat2, lon2), ca, cb, norm: ca.cross(&cb) }
+        Segment::with_cartesian((lat1, lon1), (lat2, lon2), cartesian(lat1, lon1), cartesian(lat2, lon2))
+    }
+
+    /// As `new`, with the `cartesian` of the ends given (the vertices of a
+    /// line are the ends of two segments).
+    pub fn with_cartesian(a: (f64, f64), b: (f64, f64), ca: V3, cb: V3) -> Segment {
+        Segment { a, b, ca, cb, norm: ca.cross(&cb) }
     }
 
     /// Distance from a point to the great circle through the segment.
