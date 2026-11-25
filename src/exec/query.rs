@@ -726,6 +726,13 @@ impl<'s, W: Write> Engine<'s, W> {
             let bbox_rects: Vec<Vec<Rect>> = plan.bboxes.iter().map(|b| b.rects()).collect();
             let around_rects: Vec<Cow<'_, [Rect]>> = arounds.iter().map(|(s, r)| s.bbox_rects(*r)).collect();
             let poly_rects: Vec<Vec<Rect>> = plan.polys.iter().map(|p| p.bbox().rects()).collect();
+            // the polygons with their edge rows, once for every candidate,
+            // when a candidate needs them (in a `foreach`, a statement whose
+            // candidates all lie outside the box of a polygon of 10^4 edges
+            // took 0.6 ms more per run for the rows)
+            let polys_once: std::cell::OnceCell<Vec<PolyTest>> = std::cell::OnceCell::new();
+            let polys = || polys_once.get_or_init(|| plan.polys.iter().map(|p| p.prepare()).collect());
+            let poly_boxes = !plan.polys.is_empty() && way_boxes_on() && rel_boxes_on();
             // `around` and implicit areas follow great-circle edges, which
             // pass north or south of the box (`Rect::arc_box`)
             let arcs = !arounds.is_empty() || area_ctxs.iter().any(|c| c.has_implicit());
@@ -739,6 +746,7 @@ impl<'s, W: Write> Engine<'s, W> {
             let only_bbox_nodes = only_bbox && !tests::NODE_BOX_PLAIN.get();
             #[cfg(not(test))]
             let only_bbox_nodes = only_bbox;
+            let mut boxes_tested = 0usize;
             for (i, e) in cands.iter().enumerate() {
                 if only_bbox_nodes {
                     if let Some(p) = e.point() {
@@ -775,11 +783,45 @@ impl<'s, W: Write> Engine<'s, W> {
                                 c.rects.iter().all(|r| !grow(r).intersects(b))
                             });
                     }
+                    // A polygon decides a way or relation by its stored box
+                    // where it can (`PolyTest::rect_pos`): apart from it, the
+                    // element fails its test; strictly inside, it passes, as
+                    // it has a vertex there (a way with all its nodes, a
+                    // relation with a node or a complete way: not
+                    // `spatially_empty`). Of 1,720 protected areas in the box
+                    // of a country polygon, 608 lay inside and 872 apart:
+                    // their members were not read.
+                    let mut polys_decided = plan.polys.is_empty();
+                    if !reject && poly_boxes {
+                        // a box test costs up to all edges where the rows
+                        // do not help: the ways of a city against a comb of
+                        // 2 x 10^4 edges ran 46 s with [timeout:5]
+                        boxes_tested += 1;
+                        if boxes_tested % 64 == 0 {
+                            self.check()?;
+                        }
+                        polys_decided = true;
+                        for p in polys() {
+                            match p.rect_pos(&sb) {
+                                RectPos::Apart => {
+                                    reject = true;
+                                    break;
+                                }
+                                RectPos::Inside => {}
+                                RectPos::Border => polys_decided = false,
+                            }
+                        }
+                    }
+                    #[cfg(test)]
+                    if poly_boxes && (reject || polys_decided) {
+                        let (pass, fail) = tests::POLY_BOXES.get();
+                        tests::POLY_BOXES.set(if reject { (pass, fail + 1) } else { (pass + 1, fail) });
+                    }
                     if reject {
                         keep[i] = false;
                         continue;
                     }
-                    if only_bbox && all_inside {
+                    if all_inside && polys_decided && arounds.is_empty() && plan.areas.is_empty() {
                         continue;
                     }
                 }
@@ -801,7 +843,7 @@ impl<'s, W: Write> Engine<'s, W> {
                 } else {
                     // A way apart from a polygon at every shift fails its
                     // way test (`PolyTest::rect_pos`).
-                    let polys: Vec<PolyTest> = plan.polys.iter().map(|p| p.prepare()).collect();
+                    let polys = polys();
                     let near_poly = |b: &Rect| !b.is_empty() && polys.iter().any(|p| p.rect_pos(b) != RectPos::Apart);
                     let near_bbox = |b: &Rect| bbox_rects.iter().any(|rs| rs.iter().any(|r| grow(r).intersects(b)));
                     let near_around = |b: &Rect| {
@@ -816,10 +858,17 @@ impl<'s, W: Write> Engine<'s, W> {
                     // and `near_box` accepts every box that meets the
                     // rectangles of the clause, which hold all it can pass.
                     let near = |b: &Rect| near_bbox(b) || near_around(b) || near_poly(b);
-                    let test = |g: &EGeom, fine: &[Option<std::sync::Arc<AroundSource>>]| {
-                        plan.bboxes.iter().all(|b| geom_in_bbox(g, b))
-                            && arounds.iter().zip(fine).all(|((src, r), fine)| around_match_with(src, fine.as_deref(), g, *r))
-                            && plan.polys.iter().all(|p| poly_match(p, g))
+                    let limits = &self.f.limits;
+                    let test = |g: &EGeom, fine: &[Option<std::sync::Arc<AroundSource>>]| -> Result<bool> {
+                        if !(plan.bboxes.iter().all(|b| geom_in_bbox(g, b)) && arounds.iter().zip(fine).all(|((src, r), fine)| around_match_with(src, fine.as_deref(), g, *r))) {
+                            return Ok(false);
+                        }
+                        for p in polys {
+                            if !p.matches_checked(g, limits)? {
+                                return Ok(false);
+                            }
+                        }
+                        Ok(true)
                     };
                     // The geometries are built and tested for a batch of
                     // elements at a time: those of all candidates at once
@@ -839,8 +888,22 @@ impl<'s, W: Write> Engine<'s, W> {
                         };
                         // the lazy ways of the sources near this batch
                         let fine = arounds.iter().map(|(src, r)| self.around_fine(src, *r, &geoms)).collect::<Result<Vec<_>>>()?;
-                        // Geometric tests are pure: run them in parallel for large batches.
-                        sub_keep.extend(super::par_map(&geoms, 512, |g| test(g, &fine)));
+                        // Geometric tests are pure: run them in parallel for
+                        // large batches. The limits are checked between the
+                        // tests: one batch of relations against a polygon of
+                        // 10^4 edges ran 23 s past the timeout.
+                        super::par_run::<_, _, anyhow::Error>(
+                            &geoms,
+                            512,
+                            |g| {
+                                limits.check()?;
+                                test(g, &fine)
+                            },
+                            |k| {
+                                sub_keep.push(k);
+                                Ok(())
+                            },
+                        )?;
                         drop(fine);
                         drop(geoms);
                         drop(scope);
@@ -1754,6 +1817,9 @@ fn poly_member_ways(f: &Fetch, poly: &PolyTest, ways: &[&Way]) -> Result<Vec<boo
     let mut border = Vec::new();
     let boxes = way_boxes_on();
     for (i, w) in ways.iter().enumerate() {
+        if i % 1024 == 0 {
+            f.limits.check()?;
+        }
         match if boxes { poly.rect_pos(&w.bbox) } else { RectPos::Border } {
             RectPos::Inside if !w.missing && !w.nodes.is_empty() => pass[i] = true,
             RectPos::Apart => {}
@@ -1763,6 +1829,7 @@ fn poly_member_ways(f: &Fetch, poly: &PolyTest, ways: &[&Way]) -> Result<Vec<boo
     let refs: Vec<&Way> = border.iter().map(|&i| ways[i]).collect();
     let verts = super::geom::way_vertices(f, &refs)?;
     for i in border {
+        f.limits.check()?;
         pass[i] = poly_member_way(poly, &verts[&ways[i].id]);
     }
     Ok(pass)
@@ -1967,12 +2034,6 @@ pub fn around_match(src: &AroundSource, g: &EGeom, r: f64) -> bool {
     }
 }
 
-fn poly_match(p: &Polygon, g: &EGeom) -> bool {
-    match g {
-        _ => p.matches(g),
-    }
-}
-
 
 #[cfg(test)]
 mod tests {
@@ -1995,6 +2056,9 @@ mod tests {
         pub(super) static GEOM_BATCH: Cell<Option<usize>> = const { Cell::new(None) };
         /// Turns off the reduced relation geometry (`rel_geoms_near`).
         pub(super) static NEAR_GEOMS_OFF: Cell<bool> = const { Cell::new(false) };
+        /// Ways and relations of `query_type` that a polygon decided by
+        /// their box, passed or failed (counted on).
+        pub(super) static POLY_BOXES: Cell<(usize, usize)> = const { Cell::new((0, 0)) };
         /// The filter `most_selective` chose last, when it compared filters.
         pub(super) static PROBE: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
         /// Turns off the way box tests of `poly` on relations (`way_boxes_on`).
@@ -4267,6 +4331,165 @@ mod tests {
                 assert_eq!(out, plain, "{q} {boxes_off} {scan} {near_off}");
             }
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Ways and relations that a polygon decides by their stored box in
+    /// `query_type` (apart: fail, strictly inside: pass) get the answers of
+    /// their geometry tests: polygons larger than the relation paths take,
+    /// with grid nodes on their edges and corners, edges along grid ways, a
+    /// notch, and short ways and relations of a few nodes on both sides.
+    #[test]
+    fn poly_box_decisions_match_geometry_tests() {
+        let m = "{m}";
+        let id = |i: usize, j: usize| i * 30 + j + 1;
+        let mut ways = String::new();
+        let mut rels = String::new();
+        let mut k = 0;
+        for i in (0..29).step_by(2) {
+            for j in (0..29).step_by(3) {
+                let nds = [id(i, j), id(i, j + 1), id(i + 1, j + 1)];
+                let w = 4000 + k;
+                ways += &format!("<way id=\"{w}\" {m}>{}<tag k=\"building\" v=\"yes\"/></way>\n", nds.iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect::<String>());
+                rels += &relation(6000 + k, &[("way", w)], &[("type", "multipolygon"), ("building", "yes")]);
+                rels += &relation(7000 + k, &[("node", id(i + 1, j))], &[("type", "site")]);
+                k += 1;
+            }
+        }
+        // one with a missing node: never passes
+        ways += &format!("<way id=\"4999\" {m}><nd ref=\"466\"/><nd ref=\"999999\"/></way>\n");
+        rels += &relation(6999, &[("way", 4999)], &[("building", "yes")]);
+        rels += &relation(7999, &[("way", 1003), ("node", 466)], &[("type", "route")]);
+        let (db, dir) = osm_db("polyboxes", &grid_osm_with("", &ways, &rels));
+        let polys = [
+            // a large square with a notch from the east along grid ways 1015 and 1020
+            "48.7 2.2 48.7 2.5 48.85 2.5 48.85 2.35 48.86 2.35 48.86 2.5 49.0 2.5 49.0 2.2",
+            // a large triangle, one edge across the grid through grid nodes
+            "48.6 2.1 48.84 2.33 48.88 2.37 49.1 2.1",
+            // edges along grid way 2010 and through grid nodes
+            "48.6 2.34 49.1 2.34 49.1 2.6 48.6 2.6",
+            // a spike into the grid, and a ring that runs back along itself
+            "48.6 2.0 48.85 2.35 48.6 2.01 48.6 2.6 49.0 2.6 49.0 2.0",
+            "48.6 2.0 48.6 2.6 48.85 2.6 48.85 2.35 48.85 2.6 49.0 2.6 49.0 2.0",
+            // smaller ones (the relation paths answer for relations)
+            "48.840 2.340 48.840 2.360 48.860 2.360 48.860 2.340",
+            "48.83 2.33 48.87 2.33 48.85 2.37",
+        ];
+        let c = "[out:csv(::type,::id;false)];";
+        let (mut pass, mut fail) = (0, 0);
+        for poly in polys {
+            let p = format!("(poly:\"{poly}\")");
+            for q in [
+                format!("{c}way{p};out ids;"),
+                format!("{c}way[building]{p};out ids;"),
+                format!("{c}rel{p};out ids;"),
+                format!("{c}rel[type]{p};out ids;"),
+                format!("{c}nwr{p};out ids;"),
+                format!("{c}way(48.84,2.33,48.87,2.37){p};out ids;"),
+                format!("[out:csv(::type,::id;false)][bbox:48.845,2.33,48.86,2.37];nwr[building]{p};out ids;"),
+                format!("{c}way[building]{p}(around:300,48.85,2.35);out ids;"),
+                format!("{c}way[building]{p}{p};out ids;"),
+            ] {
+                POLY_BOXES.set((0, 0));
+                let plain = both_ways(&db, &q).0;
+                let (a, b) = POLY_BOXES.get();
+                (pass, fail) = (pass + a, fail + b);
+                REL_BOXES_OFF.set(true);
+                WAY_BOXES_OFF.set(true);
+                let out = both_ways(&db, &q).0;
+                REL_BOXES_OFF.set(false);
+                WAY_BOXES_OFF.set(false);
+                assert_eq!(out, plain, "{q}");
+            }
+        }
+        assert!(pass > 100 && fail > 100, "{pass} passed, {fail} failed by box");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Review (rv-poly): relations of mixed members decided by their box:
+    /// incomplete member ways inside with complete ones outside, missing
+    /// member nodes, only relation members, member nodes on polygon
+    /// vertices and edges, member ways along an edge, ways with repeated
+    /// nodes, and the same with an `(area)`-free `(if:)` and `out` modes.
+    #[test]
+    fn rv_poly_box_decisions_mixed_relations() {
+        let m = "{m}";
+        let id = |i: usize, j: usize| i * 30 + j + 1;
+        let mut ways = String::new();
+        // incomplete ways (one missing node) at several places, complete short ways, a way with repeated nodes
+        for (k, (i, j)) in [(2, 2), (10, 10), (15, 15), (20, 25), (27, 27), (14, 16)].iter().enumerate() {
+            ways += &format!("<way id=\"{}\" {m}><nd ref=\"{}\"/><nd ref=\"{}\"/><nd ref=\"9999{k}\"/></way>\n", 4100 + k, id(*i, *j), id(*i, *j + 1));
+            ways += &format!("<way id=\"{}\" {m}><nd ref=\"{}\"/><nd ref=\"{}\"/><nd ref=\"{}\"/></way>\n", 4200 + k, id(*i, *j), id(*i + 1, *j), id(*i, *j));
+            ways += &format!("<way id=\"{}\" {m}><nd ref=\"{}\"/></way>\n", 4300 + k, id(*i, *j));
+        }
+        let mut rels = String::new();
+        let mut rid = 8000;
+        let mut add = |members: &[(&str, usize)]| {
+            rels += &relation(rid, members, &[("type", "multipolygon"), ("building", "yes")]);
+            rid += 1;
+        };
+        for a in 0..6 {
+            for b in 0..6 {
+                // an incomplete way at one place and a complete one at another
+                add(&[("way", 4100 + a), ("way", 4200 + b)]);
+                // a one-node way and a missing node
+                add(&[("way", 4300 + a), ("node", 999_990 + b)]);
+                // a node at one place and an incomplete way at another
+                add(&[("node", id([2, 10, 15, 20, 27, 14][a], [2, 10, 15, 25, 27, 16][a])), ("way", 4100 + b)]);
+            }
+            // only a relation member, and a relation of a relation and a node
+            add(&[("relation", 8000 + a)]);
+            add(&[("relation", 8001 + a), ("node", id(15, 15 + a))]);
+            // a grid row (along polygon edges at 48.85 and 48.86) and a node
+            add(&[("way", 1015), ("node", id(a * 5, a * 5))]);
+            add(&[("way", 1020)]);
+            add(&[("way", 2000 + a * 5), ("way", 1000 + a * 5)]);
+            // nodes only, on grid points along the polygon edges
+            add(&[("node", id(15, a * 5)), ("node", id(20, a * 5 + 2))]);
+            // nothing that exists
+            add(&[("node", 999_980 + a), ("way", 999_970 + a)]);
+        }
+        let (db, dir) = osm_db("rvpolymixed", &grid_osm_with("", &ways, &rels));
+        let polys = [
+            "48.7 2.2 48.7 2.5 48.85 2.5 48.85 2.35 48.86 2.35 48.86 2.5 49.0 2.5 49.0 2.2",
+            "48.6 2.1 48.84 2.33 48.88 2.37 49.1 2.1",
+            "48.6 2.34 49.1 2.34 49.1 2.6 48.6 2.6",
+            "48.6 2.0 48.85 2.35 48.6 2.01 48.6 2.6 49.0 2.6 49.0 2.0",
+            "48.6 2.0 48.6 2.6 48.85 2.6 48.85 2.35 48.85 2.6 49.0 2.6 49.0 2.0",
+            // vertices on grid nodes, edges through them
+            "48.7 2.2 48.7 2.36 48.85 2.36 48.85 2.35 48.83 2.33 48.87 2.33 48.87 2.36 49.0 2.36 49.0 2.2",
+            // a bow tie over the grid
+            "48.7 2.2 49.0 2.5 49.0 2.2 48.7 2.5",
+        ];
+        let c = "[out:csv(::type,::id;false)];";
+        let (mut pass, mut fail) = (0, 0);
+        for poly in polys {
+            let p = format!("(poly:\"{poly}\")");
+            for q in [
+                format!("{c}rel{p};out ids;"),
+                format!("{c}rel[building]{p};out ids;"),
+                format!("{c}way{p};out ids;"),
+                format!("{c}nwr{p};out ids;"),
+                format!("{c}rel{p}(if:count_members()>1);out ids;"),
+                format!("[out:json];rel{p};out bb;"),
+                format!("[out:json];rel{p};out center;"),
+                format!("[out:json];way{p};out geom;"),
+                format!("{c}rel(48.84,2.33,48.87,2.37){p};out ids;"),
+                format!("{c}rel{p}(poly:\"48.5 2.0 48.5 2.7 49.2 2.7 49.2 2.0\");out ids;"),
+            ] {
+                POLY_BOXES.set((0, 0));
+                let plain = both_ways(&db, &q).0;
+                let (a, b) = POLY_BOXES.get();
+                (pass, fail) = (pass + a, fail + b);
+                REL_BOXES_OFF.set(true);
+                WAY_BOXES_OFF.set(true);
+                let out = both_ways(&db, &q).0;
+                REL_BOXES_OFF.set(false);
+                WAY_BOXES_OFF.set(false);
+                assert_eq!(out, plain, "{q}");
+            }
+        }
+        assert!(pass > 100 && fail > 100, "{pass} passed, {fail} failed by box");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

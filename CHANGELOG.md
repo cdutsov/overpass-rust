@@ -4,6 +4,25 @@ The changes in each release of overpass-rust, newest first. "Overpass API"
 here means the C++ server, version 0.7.62, whose answers overpass-rust
 reproduces.
 
+## 0.3.1 (2026-11-25)
+
+### Faster
+
+- `(poly:"...")` with large polygons. The edges of the polygon are sorted
+  into rows by latitude, and the test of a point, a segment or a box looks
+  only at the edges in the rows it touches; 0.3.0 compared every point and
+  segment with every edge. A way or relation whose stored bounding box lies
+  wholly inside the polygon passes, and one whose box lies wholly outside
+  fails, without building its geometry. Queries with a country outline of
+  2,500 to 10,000 points as the polygon, which took 25 s to over 3 minutes,
+  take 0.1 to 1 s. Small polygons run as fast as on 0.3.0.
+
+### Fixed
+
+- A query with a polygon stops at its `[timeout:]`. The geometry tests of a
+  batch of elements ran without a time check, so a query with a large polygon
+  could run about 30 s past its timeout.
+
 ## 0.3.0 (2026-11-24)
 
 ### Faster

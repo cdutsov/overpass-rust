@@ -854,36 +854,10 @@ impl Polygon {
         [p, (p.0, p.1 + FULL), (p.0, p.1 - FULL)]
     }
 
-    fn on_border(edges: &[(IP, IP)], p: IP) -> bool {
-        edges.iter().any(|(a, b)| on_seg(p, *a, *b))
-    }
-
-    /// Even-odd test; doubled coordinates allow testing segment midpoints.
-    fn inside2(edges: &[(IP, IP)], p2: IP) -> bool {
-        let mut inside = false;
-        for (a, b) in edges {
-            let (a, b) = ((a.0 * 2, a.1 * 2), (b.0 * 2, b.1 * 2));
-            if (a.0 > p2.0) != (b.0 > p2.0) {
-                let lhs = (p2.1 - a.1) as i128 * (b.0 - a.0) as i128;
-                let rhs = (p2.0 - a.0) as i128 * (b.1 - a.1) as i128;
-                let left = if b.0 > a.0 { lhs < rhs } else { lhs > rhs };
-                if left {
-                    inside = !inside;
-                }
-            }
-        }
-        inside
-    }
-
-    /// The edges computed once, for testing many points, lines and boxes.
+    /// The edges computed once, with their rows (`EdgeRows`), for testing
+    /// many points, lines and boxes.
     pub fn prepare(&self) -> PolyTest {
-        let edges = self.edges();
-        let (mut lo, mut hi) = ((i64::MAX, i64::MAX), (i64::MIN, i64::MIN));
-        for p in edges.iter().flat_map(|(a, b)| [a, b]) {
-            lo = (lo.0.min(p.0), lo.1.min(p.1));
-            hi = (hi.0.max(p.0), hi.1.max(p.1));
-        }
-        PolyTest { edges, lo, hi }
+        PolyTest::new(self.edges())
     }
 
     /// Whether the rectangle lies strictly inside the polygon, without
@@ -939,25 +913,9 @@ impl Polygon {
         self.prepare().matches_line(v, add_border)
     }
 
-    /// Spatial test of an element (ways with missing nodes never match).
+    /// Spatial test of an element (`PolyTest::matches`).
     pub fn matches(&self, g: &EGeom) -> bool {
-        let t = self.prepare();
-        let line = |l: &Vec<Option<Pt>>, add_border: bool| -> bool {
-            if l.is_empty() || l.iter().any(|x| x.is_none()) {
-                return false;
-            }
-            let pts: Vec<Pt> = l.iter().flatten().copied().collect();
-            match pts.len() {
-                1 => t.contains_pt(pts[0]),
-                _ => t.matches_line(&pts, add_border),
-            }
-        };
-        match g {
-            EGeom::Point(p) => t.contains_pt(*p),
-            EGeom::Line(v) => line(v, true),
-            EGeom::Multi { points, lines } => points.iter().any(|p| t.contains_member(*p)) || lines.iter().any(|l| line(l, false)),
-            EGeom::Empty => false,
-        }
+        self.prepare().matches(g)
     }
 }
 
@@ -973,26 +931,220 @@ pub enum RectPos {
     Border,
 }
 
-/// A polygon with its edges (unwrapped, see `Polygon`) and their box,
-/// computed once (`Polygon::prepare`). Points outside the box are neither
-/// inside nor on the border, so most shifted points cost one comparison.
+/// The edges of a polygon by latitude, so that a test looks at the few
+/// edges near its point or segment instead of all of them (a country
+/// outline has 10^4 edges, a row about 5).
+///
+/// Row `k` covers the latitudes `y0 + k h` to `y0 + (k + 1) h - 1`, with
+/// `h = 2^s`, and lists every edge whose closed latitude range meets them,
+/// in edge order (an edge over several rows is listed in each). A latitude
+/// `y` of the box lies in row `(y - y0) >> s`, which therefore lists every
+/// edge whose closed range contains `y`: every edge a point at `y` can lie
+/// on, and every edge the even-odd ray from it can cross. The rows of a latitude
+/// range follow each other in `ids`, and list every edge that meets the
+/// range. Outside the box there is no edge at all.
+struct EdgeRows {
+    y0: i64,
+    y1: i64,
+    /// Rows of `h = 2^s` latitudes: a shift finds the row (a division
+    /// cost more than the rest of building the rows).
+    s: u32,
+    #[cfg(test)]
+    h: i64,
+    /// Row `k` is `ids[start[k]..start[k + 1]]`.
+    start: Vec<u32>,
+    ids: Vec<u32>,
+}
+
+impl EdgeRows {
+    /// Rows for the edges between latitudes `y0` and `y1` (the box): about
+    /// one per edge, fewer when the edges span so many rows that the lists
+    /// would hold more than 16 entries per edge (long edges from north to
+    /// south). Fewer rows hold more edges each, down to one row of all
+    /// edges.
+    fn new(edges: &[(IP, IP)], y0: i64, y1: i64) -> EdgeRows {
+        Self::with_rows(edges, y0, y1, edges.len().max(1) as i64)
+    }
+
+    fn with_rows(edges: &[(IP, IP)], y0: i64, y1: i64, rows: i64) -> EdgeRows {
+        if edges.is_empty() {
+            return EdgeRows { y0: 0, y1: -1, s: 0, #[cfg(test)] h: 1, start: vec![0, 0], ids: Vec::new() };
+        }
+        let span = (y1 - y0 + 1).max(1);
+        let budget = 16 * edges.len() as u64 + 1024;
+        let rows_of = |a: &IP, b: &IP, s: u32| ((a.0.min(b.0) - y0) >> s) as usize..=((a.0.max(b.0) - y0) >> s) as usize;
+        let mut rows = rows.clamp(1, span);
+        loop {
+            // the least s with rows of 2^s latitudes covering the span in
+            // at most `rows` rows
+            let mut s = 0u32;
+            while rows << s < span {
+                s += 1;
+            }
+            let total: u64 = edges.iter().map(|(a, b)| (((a.0.max(b.0) - y0) >> s) - ((a.0.min(b.0) - y0) >> s) + 1) as u64).sum();
+            if total > budget && rows > 1 {
+                rows = (rows / 2).max(1);
+                continue;
+            }
+            let n = (((y1 - y0).max(0) >> s) + 1) as usize;
+            let mut start = vec![0u32; n + 1];
+            for (a, b) in edges {
+                for k in rows_of(a, b, s) {
+                    start[k + 1] += 1;
+                }
+            }
+            for k in 0..n {
+                start[k + 1] += start[k];
+            }
+            let mut next: Vec<u32> = start[..n].to_vec();
+            let mut ids = vec![0u32; total as usize];
+            for (i, (a, b)) in edges.iter().enumerate() {
+                for k in rows_of(a, b, s) {
+                    ids[next[k] as usize] = i as u32;
+                    next[k] += 1;
+                }
+            }
+            return EdgeRows { y0, y1, s, #[cfg(test)] h: 1 << s, start, ids };
+        }
+    }
+
+    fn row(&self, k: usize) -> &[u32] {
+        &self.ids[self.start[k] as usize..self.start[k + 1] as usize]
+    }
+
+    /// The edges whose closed latitude range may contain `y`.
+    #[inline]
+    fn at(&self, y: i64) -> &[u32] {
+        if y < self.y0 || y > self.y1 {
+            return &[];
+        }
+        self.row(((y - self.y0) >> self.s) as usize)
+    }
+
+    /// `at` for a doubled latitude (a midpoint in doubled coordinates):
+    /// its row is that of `y2 / 2`.
+    #[inline]
+    fn at2(&self, y2: i64) -> &[u32] {
+        if y2 < 2 * self.y0 || y2 > 2 * self.y1 {
+            return &[];
+        }
+        self.row(((y2 - 2 * self.y0) >> (self.s + 1)) as usize)
+    }
+
+    /// The rows from latitude `lo` to `hi`: every edge whose closed range
+    /// meets that range, some more than once.
+    fn span(&self, lo: i64, hi: i64) -> &[u32] {
+        let (lo, hi) = (lo.max(self.y0), hi.min(self.y1));
+        if lo > hi {
+            return &[];
+        }
+        let (k0, k1) = (((lo - self.y0) >> self.s) as usize, ((hi - self.y0) >> self.s) as usize);
+        &self.ids[self.start[k0] as usize..self.start[k1 + 1] as usize]
+    }
+
+    /// Bytes held (for the report of the index size).
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        4 * (self.start.len() + self.ids.len())
+    }
+}
+
+/// A polygon with its edges (unwrapped, see `Polygon`), their box and
+/// their rows (`EdgeRows`), computed once (`Polygon::prepare`). Points
+/// outside the box are neither inside nor on the border, so most shifted
+/// points cost one comparison. Every test gives the answer of the test on
+/// all edges: the rows only leave out edges that cannot change it.
 pub struct PolyTest {
     edges: Vec<(IP, IP)>,
     lo: IP,
     hi: IP,
+    rows: EdgeRows,
 }
 
 impl PolyTest {
+    fn new(edges: Vec<(IP, IP)>) -> PolyTest {
+        let (lo, hi) = Self::edge_box(&edges);
+        let rows = EdgeRows::new(&edges, lo.0, hi.0);
+        PolyTest { edges, lo, hi, rows }
+    }
+
+    fn edge_box(edges: &[(IP, IP)]) -> (IP, IP) {
+        let (mut lo, mut hi) = ((i64::MAX, i64::MAX), (i64::MIN, i64::MIN));
+        for p in edges.iter().flat_map(|(a, b)| [a, b]) {
+            lo = (lo.0.min(p.0), lo.1.min(p.1));
+            hi = (hi.0.max(p.0), hi.1.max(p.1));
+        }
+        (lo, hi)
+    }
+
+    /// With `rows` rows (fewer over the budget of `EdgeRows::new`): the
+    /// tests compare row counts with each other and with all edges.
+    #[cfg(test)]
+    fn with_rows(edges: Vec<(IP, IP)>, rows: i64) -> PolyTest {
+        let (lo, hi) = Self::edge_box(&edges);
+        let rows = EdgeRows::with_rows(&edges, lo.0, hi.0, rows);
+        PolyTest { edges, lo, hi, rows }
+    }
+
+    #[inline]
+    fn edge(&self, i: u32) -> (IP, IP) {
+        self.edges[i as usize]
+    }
+
+    /// Whether `f` holds for an edge that meets the latitudes `lo` to `hi`
+    /// (it may also see others): the edges of their rows, or every edge
+    /// once when the rows list more.
+    #[inline]
+    fn any_edge(&self, lo: i64, hi: i64, mut f: impl FnMut(IP, IP) -> bool) -> bool {
+        let ids = self.rows.span(lo, hi);
+        if ids.len() > self.edges.len() {
+            return self.edges.iter().any(|(a, b)| f(*a, *b));
+        }
+        ids.iter().any(|&i| {
+            let (a, b) = self.edge(i);
+            f(a, b)
+        })
+    }
+
     fn in_box(&self, p: IP) -> bool {
         p.0 >= self.lo.0 && p.0 <= self.hi.0 && p.1 >= self.lo.1 && p.1 <= self.hi.1
     }
 
+    /// On an edge: the edges of the row of `p`, which hold every edge whose
+    /// latitude range contains it.
     fn on_border(&self, p: IP) -> bool {
-        Polygon::on_border(&self.edges, p)
+        self.rows.at(p.0).iter().any(|&i| {
+            let (a, b) = self.edge(i);
+            on_seg(p, a, b)
+        })
     }
 
+    /// On an edge, in doubled coordinates (a segment midpoint).
+    fn on_border2(&self, p2: IP) -> bool {
+        self.rows.at2(p2.0).iter().any(|&i| {
+            let (c, d) = self.edge(i);
+            on_seg(p2, (c.0 * 2, c.1 * 2), (d.0 * 2, d.1 * 2))
+        })
+    }
+
+    /// Even-odd test; doubled coordinates allow testing segment midpoints.
+    /// An edge the ray from the point crosses has the latitude of the
+    /// point in its range, so it is in the row of the point (once).
     fn inside2(&self, p2: IP) -> bool {
-        Polygon::inside2(&self.edges, p2)
+        let mut inside = false;
+        for &i in self.rows.at2(p2.0) {
+            let (a, b) = self.edge(i);
+            let (a, b) = ((a.0 * 2, a.1 * 2), (b.0 * 2, b.1 * 2));
+            if (a.0 > p2.0) != (b.0 > p2.0) {
+                let lhs = (p2.1 - a.1) as i128 * (b.0 - a.0) as i128;
+                let rhs = (p2.0 - a.0) as i128 * (b.1 - a.1) as i128;
+                let left = if b.0 > a.0 { lhs < rhs } else { lhs > rhs };
+                if left {
+                    inside = !inside;
+                }
+            }
+        }
+        inside
     }
 
     fn contains_ip(&self, p: IP) -> bool {
@@ -1006,12 +1158,17 @@ impl PolyTest {
 
     /// Relation member node test (C++ `add_border = false`): a point on an
     /// edge counts, a point on a vertex shared by two edges cancels out.
+    /// The row of the point lists each edge it can lie on once.
     pub fn contains_member(&self, p: Pt) -> bool {
         Polygon::shifts(qp(p)).into_iter().any(|ip| {
             if !self.in_box(ip) {
                 return false;
             }
-            let hits = self.edges.iter().filter(|(a, b)| on_seg(ip, *a, *b)).count();
+            let hits = self.rows.at(ip.0).iter().filter(|&&i| {
+                let (a, b) = self.edge(i);
+                on_seg(ip, a, b)
+            });
+            let hits = hits.count();
             if hits == 0 {
                 return self.inside2((ip.0 * 2, ip.1 * 2));
             }
@@ -1023,10 +1180,10 @@ impl PolyTest {
     /// overlap and the corners are not all on one side of the edge's line.
     fn edge_meets(&self, lo: IP, hi: IP) -> bool {
         let corners = [lo, (lo.0, hi.1), (hi.0, lo.1), hi];
-        self.edges.iter().any(|(a, b)| {
+        self.any_edge(lo.0, hi.0, |a, b| {
             let overlap = a.0.min(b.0) <= hi.0 && a.0.max(b.0) >= lo.0 && a.1.min(b.1) <= hi.1 && a.1.max(b.1) >= lo.1;
             overlap && {
-                let sides = corners.map(|c| orient(*a, *b, c).signum());
+                let sides = corners.map(|c| orient(a, b, c).signum());
                 !(sides.iter().all(|s| *s > 0) || sides.iter().all(|s| *s < 0))
             }
         })
@@ -1074,47 +1231,112 @@ impl PolyTest {
     /// Way test: a vertex strictly inside, a proper crossing of the border,
     /// a segment midpoint strictly inside, or (`add_border`) a segment
     /// running along the border. Touching the border in a single point does
-    /// not count.
-    fn matches_line_edges(edges: &[(IP, IP)], pts: &[IP], add_border: bool) -> bool {
-        let strictly_inside = |p: IP| !Polygon::on_border(edges, p) && Polygon::inside2(edges, (p.0 * 2, p.1 * 2));
+    /// not count. Each of these needs an edge whose latitude range meets
+    /// that of the vertex or segment: those of its rows.
+    fn matches_line_edges(&self, pts: &[IP], add_border: bool) -> bool {
+        let strictly_inside = |p: IP| !self.on_border(p) && self.inside2((p.0 * 2, p.1 * 2));
         if pts.iter().any(|p| strictly_inside(*p)) {
             return true;
         }
         for w in pts.windows(2) {
             let (a, b) = (w[0], w[1]);
             let mid2 = (a.0 + b.0, a.1 + b.1);
-            let mid_on_border = edges.iter().any(|(c, d)| on_seg(mid2, (c.0 * 2, c.1 * 2), (d.0 * 2, d.1 * 2)));
-            if !mid_on_border && Polygon::inside2(edges, mid2) {
+            if !self.on_border2(mid2) && self.inside2(mid2) {
                 return true;
             }
-            for (c, d) in edges {
-                let o1 = orient(*c, *d, a);
-                let o2 = orient(*c, *d, b);
-                let o3 = orient(a, b, *c);
-                let o4 = orient(a, b, *d);
+            // a crossing or a shared point lies in the boxes of both
+            let (s0, s1) = ((a.0.min(b.0), a.1.min(b.1)), (a.0.max(b.0), a.1.max(b.1)));
+            let hit = self.any_edge(s0.0, s1.0, |c, d| {
+                if c.0.max(d.0) < s0.0 || c.0.min(d.0) > s1.0 || c.1.max(d.1) < s0.1 || c.1.min(d.1) > s1.1 {
+                    return false;
+                }
+                let o1 = orient(c, d, a);
+                let o2 = orient(c, d, b);
+                let o3 = orient(a, b, c);
+                let o4 = orient(a, b, d);
                 if ((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) && ((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0)) {
                     return true;
                 }
                 if add_border && o1 == 0 && o2 == 0 && a != b {
-                    let along = |p: IP| on_seg(p, *c, *d);
+                    let along = |p: IP| on_seg(p, c, d);
                     let back = |p: IP| on_seg(p, a, b);
-                    let shared: Vec<IP> = [a, b].into_iter().filter(|p| along(*p)).chain([*c, *d].into_iter().filter(|p| back(*p))).collect();
+                    let shared: Vec<IP> = [a, b].into_iter().filter(|p| along(*p)).chain([c, d].into_iter().filter(|p| back(*p))).collect();
                     if shared.iter().any(|p| *p != shared[0]) {
                         return true;
                     }
                 }
+                false
+            });
+            if hit {
+                return true;
             }
         }
         false
     }
 
+    /// Way test at the three shifts. A line whose box misses the box of the
+    /// polygon at a shift has no vertex, midpoint or crossing there: the
+    /// even-odd ray of a point outside the box crosses the closed ring an
+    /// even number of times, or not at all.
     pub fn matches_line(&self, v: &[Pt], add_border: bool) -> bool {
         let raw: Vec<IP> = v.iter().map(|p| qp(*p)).collect();
         let pts = unwrap(&raw);
+        let (mut lo, mut hi) = ((i64::MAX, i64::MAX), (i64::MIN, i64::MIN));
+        for p in &pts {
+            lo = (lo.0.min(p.0), lo.1.min(p.1));
+            hi = (hi.0.max(p.0), hi.1.max(p.1));
+        }
         [0, FULL, -FULL].into_iter().any(|shift| {
+            if hi.0 < self.lo.0 || lo.0 > self.hi.0 || hi.1 + shift < self.lo.1 || lo.1 + shift > self.hi.1 {
+                return false;
+            }
             let shifted: Vec<IP> = pts.iter().map(|p| (p.0, p.1 + shift)).collect();
-            Self::matches_line_edges(&self.edges, &shifted, add_border)
+            self.matches_line_edges(&shifted, add_border)
         })
+    }
+
+    /// Spatial test of an element (ways with missing nodes never match).
+    pub fn matches(&self, g: &EGeom) -> bool {
+        match g {
+            EGeom::Point(p) => self.contains_pt(*p),
+            EGeom::Line(v) => self.matches_way(v, true),
+            EGeom::Multi { points, lines } => points.iter().any(|p| self.contains_member(*p)) || lines.iter().any(|l| self.matches_way(l, false)),
+            EGeom::Empty => false,
+        }
+    }
+
+    /// `matches`, with the limits checked between the member ways of a
+    /// relation: where the rows do not help (edges from south to north
+    /// over every row), a boundary of 10^5 vertices costs seconds.
+    pub fn matches_checked(&self, g: &EGeom, limits: &super::fetch::Limits) -> Result<bool> {
+        let EGeom::Multi { points, lines } = g else { return Ok(self.matches(g)) };
+        if points.iter().any(|p| self.contains_member(*p)) {
+            return Ok(true);
+        }
+        let mut vertices = 0;
+        for l in lines {
+            vertices += l.len();
+            if vertices >= 4096 {
+                limits.check()?;
+                vertices = 0;
+            }
+            if self.matches_way(l, false) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// The way test of a way or member way: one vertex is a point.
+    fn matches_way(&self, l: &[Option<Pt>], add_border: bool) -> bool {
+        if l.is_empty() || l.iter().any(|x| x.is_none()) {
+            return false;
+        }
+        let pts: Vec<Pt> = l.iter().flatten().copied().collect();
+        match pts.len() {
+            1 => self.contains_pt(pts[0]),
+            _ => self.matches_line(&pts, add_border),
+        }
     }
 }
 
@@ -1324,5 +1546,671 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The tests on all edges before the edge rows, kept as the oracle of
+    /// the row tests (`PolyTest`).
+    mod linear {
+        use super::super::{on_seg, orient, unwrap, Polygon, RectPos, FULL, IP};
+        use crate::geo::Pt;
+
+        fn qp(p: Pt) -> IP {
+            (p.y as i64, p.ilon() as i64)
+        }
+
+        pub struct Lin {
+            pub edges: Vec<(IP, IP)>,
+            pub lo: IP,
+            pub hi: IP,
+        }
+
+        impl Lin {
+            pub fn new(p: &Polygon) -> Lin {
+                let edges = p.edges();
+                let (mut lo, mut hi) = ((i64::MAX, i64::MAX), (i64::MIN, i64::MIN));
+                for p in edges.iter().flat_map(|(a, b)| [a, b]) {
+                    lo = (lo.0.min(p.0), lo.1.min(p.1));
+                    hi = (hi.0.max(p.0), hi.1.max(p.1));
+                }
+                Lin { edges, lo, hi }
+            }
+
+            fn shifts(p: IP) -> [IP; 3] {
+                [p, (p.0, p.1 + FULL), (p.0, p.1 - FULL)]
+            }
+
+            pub fn on_border_e(edges: &[(IP, IP)], p: IP) -> bool {
+                edges.iter().any(|(a, b)| on_seg(p, *a, *b))
+            }
+
+            pub fn inside2_e(edges: &[(IP, IP)], p2: IP) -> bool {
+                let mut inside = false;
+                for (a, b) in edges {
+                    let (a, b) = ((a.0 * 2, a.1 * 2), (b.0 * 2, b.1 * 2));
+                    if (a.0 > p2.0) != (b.0 > p2.0) {
+                        let lhs = (p2.1 - a.1) as i128 * (b.0 - a.0) as i128;
+                        let rhs = (p2.0 - a.0) as i128 * (b.1 - a.1) as i128;
+                        let left = if b.0 > a.0 { lhs < rhs } else { lhs > rhs };
+                        if left {
+                            inside = !inside;
+                        }
+                    }
+                }
+                inside
+            }
+
+            fn in_box(&self, p: IP) -> bool {
+                p.0 >= self.lo.0 && p.0 <= self.hi.0 && p.1 >= self.lo.1 && p.1 <= self.hi.1
+            }
+
+            pub fn on_border(&self, p: IP) -> bool {
+                Self::on_border_e(&self.edges, p)
+            }
+
+            pub fn inside2(&self, p2: IP) -> bool {
+                Self::inside2_e(&self.edges, p2)
+            }
+
+            pub fn contains_ip(&self, p: IP) -> bool {
+                Self::shifts(p).into_iter().any(|ip| self.in_box(ip) && (self.on_border(ip) || self.inside2((ip.0 * 2, ip.1 * 2))))
+            }
+
+            pub fn contains_member_ip(&self, p: IP) -> bool {
+                Self::shifts(p).into_iter().any(|ip| {
+                    if !self.in_box(ip) {
+                        return false;
+                    }
+                    let hits = self.edges.iter().filter(|(a, b)| on_seg(ip, *a, *b)).count();
+                    if hits == 0 {
+                        return self.inside2((ip.0 * 2, ip.1 * 2));
+                    }
+                    hits % 2 == 1
+                })
+            }
+
+            pub fn edge_meets(&self, lo: IP, hi: IP) -> bool {
+                let corners = [lo, (lo.0, hi.1), (hi.0, lo.1), hi];
+                self.edges.iter().any(|(a, b)| {
+                    let overlap = a.0.min(b.0) <= hi.0 && a.0.max(b.0) >= lo.0 && a.1.min(b.1) <= hi.1 && a.1.max(b.1) >= lo.1;
+                    overlap && {
+                        let sides = corners.map(|c| orient(*a, *b, c).signum());
+                        !(sides.iter().all(|s| *s > 0) || sides.iter().all(|s| *s < 0))
+                    }
+                })
+            }
+
+            pub fn contains_rect(&self, r: &crate::geo::Rect) -> bool {
+                if r.is_empty() {
+                    return false;
+                }
+                let (lo, hi) = (qp(Pt { y: r.y0, x: r.x0 }), qp(Pt { y: r.y1, x: r.x1 }));
+                let corners = [lo, (lo.0, hi.1), (hi.0, lo.1), hi];
+                corners.iter().all(|c| !self.on_border(*c) && self.inside2((c.0 * 2, c.1 * 2))) && !self.edge_meets(lo, hi)
+            }
+
+            pub fn rect_pos(&self, r: &crate::geo::Rect) -> RectPos {
+                if r.is_empty() {
+                    return RectPos::Border;
+                }
+                if self.contains_rect(r) {
+                    return RectPos::Inside;
+                }
+                if r.may_cross() {
+                    return RectPos::Border;
+                }
+                let (lo, hi) = (qp(Pt { y: r.y0, x: r.x0 }), qp(Pt { y: r.y1, x: r.x1 }));
+                for shift in [0, FULL, -FULL] {
+                    let (lo, hi) = ((lo.0, lo.1 + shift), (hi.0, hi.1 + shift));
+                    if hi.0 < self.lo.0 || lo.0 > self.hi.0 || hi.1 < self.lo.1 || lo.1 > self.hi.1 {
+                        continue;
+                    }
+                    if self.edge_meets(lo, hi) || self.inside2((lo.0 * 2, lo.1 * 2)) {
+                        return RectPos::Border;
+                    }
+                }
+                RectPos::Apart
+            }
+
+            pub fn matches_line_edges(edges: &[(IP, IP)], pts: &[IP], add_border: bool) -> bool {
+                let strictly_inside = |p: IP| !Self::on_border_e(edges, p) && Self::inside2_e(edges, (p.0 * 2, p.1 * 2));
+                if pts.iter().any(|p| strictly_inside(*p)) {
+                    return true;
+                }
+                for w in pts.windows(2) {
+                    let (a, b) = (w[0], w[1]);
+                    let mid2 = (a.0 + b.0, a.1 + b.1);
+                    let mid_on_border = edges.iter().any(|(c, d)| on_seg(mid2, (c.0 * 2, c.1 * 2), (d.0 * 2, d.1 * 2)));
+                    if !mid_on_border && Self::inside2_e(edges, mid2) {
+                        return true;
+                    }
+                    for (c, d) in edges {
+                        let o1 = orient(*c, *d, a);
+                        let o2 = orient(*c, *d, b);
+                        let o3 = orient(a, b, *c);
+                        let o4 = orient(a, b, *d);
+                        if ((o1 > 0 && o2 < 0) || (o1 < 0 && o2 > 0)) && ((o3 > 0 && o4 < 0) || (o3 < 0 && o4 > 0)) {
+                            return true;
+                        }
+                        if add_border && o1 == 0 && o2 == 0 && a != b {
+                            let along = |p: IP| on_seg(p, *c, *d);
+                            let back = |p: IP| on_seg(p, a, b);
+                            let shared: Vec<IP> = [a, b].into_iter().filter(|p| along(*p)).chain([*c, *d].into_iter().filter(|p| back(*p))).collect();
+                            if shared.iter().any(|p| *p != shared[0]) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+                false
+            }
+
+            pub fn matches_line(&self, v: &[Pt], add_border: bool) -> bool {
+                let raw: Vec<IP> = v.iter().map(|p| qp(*p)).collect();
+                let pts = unwrap(&raw);
+                [0, FULL, -FULL].into_iter().any(|shift| {
+                    let shifted: Vec<IP> = pts.iter().map(|p| (p.0, p.1 + shift)).collect();
+                    Self::matches_line_edges(&self.edges, &shifted, add_border)
+                })
+            }
+        }
+    }
+
+    /// Random polygons, points, lines and boxes for the comparison of the
+    /// row tests with the tests on all edges.
+    struct Gen(u64);
+
+    impl Gen {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn unit(&mut self) -> f64 {
+            (self.next() >> 11) as f64 / (1u64 << 53) as f64
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+        fn range(&mut self, lo: i64, hi: i64) -> i64 {
+            lo + self.below((hi - lo + 1) as u64) as i64
+        }
+    }
+
+    use super::{IP, FULL};
+
+    /// In-range integer coordinates (lat as stored, lon in -180..180).
+    const LAT_MIN: i64 = 10_000_000;
+    const LAT_MAX: i64 = 1_810_000_000;
+    const LON_MAX: i64 = 1_800_000_000;
+
+    fn ip_pt(p: IP) -> crate::geo::Pt {
+        crate::geo::Pt { y: p.0 as u32, x: crate::geo::x_of_ilon(p.1 as i32) }
+    }
+
+    fn clamp_ip(p: IP) -> IP {
+        (p.0.clamp(LAT_MIN, LAT_MAX), p.1.clamp(-LON_MAX, LON_MAX))
+    }
+
+    /// A polygon given in integer coordinates (`Polygon` takes degrees;
+    /// ilat/ilon give back the same integers).
+    fn poly_of(pts: &[IP]) -> super::Polygon {
+        super::Polygon { pts: pts.iter().map(|p| (crate::geo::lat_of(p.0 as u32), crate::geo::lon_of(p.1 as i32))).collect() }
+    }
+
+    /// One random polygon of a few kinds: a star (simple), random points
+    /// (self-intersecting), points on a coarse grid (repeated points,
+    /// collinear and zero-length edges, many points exactly on edges),
+    /// north-south zigzags (edges over every row), across the
+    /// antimeridian, near a pole, and huge ones.
+    fn random_ring(g: &mut Gen, n: usize) -> Vec<IP> {
+        let kind = g.below(8);
+        let scale: i64 = [10, 1_000, 100_000, 10_000_000, 300_000_000, 1_500_000_000][g.below(6) as usize];
+        let (cy, cx) = match kind {
+            4 => (g.range(LAT_MIN + 200_000_000, LAT_MAX - 200_000_000), if g.below(2) == 0 { LON_MAX - g.range(0, scale / 2) } else { -LON_MAX + g.range(0, scale / 2) }),
+            5 => (if g.below(2) == 0 { LAT_MAX - g.range(0, scale.min(100_000_000)) } else { LAT_MIN + g.range(0, scale.min(100_000_000)) }, g.range(-LON_MAX, LON_MAX)),
+            _ => (g.range(LAT_MIN, LAT_MAX), g.range(-LON_MAX, LON_MAX)),
+        };
+        let mut pts: Vec<IP> = Vec::with_capacity(n);
+        match kind {
+            0 | 4 | 5 => {
+                // a star around the centre
+                for k in 0..n {
+                    let a = (k as f64 + 0.5 * g.unit()) / n as f64 * std::f64::consts::TAU;
+                    let r = scale as f64 * (0.2 + 0.8 * g.unit());
+                    pts.push((cy + (r * a.sin()) as i64, cx + (r * a.cos()) as i64));
+                }
+            }
+            1 => {
+                for _ in 0..n {
+                    pts.push((cy + g.range(-scale, scale), cx + g.range(-scale, scale)));
+                }
+            }
+            2 | 6 => {
+                // a coarse grid: steps of 1 to 4 units, repeated points
+                let step = [1, 2, 4, scale / 8 + 1][g.below(4) as usize];
+                let cells = 1 + g.below(6) as i64;
+                for _ in 0..n {
+                    let p = (cy + step * g.range(-cells, cells), cx + step * g.range(-cells, cells));
+                    pts.push(p);
+                    if g.below(5) == 0 {
+                        pts.push(p);
+                    }
+                }
+            }
+            3 => {
+                // zigzag from south to north and back: every edge over every row
+                let w = scale.max(n as i64);
+                for k in 0..n {
+                    let y = if k % 2 == 0 { cy - scale } else { cy + scale };
+                    pts.push((y, cx - w + 2 * w * k as i64 / n as i64));
+                }
+            }
+            _ => {
+                // a rectangle-ish ring with collinear points on its sides
+                let (h, w) = (g.range(1, scale), g.range(1, scale));
+                let per = (n / 4).max(1) as i64;
+                for k in 0..per {
+                    pts.push((cy - h, cx - w + 2 * w * k / per));
+                }
+                for k in 0..per {
+                    pts.push((cy - h + 2 * h * k / per, cx + w));
+                }
+                for k in 0..per {
+                    pts.push((cy + h, cx + w - 2 * w * k / per));
+                }
+                for k in 0..per {
+                    pts.push((cy + h - 2 * h * k / per, cx - w));
+                }
+            }
+        }
+        // antimeridian rings: some vertices wrapped to the other side
+        let mut pts: Vec<IP> = pts
+            .into_iter()
+            .map(|(y, x)| {
+                let x = if x > LON_MAX { x - FULL } else if x < -LON_MAX { x + FULL } else { x };
+                clamp_ip((y, x))
+            })
+            .collect();
+        while pts.len() < 3 {
+            pts.push(pts[0]);
+        }
+        pts
+    }
+
+    /// Points to test near a polygon: random ones in and around its box,
+    /// vertices, points on edges, midpoints, and the borders of the rows.
+    fn probe_points(g: &mut Gen, lin: &linear::Lin, t: &super::PolyTest, n: usize) -> Vec<IP> {
+        let (lo, hi) = (lin.lo, lin.hi);
+        let (dy, dx) = ((hi.0 - lo.0) / 4 + 2, (hi.1 - lo.1) / 4 + 2);
+        let mut out = Vec::with_capacity(n);
+        while out.len() < n {
+            let p = match g.below(7) {
+                0 | 1 => (g.range(lo.0 - dy, hi.0 + dy), g.range(lo.1 - dx, hi.1 + dx)),
+                2 => {
+                    let e = lin.edges[g.below(lin.edges.len() as u64) as usize];
+                    if g.below(2) == 0 { e.0 } else { e.1 }
+                }
+                3 => {
+                    // on an edge: an integer point of it, if any, else near
+                    let (a, b) = lin.edges[g.below(lin.edges.len() as u64) as usize];
+                    let (ddy, ddx) = (b.0 - a.0, b.1 - a.1);
+                    let gcd = {
+                        let (mut x, mut y) = (ddy.abs(), ddx.abs());
+                        while y != 0 {
+                            (x, y) = (y, x % y);
+                        }
+                        x.max(1)
+                    };
+                    let k = g.range(0, gcd);
+                    (a.0 + ddy / gcd * k, a.1 + ddx / gcd * k)
+                }
+                4 => {
+                    let (a, b) = lin.edges[g.below(lin.edges.len() as u64) as usize];
+                    ((a.0 + b.0) / 2 + g.range(-1, 1), (a.1 + b.1) / 2 + g.range(-1, 1))
+                }
+                5 => {
+                    // at a row border or one unit off it
+                    let rows = &t.rows;
+                    let n = (rows.start.len() - 1) as i64;
+                    let k = g.range(0, n);
+                    (rows.y0 + k * rows.h + g.range(-1, 1), g.range(lo.1 - dx, hi.1 + dx))
+                }
+                _ => {
+                    // a vertex latitude with another longitude (rays along edges)
+                    let e = lin.edges[g.below(lin.edges.len() as u64) as usize];
+                    (e.0.0, g.range(lo.1 - dx, hi.1 + dx))
+                }
+            };
+            out.push(p);
+        }
+        out
+    }
+
+    /// Compares every test of `PolyTest` with the tests on all edges, for
+    /// polygons from `seed`, `polys` of them with up to `max_n` vertices,
+    /// and a few row counts each (1 row, a few, the default, more than
+    /// edges). Returns the number of comparisons.
+    fn compare_with_linear(seed: u64, polys: usize, max_n: usize, probes: usize) -> usize {
+        use super::{qp, PolyTest};
+        use crate::geo::Rect;
+        let mut g = Gen(seed);
+        let mut checks = 0;
+        for _ in 0..polys {
+            let n = 3 + g.below(max_n as u64 - 2) as usize;
+            let ring = random_ring(&mut g, n);
+            let poly = poly_of(&ring);
+            let lin = linear::Lin::new(&poly);
+            let e = lin.edges.len() as i64;
+            for rows in [1, 3, e / 3 + 1, e, 8 * e, i64::MAX] {
+                let t = if rows == e { poly.prepare() } else { PolyTest::with_rows(poly.edges(), rows) };
+                assert_eq!((t.lo, t.hi), (lin.lo, lin.hi));
+                let pts = probe_points(&mut g, &lin, &t, probes);
+                for &p in &pts {
+                    // internal tests on any coordinates, also shifted and doubled
+                    assert_eq!(t.on_border(p), lin.on_border(p), "on_border {p:?} ring {ring:?}");
+                    let p2 = (2 * p.0 + g.range(-1, 1), 2 * p.1 + g.range(-1, 1));
+                    assert_eq!(t.inside2(p2), lin.inside2(p2), "inside2 {p2:?} ring {ring:?}");
+                    assert_eq!(t.on_border2(p2), linear::Lin::on_border_e(&lin.edges.iter().map(|(a, b)| ((a.0 * 2, a.1 * 2), (b.0 * 2, b.1 * 2))).collect::<Vec<_>>(), p2));
+                    let c = clamp_ip(p);
+                    assert_eq!(t.contains_ip(c), lin.contains_ip(c), "contains {c:?} ring {ring:?}");
+                    assert_eq!(t.contains_member(ip_pt(c)), lin.contains_member_ip(qp(ip_pt(c))), "member {c:?} ring {ring:?}");
+                    checks += 5;
+                }
+                // lines: random, along edges, through vertices, zero length, long
+                for k in 0..probes / 2 {
+                    let len = 1 + g.below(if k % 7 == 0 { 40 } else { 5 }) as usize;
+                    let mut line: Vec<IP> = (0..len).map(|_| pts[g.below(pts.len() as u64) as usize]).collect();
+                    match k % 5 {
+                        0 => {
+                            // part of an edge, both directions
+                            let (a, b) = lin.edges[g.below(lin.edges.len() as u64) as usize];
+                            line = vec![a, b, a];
+                        }
+                        1 => line.push(line[0]),
+                        2 => {
+                            let c = line[0];
+                            line = vec![c, c];
+                        }
+                        _ => {}
+                    }
+                    let line: Vec<IP> = line.into_iter().map(clamp_ip).collect();
+                    let v: Vec<crate::geo::Pt> = line.iter().map(|p| ip_pt(*p)).collect();
+                    for add_border in [false, true] {
+                        assert_eq!(t.matches_line(&v, add_border), lin.matches_line(&v, add_border), "line {line:?} {add_border} ring {ring:?}");
+                        // without the shifts and the box test, unclamped
+                        assert_eq!(t.matches_line_edges(&line, add_border), linear::Lin::matches_line_edges(&lin.edges, &line, add_border));
+                        checks += 2;
+                    }
+                }
+                // boxes: between two probe points, a point box, corners on edges
+                for _ in 0..probes / 2 {
+                    let (a, b) = (clamp_ip(pts[g.below(pts.len() as u64) as usize]), clamp_ip(pts[g.below(pts.len() as u64) as usize]));
+                    let (pa, pb) = (ip_pt(a), ip_pt(b));
+                    let r = Rect { y0: pa.y.min(pb.y), x0: pa.x.min(pb.x), y1: pa.y.max(pb.y), x1: pa.x.max(pb.x) };
+                    assert_eq!(t.rect_pos(&r), lin.rect_pos(&r), "rect {r:?} ring {ring:?}");
+                    assert_eq!(t.contains_rect(&r), lin.contains_rect(&r));
+                    let r1 = Rect::point(pa);
+                    assert_eq!(t.rect_pos(&r1), lin.rect_pos(&r1), "rect {r1:?} ring {ring:?}");
+                    checks += 3;
+                }
+            }
+        }
+        checks
+    }
+
+    /// The row tests give the answers of the tests on all edges (seconds
+    /// in a release build; `poly_rows_match_linear_long` runs more).
+    #[test]
+    fn poly_rows_match_linear() {
+        let n = compare_with_linear(0x5eed_0001_2345_6789, 300, 40, 60);
+        assert!(n > 100_000, "{n}");
+        // fewer, larger polygons
+        compare_with_linear(0x5eed_0002_2345_6789, 3, 3000, 100);
+    }
+
+    /// Many more polygons; about a minute (`-- --ignored`).
+    #[test]
+    #[ignore]
+    fn poly_rows_match_linear_long() {
+        let start = std::time::Instant::now();
+        let mut seed = 0x0123_4567_89ab_cdefu64;
+        while start.elapsed() < std::time::Duration::from_secs(60) {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407) | 1;
+            compare_with_linear(seed, 50, 200, 100);
+            compare_with_linear(seed ^ 0xff, 1, 5000, 300);
+        }
+    }
+
+    /// Handmade cases: points on vertices and edges of a square with a
+    /// spike, a ring that runs along itself, a ring across the antimeridian
+    /// and around a pole, and the rows of each against all edges.
+    #[test]
+    fn poly_rows_handmade() {
+        use super::{qp, PolyTest, Polygon};
+        let polys = [
+            // square with a zero-length edge and a spike along the top
+            Polygon { pts: vec![(0.0, 0.0), (0.0, 1.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.5), (2.0, 0.5), (1.0, 0.5), (1.0, 0.0)] },
+            // runs back along itself
+            Polygon { pts: vec![(10.0, 10.0), (10.0, 12.0), (11.0, 12.0), (11.0, 11.0), (11.0, 12.0), (12.0, 12.0), (12.0, 10.0)] },
+            // across the antimeridian
+            Polygon { pts: vec![(-10.0, 170.0), (-10.0, -170.0), (10.0, -170.0), (10.0, 170.0)] },
+            // around the north pole region: all longitudes
+            Polygon { pts: vec![(80.0, -180.0), (80.0, -90.0), (80.0, 0.0), (80.0, 90.0), (80.0, 180.0), (90.0, 180.0), (90.0, -180.0)] },
+            // a bow tie
+            Polygon { pts: vec![(0.0, 0.0), (1.0, 1.0), (1.0, 0.0), (0.0, 1.0)] },
+        ];
+        let mut g = Gen(77);
+        for poly in &polys {
+            let lin = linear::Lin::new(poly);
+            for rows in [1, 2, 5, 1000] {
+                let t = PolyTest::with_rows(poly.edges(), rows);
+                let mut pts: Vec<IP> = lin.edges.iter().flat_map(|(a, b)| [*a, *b, ((a.0 + b.0) / 2, (a.1 + b.1) / 2)]).collect();
+                pts.extend(probe_points(&mut g, &lin, &t, 400));
+                for &p in &pts {
+                    let c = clamp_ip(p);
+                    assert_eq!(t.contains_ip(c), lin.contains_ip(c), "{c:?}");
+                    assert_eq!(t.contains_member(ip_pt(c)), lin.contains_member_ip(qp(ip_pt(c))), "{c:?}");
+                    for &d in pts.iter().step_by(7) {
+                        let d = clamp_ip(d);
+                        let v = [ip_pt(c), ip_pt(d)];
+                        for add_border in [false, true] {
+                            assert_eq!(t.matches_line(&v, add_border), lin.matches_line(&v, add_border), "{c:?} {d:?} {add_border}");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `matches_checked` stops at the deadline between the member ways of a
+    /// relation and otherwise answers as `matches`.
+    #[test]
+    fn poly_matches_checked_stops() {
+        use super::EGeom;
+        use crate::geo::Pt;
+        let poly = super::Polygon { pts: vec![(0.0, 0.0), (0.0, 1.0), (1.0, 1.0), (1.0, 0.0)] };
+        let t = poly.prepare();
+        // member ways outside the polygon: every one is tested
+        let way = |k: usize| (0..100).map(|i| Some(Pt::from_ll(2.0 + k as f64 * 0.01, i as f64 * 0.001))).collect::<Vec<_>>();
+        let outside = EGeom::Multi { points: vec![], lines: (0..100).map(way).collect() };
+        let inside = EGeom::Multi { points: vec![Pt::from_ll(0.5, 0.5)], lines: (0..100).map(way).collect() };
+        let open = super::super::fetch::Limits::default();
+        let past = super::super::fetch::Limits { deadline: Some(std::time::Instant::now() - std::time::Duration::from_millis(1)), ..Default::default() };
+        for g in [&outside, &inside, &EGeom::Point(Pt::from_ll(0.5, 0.5)), &EGeom::Line(way(1))] {
+            assert_eq!(t.matches_checked(g, &open).unwrap(), t.matches(g));
+        }
+        assert!(t.matches_checked(&outside, &past).is_err());
+        // a member node inside answers before the first check
+        assert!(t.matches_checked(&inside, &past).unwrap());
+    }
+
+    /// The rows stay within their budget for edges over every row, and
+    /// hold about 5 entries per edge for an outline.
+    #[test]
+    fn poly_rows_budget() {
+        use super::PolyTest;
+        let n = 2000;
+        // zigzag: each edge from south to north
+        let zig: Vec<IP> = (0..n).map(|k| (if k % 2 == 0 { 100_000_000 } else { 200_000_000 }, k as i64 * 1000)).collect();
+        let t = poly_of(&zig).prepare();
+        assert!(t.rows.ids.len() <= 16 * t.edges.len() + 1024, "{}", t.rows.ids.len());
+        // a circle: two edges per row
+        let circle: Vec<IP> = (0..n).map(|k| {
+            let a = k as f64 / n as f64 * std::f64::consts::TAU;
+            (500_000_000 + (1e8 * a.sin()) as i64, (1e8 * a.cos()) as i64)
+        }).collect();
+        let t = PolyTest::with_rows(poly_of(&circle).edges(), n as i64);
+        assert!(t.rows.ids.len() <= 4 * t.edges.len(), "{}", t.rows.ids.len());
+        assert!(t.rows.bytes() < 64 * n);
+    }
+
+    // ---- review (rv-poly): rings across the antimeridian, winding 360 and
+    // 720 degrees, ending on lon 180, with probes on both sides (each probe
+    // also shifted by 360 degrees where that stays in -180..180).
+
+    fn rv_compare_ring(g: &mut Gen, ring: &[IP], probes: usize) -> usize {
+        use super::{qp, PolyTest};
+        use crate::geo::Rect;
+        let poly = poly_of(ring);
+        let lin = linear::Lin::new(&poly);
+        let e = lin.edges.len() as i64;
+        let mut checks = 0;
+        let wrap = |p: IP| -> Vec<IP> {
+            let mut v = vec![clamp_ip(p)];
+            for k in [-2i64, -1, 1, 2] {
+                let x = p.1 + k * FULL;
+                if (-LON_MAX..=LON_MAX).contains(&x) {
+                    v.push(clamp_ip((p.0, x)));
+                }
+            }
+            v
+        };
+        for rows in [1, 3, e / 3 + 1, e, 8 * e] {
+            let t = if rows == e { poly.prepare() } else { PolyTest::with_rows(poly.edges(), rows) };
+            assert_eq!((t.lo, t.hi), (lin.lo, lin.hi));
+            let raw = probe_points(g, &lin, &t, probes);
+            let pts: Vec<IP> = raw.iter().flat_map(|p| wrap(*p)).collect();
+            for &c in &pts {
+                assert_eq!(t.contains_ip(c), lin.contains_ip(c), "contains {c:?} ring {ring:?}");
+                assert_eq!(t.contains_member(ip_pt(c)), lin.contains_member_ip(qp(ip_pt(c))), "member {c:?} ring {ring:?}");
+                checks += 2;
+            }
+            for k in 0..probes {
+                let len = 2 + g.below(if k % 5 == 0 { 30 } else { 4 }) as usize;
+                let mut line: Vec<IP> = (0..len).map(|_| pts[g.below(pts.len() as u64) as usize]).collect();
+                if k % 4 == 0 {
+                    // a short line near a probe: both sides of the meridian
+                    let c = line[0];
+                    line = vec![c, clamp_ip((c.0 + g.range(-1000, 1000), c.1 + g.range(-1000, 1000)))];
+                }
+                let v: Vec<crate::geo::Pt> = line.iter().map(|p| ip_pt(*p)).collect();
+                for add_border in [false, true] {
+                    assert_eq!(t.matches_line(&v, add_border), lin.matches_line(&v, add_border), "line {line:?} {add_border} ring {ring:?}");
+                    checks += 1;
+                }
+            }
+            for _ in 0..probes {
+                let (a, b) = (pts[g.below(pts.len() as u64) as usize], pts[g.below(pts.len() as u64) as usize]);
+                let (pa, pb) = (ip_pt(a), ip_pt(b));
+                let r = Rect { y0: pa.y.min(pb.y), x0: pa.x.min(pb.x), y1: pa.y.max(pb.y), x1: pa.x.max(pb.x) };
+                assert_eq!(t.rect_pos(&r), lin.rect_pos(&r), "rect {r:?} ring {ring:?}");
+                let r1 = Rect::point(pa);
+                assert_eq!(t.rect_pos(&r1), lin.rect_pos(&r1), "rect {r1:?} ring {ring:?}");
+                checks += 2;
+            }
+        }
+        checks
+    }
+
+    fn rv_deg(lat: f64, lon: f64) -> IP {
+        (crate::geo::ilat(lat) as i64, crate::geo::ilon(lon) as i64)
+    }
+
+    #[test]
+    fn rv_rows_rings_across_the_antimeridian() {
+        let mut g = Gen(0xabcd_ef01_2345_6789);
+        let mut checks = 0;
+        let mut rings: Vec<Vec<IP>> = Vec::new();
+        // band around the pole (360 degrees), and a spiral (720 degrees)
+        rings.push([(80.0, -180.0), (80.0, -90.0), (80.0, 0.0), (80.0, 90.0), (80.0, 180.0), (89.0, 180.0), (89.0, 90.0), (89.0, 0.0), (89.0, -90.0), (89.0, -180.0)].iter().map(|p| rv_deg(p.0, p.1)).collect());
+        rings.push([(60.0, 0.0), (60.0, 120.0), (60.0, -120.0), (60.0, 0.0), (61.0, 120.0), (61.0, -120.0), (61.0, 0.0), (62.0, 0.0)].iter().map(|p| rv_deg(p.0, p.1)).collect());
+        // a box across the date line, one ending on lon 180 with edges along it
+        rings.push([(64.0, 170.0), (64.0, -170.0), (70.0, -170.0), (70.0, 170.0)].iter().map(|p| rv_deg(p.0, p.1)).collect());
+        rings.push([(64.0, 170.0), (64.0, 180.0), (66.0, 180.0), (67.0, 180.0), (70.0, 180.0), (70.0, 170.0), (67.0, 175.0)].iter().map(|p| rv_deg(p.0, p.1)).collect());
+        rings.push([(64.0, -180.0), (64.0, -170.0), (70.0, -170.0), (70.0, -180.0), (67.0, -180.0)].iter().map(|p| rv_deg(p.0, p.1)).collect());
+        // around the pole with the closing edge along lat 90
+        rings.push([(89.5, -180.0), (89.5, 180.0), (90.0, 180.0), (90.0, -180.0)].iter().map(|p| rv_deg(p.0, p.1)).collect());
+        // random zigzags across the date line, many vertices on lon 180 / -180
+        for _ in 0..40 {
+            let n = 4 + g.below(60) as usize;
+            let cy = g.range(LAT_MIN + 100_000_000, LAT_MAX - 100_000_000);
+            let ring: Vec<IP> = (0..n)
+                .map(|_| {
+                    let y = cy + g.range(-50_000_000, 50_000_000);
+                    let x = match g.below(4) {
+                        0 => LON_MAX,
+                        1 => -LON_MAX,
+                        2 => LON_MAX - g.range(0, 30_000_000),
+                        _ => -LON_MAX + g.range(0, 30_000_000),
+                    };
+                    (y, x)
+                })
+                .collect();
+            rings.push(ring);
+        }
+        // random rings winding several times around the pole
+        for _ in 0..20 {
+            let n = 6 + g.below(40) as usize;
+            let cy = g.range(LAT_MIN + 100_000_000, LAT_MAX - 100_000_000);
+            let mut x = g.range(-LON_MAX, LON_MAX);
+            let ring: Vec<IP> = (0..n)
+                .map(|_| {
+                    x += g.range(0, 1_000_000_000);
+                    let xx = (x + LON_MAX).rem_euclid(FULL) - LON_MAX;
+                    (cy + g.range(-30_000_000, 30_000_000), xx)
+                })
+                .collect();
+            rings.push(ring);
+        }
+        for ring in &rings {
+            checks += rv_compare_ring(&mut g, ring, 80);
+        }
+        assert!(checks > 50_000, "{checks}");
+    }
+
+    /// Rings with all edges horizontal or on few latitudes (rows of one
+    /// latitude, row borders on vertices), and long edges that force the
+    /// halving with a few short ones.
+    #[test]
+    fn rv_rows_flat_and_long_edges() {
+        let mut g = Gen(0x1357_9bdf_0246_8ace);
+        let mut checks = 0;
+        for _ in 0..60 {
+            let n = 3 + g.below(80) as usize;
+            let cy = g.range(LAT_MIN + 10_000, LAT_MAX - 10_000);
+            let cx = g.range(-LON_MAX + 10_000, LON_MAX - 10_000);
+            let levels = 1 + g.below(3) as i64;
+            let step = [1, 2, 7, 1000][g.below(4) as usize];
+            let ring: Vec<IP> = (0..n).map(|_| (cy + step * g.range(0, levels - 1), cx + g.range(-5000, 5000))).collect();
+            checks += rv_compare_ring(&mut g, &ring, 40);
+        }
+        for _ in 0..30 {
+            // a few long north-south edges and many short ones
+            let n = 20 + g.below(300) as usize;
+            let cy = g.range(LAT_MIN + 200_000_000, LAT_MAX - 200_000_000);
+            let cx = g.range(-LON_MAX + 200_000_000, LON_MAX - 200_000_000);
+            let long = 1 + g.below(40) as usize;
+            let mut ring = Vec::new();
+            for k in 0..n {
+                let a = k as f64 / n as f64 * std::f64::consts::TAU;
+                ring.push((cy + (1e8 * a.sin()) as i64, cx + (1e8 * a.cos()) as i64));
+                if k < long {
+                    ring.push((cy + if k % 2 == 0 { 150_000_000 } else { -150_000_000 }, cx + (1e8 * a.cos()) as i64 + 1));
+                }
+            }
+            checks += rv_compare_ring(&mut g, &ring, 40);
+        }
+        assert!(checks > 20_000, "{checks}");
     }
 }
