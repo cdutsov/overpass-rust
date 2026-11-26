@@ -565,8 +565,25 @@ impl<'s, W: Write> Engine<'s, W> {
             let ids: Vec<Id> = if T::KIND == Kind::Node { ids.clone() } else { ids.iter().copied().filter(|i| *i <= u32::MAX as u64).collect() };
             sources.push(self.f.by_ids::<T>(&ids)?);
         }
+        // With an input set (`node.a(w.b)`), a down recursion that refers to
+        // more elements than the smallest input set holds is tested on the
+        // elements of that set: the elements `b` refers to are not fetched.
+        let inputs: Vec<std::rc::Rc<Set>> = plan.inputs.iter().map(|name| self.get(name)).collect();
+        let mut cands: Option<rustc_hash::FxHashSet<Id>> = None;
         for (kind, input, role, positions, count) in &plan.recurse {
             let inp = self.get(input);
+            if let Some(base) = inputs
+                .iter()
+                .map(|s| T::from_set(s))
+                .min_by_key(|v| v.len())
+                .filter(|base| Self::down_ref_count(*kind, &inp, positions.as_deref(), T::etype()).is_some_and(|n| n > base.len()))
+            {
+                let cands = cands.get_or_insert_with(|| base.iter().map(|e| e.id()).collect());
+                if let Some(hit) = Self::down_refs_among(*kind, &inp, role.as_deref(), positions.as_deref(), T::etype(), cands) {
+                    sources.push(base.iter().filter(|e| hit.contains(&e.id())).cloned().collect());
+                    continue;
+                }
+            }
             let mut r = self.recurse_filter(*kind, &inp, role.as_deref(), positions.as_deref(), *count, T::etype())?;
             sources.push(std::mem::take(T::from_set_mut(&mut r)));
         }
@@ -588,7 +605,6 @@ impl<'s, W: Write> Engine<'s, W> {
             }
             sources.push(v);
         }
-        let inputs: Vec<std::rc::Rc<Set>> = plan.inputs.iter().map(|name| self.get(name)).collect();
         if sources.is_empty() && inputs.is_empty() {
             return Ok(None);
         }
@@ -2232,6 +2248,42 @@ mod tests {
         let out = output(db, q);
         CANDIDATES_OFF.set(false);
         (out, CANDIDATES.get())
+    }
+
+    /// A down recursion in a statement with input sets (`node.a(w.b)`), tested
+    /// on the input set, gives what the recursion gives on its own
+    /// (`node(w.b)->.x; node.a.x;`), for positions, roles and every type.
+    #[test]
+    fn down_recursion_on_input_sets_matches_the_recursion() {
+        let dir = std::env::temp_dir().join(format!("overpass-downrec-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = crate::store::Db::open(&dir.join("db")).unwrap();
+        let file = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("compat/data/monaco.osm.gz");
+        let mut report = crate::import::ImportReport::default();
+        crate::import::import_file(&db, &file, &mut report).unwrap();
+        crate::import::set_base_timestamp(&db, Some("test"), &report).unwrap();
+        let sets = "way[highway]->.b;node[highway]->.a;node[name]->.a2;rel[type=route]->.c;way[name]->.wn;rel[type]->.rt;";
+        let pairs = [
+            ("node.a(w.b)", "node(w.b)->.x;node.a.x"),
+            ("node.a.a2(w.b)", "node(w.b)->.x;node.a.a2.x"),
+            ("node.a(w.b:1,-1)", "node(w.b:1,-1)->.x;node.a.x"),
+            ("node.a(w.b:2)", "node(w.b:2)->.x;node.a.x"),
+            ("node.a2(r.c)", "node(r.c)->.x;node.a2.x"),
+            ("node.a2(r.c:\"stop\")", "node(r.c:\"stop\")->.x;node.a2.x"),
+            ("way.wn(r.c)", "way(r.c)->.x;way.wn.x"),
+            ("way.wn(r.c:\"\")", "way(r.c:\"\")->.x;way.wn.x"),
+            ("rel.rt(r.rt)", "rel(r.rt)->.x;rel.rt.x"),
+            ("node.a(w.b)[highway=crossing]", "node(w.b)->.x;node.a.x[highway=crossing]"),
+            ("node.a(w.b)(r.c)", "node(w.b)->.x;node(r.c)->.y;node.a.x.y"),
+        ];
+        for (new, old) in pairs {
+            let a = output(&db, &format!("[out:csv(::type,::id;false)];{sets}{new};out;"));
+            let b = output(&db, &format!("[out:csv(::type,::id;false)];{sets}{old};out;"));
+            assert_eq!(a, b, "{new}");
+            assert!(!a.is_empty() || new.contains("crossing"), "{new}: empty");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Output of the query with the hooks as set on this thread.

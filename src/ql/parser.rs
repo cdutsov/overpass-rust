@@ -157,6 +157,21 @@ fn eval_name(e: &Expr) -> String {
     s.to_string()
 }
 
+use crate::exec::eval::num::atof;
+
+/// How C++ reads a quoted value that is not a number (see `cpp_number`).
+#[derive(Clone, Copy)]
+enum Quoted {
+    Atof,
+    Zero,
+}
+
+/// An empty result, for clauses whose values C++ reads as NaN: a box, a
+/// circle or a point at NaN matches nothing there.
+fn matches_nothing() -> Filter {
+    Filter::Ids(Vec::new())
+}
+
 fn parse_number(s: &str) -> Option<f64> {
     let t = s.trim();
     if t.is_empty() {
@@ -284,6 +299,35 @@ impl Parser {
         let neg = self.eat_p("-");
         let t = self.text(what)?;
         let v = parse_number(&t).ok_or_else(|| anyhow!("line {line}: parse error: {what} expected - '{t}' found."))?;
+        Ok(if neg { -v } else { v })
+    }
+    /// A coordinate or radius as C++ reads it: `atof` of the token text, so a
+    /// word that is not a number ("LAT", "None", "abc") reads as 0 and "NaN" as
+    /// NaN. A quoted number reads as that number. For a quoted value that is not
+    /// a number, `quoted` says what C++ does: in an around radius and in is_in
+    /// it reads the leading number ("1e2x" is 100); in bbox and around
+    /// coordinates it keeps the quotes and reads 0.
+    fn cpp_number(&mut self, what: &str, quoted: Quoted) -> Result<f64> {
+        let neg = self.eat_p("-");
+        let v = match self.peek().clone() {
+            Tok::Num(n) => {
+                self.next();
+                parse_number(&n).unwrap_or_else(|| atof(&n))
+            }
+            Tok::Word(w) => {
+                self.next();
+                atof(&w)
+            }
+            Tok::Str(s) => {
+                self.next();
+                match (parse_number(&s), quoted) {
+                    (Some(v), _) => v,
+                    (None, Quoted::Atof) => atof(&s),
+                    (None, Quoted::Zero) => 0.0,
+                }
+            }
+            _ => return self.err(format!("{what} expected - '{}' found.", self.found())),
+        };
         Ok(if neg { -v } else { v })
     }
     /// `.name` set reference
@@ -431,13 +475,14 @@ impl Parser {
     }
 
     fn bbox_static(&self, line: usize, elem: &str, b: BBox) -> Result<BBox> {
+        // Compared as C++ does, so NaN passes (and finds nothing).
         for (name, v) in [("s", b.south), ("n", b.north)] {
-            if !(-90.0..=90.0).contains(&v) {
+            if v < -90.0 || v > 90.0 {
                 return self.static_err(line, format!("For the attribute \"{name}\" of the element \"{elem}\" the only allowed values are floats between -90.0 and 90.0."));
             }
         }
         for (name, v) in [("w", b.west), ("e", b.east)] {
-            if !(-180.0..=180.0).contains(&v) {
+            if v < -180.0 || v > 180.0 {
                 return self.static_err(line, format!("For the attribute \"{name}\" of the element \"{elem}\" the only allowed values are floats between -180.0 and 180.0."));
             }
         }
@@ -577,16 +622,17 @@ impl Parser {
                     }
                     "is_in" => {
                         let coord = if self.eat_p("(") {
-                            let lat = self.number("Value")?;
+                            let lat = self.cpp_number("Value", Quoted::Atof)?;
                             if !self.eat_p(",") {
                                 return self.static_err(line, "For the attribute \"lon\" of the element \"coord-query\" the only allowed values are floats between -180.0 and 180.0.");
                             }
-                            let lon = self.number("Value")?;
+                            let lon = self.cpp_number("Value", Quoted::Atof)?;
                             self.expect_p(")")?;
-                            if !(-90.0..=90.0).contains(&lat) {
+                            // Compared as C++ does, so NaN passes (and finds nothing).
+                            if lat < -90.0 || lat > 90.0 {
                                 return self.static_err(line, "For the attribute \"lat\" of the element \"coord-query\" the only allowed values are floats between -90.0 and 90.0.");
                             }
-                            if !(-180.0..=180.0).contains(&lon) {
+                            if lon < -180.0 || lon > 180.0 {
                                 return self.static_err(line, "For the attribute \"lon\" of the element \"coord-query\" the only allowed values are floats between -180.0 and 180.0.");
                             }
                             Some((lat, lon))
@@ -718,13 +764,13 @@ impl Parser {
                 Tok::P("(") => {
                     let line = self.line();
                     self.next();
-                    let south = self.number("Value")?;
+                    let south = self.cpp_number("Value", Quoted::Zero)?;
                     self.expect_p(",")?;
-                    let west = self.number("Value")?;
+                    let west = self.cpp_number("Value", Quoted::Zero)?;
                     self.expect_p(",")?;
-                    let north = self.number("Value")?;
+                    let north = self.cpp_number("Value", Quoted::Zero)?;
                     self.expect_p(",")?;
-                    let east = self.number("Value")?;
+                    let east = self.cpp_number("Value", Quoted::Zero)?;
                     self.expect_p(")")?;
                     o.geom_bbox = Some(self.bbox_static(line, "print", BBox { south, west, north, east })?);
                 }
@@ -857,7 +903,7 @@ impl Parser {
         self.expect_p("(")?;
         let f = match self.peek().clone() {
             Tok::Num(_) | Tok::P("-") => {
-                let first = self.number("Number")?;
+                let first = self.cpp_number("Number", Quoted::Zero)?;
                 self.after_clause_number()?;
                 if self.eat_p(")") {
                     if first <= 0.0 || first.fract() != 0.0 {
@@ -867,7 +913,7 @@ impl Parser {
                 }
                 let mut vals = vec![first];
                 while self.eat_p(",") {
-                    vals.push(self.number("Number")?);
+                    vals.push(self.cpp_number("Number", Quoted::Zero)?);
                     self.after_clause_number()?;
                 }
                 if !self.is_p(")") {
@@ -876,7 +922,12 @@ impl Parser {
                 if vals.len() != 4 {
                     return self.err("bbox requires four arguments");
                 }
-                Filter::BBox(self.bbox_static(line, "bbox-query", BBox { south: vals[0], west: vals[1], north: vals[2], east: vals[3] })?)
+                let b = self.bbox_static(line, "bbox-query", BBox { south: vals[0], west: vals[1], north: vals[2], east: vals[3] })?;
+                if vals.iter().any(|v| v.is_nan()) {
+                    matches_nothing()
+                } else {
+                    Filter::BBox(b)
+                }
             }
             Tok::P(op @ ("<" | "<<" | ">" | ">>")) => {
                 self.next();
@@ -912,27 +963,35 @@ impl Parser {
                         if !self.eat_p(":") {
                             return self.err("around requires the radius as first argument");
                         }
-                        let radius = self.number("Value")?;
+                        // C++ refuses only an empty radius; other text reads as atof.
+                        let empty_radius = matches!(self.peek(), Tok::Str(s) if s.is_empty());
+                        let radius = self.cpp_number("Value", Quoted::Atof)?;
                         let mut coords = Vec::new();
                         while self.eat_p(",") {
-                            coords.push(self.number("Value")?);
+                            coords.push(self.cpp_number("Value", Quoted::Zero)?);
                         }
                         if coords.len() % 2 != 0 {
                             return self.err("around requires an odd number of arguments");
                         }
-                        if radius < 0.0 {
+                        if radius < 0.0 || empty_radius {
                             return self.static_err(line, "For the attribute \"radius\" of the element \"around\" the only allowed values are nonnegative floats.");
                         }
                         let points: Vec<(f64, f64)> = coords.chunks(2).map(|c| (c[0], c[1])).collect();
+                        // Compared as C++ does, so NaN passes (and finds nothing).
                         for (lat, lon) in &points {
-                            if !(-90.0..=90.0).contains(lat) {
+                            if *lat < -90.0 || *lat > 90.0 {
                                 return self.static_err(line, "For the attribute \"lat\" of the element \"around\" the only allowed values are floats between -90.0 and 90.0.");
                             }
-                            if !(-180.0..=180.0).contains(lon) {
+                            if *lon < -180.0 || *lon > 180.0 {
                                 return self.static_err(line, "For the attribute \"lon\" of the element \"around\" the only allowed values are floats between -180.0 and 180.0.");
                             }
                         }
-                        Filter::Around { input, radius, points }
+                        // C++ finds nothing for a NaN or infinite radius or a NaN coordinate.
+                        if radius.is_nan() || radius.is_infinite() || points.iter().any(|(a, b)| a.is_nan() || b.is_nan()) {
+                            matches_nothing()
+                        } else {
+                            Filter::Around { input, radius, points }
+                        }
                     }
                     "poly" => {
                         self.expect_p(":")?;
@@ -1486,6 +1545,12 @@ impl Parser {
                     self.depth = 1;
                     return Ok(Expr::SetProp { set: w, prop: name });
                 }
+                // C++ takes a word that strtod reads whole ("nan", "Inf",
+                // "Infinity") as a number constant.
+                if crate::exec::eval::num::dbl(&w).is_some() {
+                    self.depth = 1;
+                    return Ok(Expr::Lit(w));
+                }
                 bail!("line {}: parse error: Put quotation marks around \"{w}\" if it should be a constant and not a tag evaluation.", self.line())
             }
             // `.a.count(nodes)`: C++ reads it as a set that never exists (count 0,
@@ -1631,6 +1696,64 @@ mod tests {
             _ => panic!(),
         }
         assert_eq!(s.stmts[0].into, "a");
+    }
+
+    fn filter_of(q: &str) -> Filter {
+        let s = parse(q).unwrap_or_else(|e| panic!("{q}: {e}"));
+        match &s.stmts[0].kind {
+            StmtKind::Query { filters, .. } => filters[0].clone(),
+            _ => panic!("{q}"),
+        }
+    }
+
+    fn around_of(q: &str) -> (f64, Vec<(f64, f64)>) {
+        match filter_of(q) {
+            Filter::Around { radius, points, .. } => (radius, points),
+            f => panic!("{q}: {f:?}"),
+        }
+    }
+
+    // Values C++ reads with atof (word -> 0) instead of refusing the query, as
+    // in the template queries of clients that left a placeholder unfilled.
+    #[test]
+    fn coordinates_read_as_cpp_reads_them() {
+        assert_eq!(around_of("node(around:RADIUS, LAT, LON);out;"), (0.0, vec![(0.0, 0.0)]));
+        assert_eq!(around_of("way(around:40,None,None);out;"), (40.0, vec![(0.0, 0.0)]));
+        assert_eq!(around_of("node(around:abc);out;"), (0.0, vec![]));
+        assert_eq!(around_of("node(around:100,47.37,-abc);out;").1, vec![(47.37, 0.0)]);
+        // radius: quotes removed, leading number; coordinates: quoted junk is 0
+        assert_eq!(around_of("node(around:\"1e2x\",47.37,8.54);out;").0, 100.0);
+        assert_eq!(around_of("node(around:100,47.37,\"8.54abc\");out;").1, vec![(47.37, 0.0)]);
+        // a quoted number keeps its value (C++ reads 0 here: it keeps the quotes)
+        assert_eq!(around_of("node(around:100,47.37,\"8.54\");out;").1, vec![(47.37, 8.54)]);
+        // NaN or an infinite radius finds nothing; infinite coordinates are refused
+        for q in ["node(around:100,NaN,NaN);out;", "node(around:NaN);out;", "node(around:inf,47.37,8.54);out;", "node(47.3,NaN,47.31,8.51);out;"] {
+            assert_eq!(filter_of(q), Filter::Ids(vec![]), "{q}");
+        }
+        assert!(parse("node(around:100,Infinity,8);out;").unwrap_err().to_string().contains("\"lat\" of the element \"around\""));
+        assert!(parse("node(around:\"\",47.37,8.54);out;").unwrap_err().to_string().contains("\"radius\" of the element \"around\""));
+        match filter_of("node(47.3,8.5,47.31,abc);out;") {
+            Filter::BBox(b) => assert_eq!((b.south, b.west, b.north, b.east), (47.3, 8.5, 47.31, 0.0)),
+            f => panic!("{f:?}"),
+        }
+        match &parse("is_in(NaN,LON);out;").unwrap().stmts[0].kind {
+            StmtKind::IsIn { coord: Some((la, lo)), .. } => assert!(la.is_nan() && *lo == 0.0),
+            k => panic!("{k:?}"),
+        }
+        // malformed numbers stay errors, as on C++
+        for q in ["node(around:100x,47.37,8.54);out;", "node(around:100,47.37abc,8.54);out;", "node(id:abc);out;", "node(uid:abc);out;"] {
+            assert!(parse(q).is_err(), "{q}");
+        }
+    }
+
+    #[test]
+    fn nan_and_inf_words_are_numbers_in_evaluators() {
+        for q in ["node(1)(if:NaN==1);out;", "make x a=inf+1,b=Infinity,c=-nan;out;"] {
+            assert!(parse(q).is_ok(), "{q}");
+        }
+        for q in ["node(1)(if:infx>1);out;", "node(1)(if:nanny);out;", "node(1)(if:abc==1);out;"] {
+            assert!(parse(q).unwrap_err().to_string().contains("Put quotation marks"), "{q}");
+        }
     }
 
     #[test]

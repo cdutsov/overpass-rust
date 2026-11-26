@@ -4,6 +4,34 @@ The changes in each release of overpass-rust, newest first. "Overpass API"
 here means the C++ server, version 0.7.62, whose answers overpass-rust
 reproduces.
 
+## 0.3.2 (2026-11-26)
+
+### Fixed
+
+- A statement with an input set and a recursion over a large set, such as
+  `node.fords(w.roads)` with the roads of a whole country, ran out of memory:
+  it read every node of the roads and kept those of the input set. It tests
+  the elements of the input set against the node lists of the ways (or the
+  members of the relations), when that set is the smaller one. Real queries
+  of this form (fords on rivers in a country polygon) give the Overpass API
+  answer in 11 to 13 s, where they failed after 22 to 44 s; Overpass API
+  takes 88 to 139 s for them.
+- A relation whose rings are open when the areas are built keeps the area of
+  the build before, as on Overpass API. The build of 25 November read China
+  and India while their common border was being edited in several steps, and
+  both countries were without an area for a day.
+- Coordinates and radii are read as Overpass API reads them. A word in place
+  of a number (`around:RADIUS,LAT,LON`, `around:40,None,None`, `NaN`) reads as
+  the C function `atof` reads it: 0 for most words, NaN for "nan". A circle,
+  box or point at NaN, or a circle of infinite radius, finds nothing. A quoted
+  value that is not a number reads as 0 in a box or as an around coordinate,
+  and as its leading number in an around radius or in `is_in`. These queries
+  were refused with "Value expected"; clients that send them unfilled
+  templates get the answer of Overpass API.
+- In an evaluator, a word that is a number for `strtod` ("nan", "inf",
+  "Infinity") is a number constant, as on Overpass API, where it was refused
+  with "Put quotation marks around ...".
+
 ## 0.3.1 (2026-11-25)
 
 ### Faster

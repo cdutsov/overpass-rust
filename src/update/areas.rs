@@ -17,6 +17,10 @@ use rustc_hash::FxHashSet;
 pub struct AreaReport {
     pub candidates: usize,
     pub created: usize,
+    /// Candidates that did not give an area this time (an open ring while a
+    /// border is being edited) and keep the area of the last build, as C++
+    /// does. Counted in `created` too.
+    pub kept: usize,
     pub remarks: Vec<String>,
 }
 
@@ -54,7 +58,8 @@ fn tiles_rect(used: &[u32]) -> Rect {
 const GROUP: usize = 2000;
 
 /// Compute all areas from the current data and replace the stored ones
-/// (areas whose relation no longer qualifies disappear). The computation
+/// (areas whose relation is deleted or no longer qualifies disappear; a
+/// relation that qualifies but does not give an area keeps its stored one). The computation
 /// reads short-lived snapshots; the results go through external sorters
 /// and are written in one short transaction at the end.
 pub fn make_areas(db: &Db) -> Result<AreaReport> {
@@ -105,7 +110,16 @@ pub fn make_areas_with(db: &Db, tmp: &std::path::Path, memory: usize) -> Result<
         for id in gids {
             // Deleted since the candidates were collected.
             let Some(rel) = by_id.remove(&id) else { continue };
-            let Some((area, blocks)) = build(&f, rel, &mut report)? else { continue };
+            let (area, blocks) = match build(&f, rel, &mut report)? {
+                Some(built) => built,
+                None => match stored_area(&snap, &f, id)? {
+                    Some(old) => {
+                        report.kept += 1;
+                        old
+                    }
+                    None => continue,
+                },
+            };
             report.created += 1;
             let cell = area.cell();
             let key = crate::store::chunk_key(cell, area.id);
@@ -139,6 +153,23 @@ pub fn make_areas_with(db: &Db, tmp: &std::path::Path, memory: usize) -> Result<
     app.commit()?;
     let _ = std::fs::remove_dir(tmp);
     Ok(report)
+}
+
+/// The stored area of relation `rel_id` with its blocks. C++ replaces the area
+/// of a relation only when `make-area` succeeds: a relation whose rings are
+/// open at the time of the run keeps the area of the run before (2026-11-25:
+/// China and India lost theirs for a day while their common border was being
+/// edited during the build).
+fn stored_area(snap: &crate::store::Snapshot, f: &Fetch, rel_id: Id) -> Result<Option<(Area, Blocks)>> {
+    let id = (rel_id as u32).wrapping_add(3_600_000_000) as Id;
+    let Some(area) = f.by_ids::<Area>(&[id])?.into_iter().next() else { return Ok(None) };
+    let mut blocks = Blocks::new();
+    for &tile in &area.used {
+        if let Some(b) = snap.area_blocks(tile, id as u32)? {
+            blocks.insert(tile, b);
+        }
+    }
+    Ok(Some((area, blocks)))
 }
 
 /// The area of one candidate relation (C++ `make-area` of the rules).
@@ -227,6 +258,56 @@ mod tests {
             let got = types(q);
             assert!(!got.iter().any(|t| t == "area"), "{q}: {} areas", got.len());
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn change(db: &Db, xml: &str) {
+        let mut t = db.write().unwrap();
+        let mut r = crate::import::ImportReport::default();
+        crate::import::apply_reader(&mut t, std::io::BufReader::new(xml.as_bytes()), &mut r).unwrap();
+        t.commit().unwrap();
+    }
+
+    /// A relation whose ring is open at the time of a build keeps the area of
+    /// the build before, as on C++; a deleted relation loses it.
+    #[test]
+    fn open_ring_keeps_the_last_area() {
+        let dir = std::env::temp_dir().join(format!("areas-keep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = Db::open(&dir.join("db")).unwrap();
+        let n = |id: u32, lat: f64, lon: f64| format!(r#"<node id="{id}" version="1" lat="{lat}" lon="{lon}"/>"#);
+        let base = format!(
+            r#"<osmChange version="0.6"><create>{}{}{}{}{}
+<way id="11" version="1"><nd ref="1"/><nd ref="2"/><nd ref="3"/></way>
+<way id="12" version="1"><nd ref="3"/><nd ref="4"/><nd ref="1"/></way>
+<relation id="21" version="1"><member type="way" ref="11" role="outer"/><member type="way" ref="12" role="outer"/>
+<tag k="type" v="boundary"/><tag k="boundary" v="administrative"/><tag k="name" v="Square"/></relation>
+</create></osmChange>"#,
+            n(1, 47.0, 8.0), n(2, 47.0, 8.1), n(3, 47.1, 8.1), n(4, 47.1, 8.0), n(5, 47.2, 8.2)
+        );
+        change(&db, &base);
+        let first = make_areas(&db).unwrap();
+        assert_eq!((first.created, first.kept), (1, 0));
+        let full = stored(&db);
+        assert!(full.0 == 1 && full.1 >= 1, "{full:?}");
+        let is_in = |db: &Db| -> String {
+            let p = crate::exec::run(db, "[out:csv(::id;false)];is_in(47.05,8.05);out ids;", Vec::new(), &Default::default()).map_err(|(_, e)| e).unwrap();
+            String::from_utf8(p.w).unwrap()
+        };
+        assert_eq!(is_in(&db).trim(), "3600000021");
+        // a mapper moves the end of way 12 to node 5: the ring is open
+        change(&db, r#"<osmChange version="0.6"><modify><way id="12" version="2"><nd ref="3"/><nd ref="4"/><nd ref="5"/></way></modify></osmChange>"#);
+        let second = make_areas(&db).unwrap();
+        assert_eq!((second.created, second.kept), (1, 1));
+        assert!(second.remarks.iter().any(|r| r.contains("odd number of ways")), "{:?}", second.remarks);
+        assert_eq!(stored(&db), full);
+        assert_eq!(is_in(&db).trim(), "3600000021");
+        // the relation is deleted: its area goes
+        change(&db, r#"<osmChange version="0.6"><delete><relation id="21" version="2"/></delete></osmChange>"#);
+        let third = make_areas(&db).unwrap();
+        assert_eq!((third.created, third.kept), (0, 0));
+        assert_eq!(stored(&db), (0, 0));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

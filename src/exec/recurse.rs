@@ -238,6 +238,55 @@ impl<'s, W: Write> Engine<'s, W> {
         Ok(out)
     }
 
+    /// How many references a down recursion follows (`None` for the other
+    /// recursions): what `recurse_filter` would fetch at most.
+    pub fn down_ref_count(kind: RecurseFilter, s: &Set, positions: Option<&[i64]>, target: ElemType) -> Option<usize> {
+        match (kind, target) {
+            (RecurseFilter::W, ElemType::Node) => Some(match positions {
+                Some(ps) => s.ways.len() * ps.len(),
+                None => s.ways.iter().map(|w| w.nodes.len()).sum(),
+            }),
+            (RecurseFilter::R, _) => Some(s.rels.iter().map(|r| r.members.len()).sum()),
+            _ => None,
+        }
+    }
+
+    /// For a down recursion (`(w.s)` on nodes, `(r.s)`): which of the
+    /// candidate ids (`cands`, the elements of an input set of the statement)
+    /// the set `s` refers to, without fetching what it refers to. `None` for
+    /// the other recursions. `node.fords(w.roads)` with 2.6 million roads
+    /// fetched every node of them (30 million) to keep 33,000 at most.
+    pub fn down_refs_among(kind: RecurseFilter, s: &Set, role: Option<&str>, positions: Option<&[i64]>, target: ElemType, cands: &rustc_hash::FxHashSet<Id>) -> Option<rustc_hash::FxHashSet<Id>> {
+        let mut hit = rustc_hash::FxHashSet::default();
+        match (kind, target) {
+            (RecurseFilter::W, ElemType::Node) => {
+                for w in &s.ways {
+                    match positions {
+                        Some(ps) => {
+                            let len = w.nodes.len() as i64;
+                            for &p in ps {
+                                let i = if p > 0 { p - 1 } else { len + p };
+                                if (0..len).contains(&i) && cands.contains(&w.nodes[i as usize]) {
+                                    hit.insert(w.nodes[i as usize]);
+                                }
+                            }
+                        }
+                        None => hit.extend(w.nodes.iter().filter(|n| cands.contains(n))),
+                    }
+                }
+            }
+            (RecurseFilter::R, t) => {
+                for m in s.rels.iter().flat_map(|r| r.members.iter()) {
+                    if m.mtype == t && role.is_none_or(|ro| &*m.role == ro) && cands.contains(&m.id) {
+                        hit.insert(m.id);
+                    }
+                }
+            }
+            _ => return None,
+        }
+        Some(hit)
+    }
+
     /// Recurse criteria; `target` is the queried element type.
     pub fn recurse_filter(&mut self, kind: RecurseFilter, s: &Set, role: Option<&str>, positions: Option<&[i64]>, count: Option<(u32, u32)>, target: ElemType) -> Result<Set> {
         // Vertex at a 1-based position, negative positions counting from the end.

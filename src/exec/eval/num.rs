@@ -187,6 +187,12 @@ pub fn dbl(s: &str) -> Option<f64> {
     (n == s.len()).then_some(v)
 }
 
+/// `atof(s)`: the longest leading number, 0 when the text does not start
+/// with one ("abc", "LAT", "None"), NaN for "nan", infinity for "inf".
+pub fn atof(s: &str) -> f64 {
+    strtod_prefix(s).map(|(v, _, _)| v).unwrap_or(0.0)
+}
+
 /// `strtod` on a prefix, failing on range errors.
 pub fn pdbl(s: &str) -> Option<f64> {
     if s.is_empty() {

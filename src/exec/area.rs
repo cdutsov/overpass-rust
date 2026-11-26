@@ -1007,6 +1007,8 @@ impl<'s, W: Write> Engine<'s, W> {
 
     pub fn is_in(&mut self, input: &str, coord: Option<(f64, f64)>) -> Result<Set> {
         let points: Vec<IC> = match coord {
+            // A NaN coordinate ("NaN" in the query) is in no area, as on C++.
+            Some((la, lo)) if la.is_nan() || lo.is_nan() => Vec::new(),
             Some((la, lo)) => vec![(ilat(la), ilon(lo))],
             None => self.get(input).nodes.iter().map(|n| ic(n.pos)).collect(),
         };

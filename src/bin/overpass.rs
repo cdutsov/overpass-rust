@@ -218,7 +218,7 @@ fn main() -> Result<()> {
             for m in r.remarks.iter().filter(|_| !quiet) {
                 eprintln!("runtime remark: {m}");
             }
-            eprintln!("built {} of {} candidate areas in {:.2?}", r.created, r.candidates, start.elapsed());
+            eprintln!("built {} of {} candidate areas in {:.2?} ({} kept from the last build)", r.created, r.candidates, start.elapsed(), r.kept);
         }
         Cmd::Serve { listen, max_concurrent, max_timeout, max_maxsize, max_space, max_query_size, spool_max } => {
             let mut cfg = overpass::server::ServerConfig { max_timeout: Some(max_timeout), max_maxsize: Some(max_maxsize), max_space, max_query_len: max_query_size, spool_max, ..Default::default() };
