@@ -124,6 +124,21 @@ impl Rect {
         !(o.y0 > self.y1 || o.y1 < self.y0 || o.x0 > self.x1 || o.x1 < self.x0)
     }
 
+    /// The box grown by `m` units on every side, up to the edges of the key
+    /// space (an empty box stays empty).
+    pub fn grow(&self, m: u32) -> Rect {
+        if self.is_empty() {
+            return *self;
+        }
+        Rect { y0: self.y0.saturating_sub(m), x0: self.x0.saturating_sub(m), y1: self.y1.saturating_add(m), x1: self.x1.saturating_add(m) }
+    }
+
+    /// The part of the box within `o`, if any.
+    pub fn clip(&self, o: &Rect) -> Option<Rect> {
+        let r = Rect { y0: self.y0.max(o.y0), x0: self.x0.max(o.x0), y1: self.y1.min(o.y1), x1: self.x1.min(o.x1) };
+        (!r.is_empty()).then_some(r)
+    }
+
     /// The box grown north and south by `m` units (an empty box stays empty).
     pub fn grow_lat(&self, m: u32) -> Rect {
         if self.is_empty() {
@@ -515,6 +530,36 @@ pub fn merge_ranges(mut r: Vec<CodeRange>) -> Vec<CodeRange> {
     out
 }
 
+/// The cells in both lists of ranges, each sorted by level and start with
+/// the ranges of a level apart (as `merge_ranges` leaves them).
+pub fn intersect_ranges(a: &[CodeRange], b: &[CodeRange]) -> Vec<CodeRange> {
+    debug_assert!(a.windows(2).all(|w| (w[0].level, w[0].hi) < (w[1].level, w[1].lo)));
+    debug_assert!(b.windows(2).all(|w| (w[0].level, w[0].hi) < (w[1].level, w[1].lo)));
+    let mut out = Vec::new();
+    let (mut i, mut j) = (0, 0);
+    while i < a.len() && j < b.len() {
+        let (x, y) = (a[i], b[j]);
+        if x.level != y.level {
+            if x.level < y.level {
+                i += 1;
+            } else {
+                j += 1;
+            }
+            continue;
+        }
+        let (lo, hi) = (x.lo.max(y.lo), x.hi.min(y.hi));
+        if lo <= hi {
+            out.push(CodeRange { level: x.level, lo, hi });
+        }
+        if x.hi < y.hi {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+    out
+}
+
 /// Whether a cell lies in one of the ranges (sorted by level and start).
 pub fn cell_in_ranges(cell: Cell, ranges: &[CodeRange]) -> bool {
     let i = ranges.partition_point(|r| (r.level, r.hi) < (cell.level, cell.code));
@@ -880,6 +925,55 @@ impl Segment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `intersect_ranges` keeps the cells that both lists hold: checked
+    /// cell by cell on ranges from boxes over a few levels, and on the
+    /// ranges of real rectangles at every level.
+    #[test]
+    fn intersect_ranges_keeps_the_cells_in_both() {
+        let mut seed = 0x2545_f491_4f6c_dd1du64;
+        let mut next = |n: u32| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as u32
+        };
+        for _ in 0..500 {
+            let mut lists = Vec::new();
+            for _ in 0..2 {
+                let mut r = Vec::new();
+                for _ in 0..next(6) {
+                    let level = next(3) as u8;
+                    let lo = next(200);
+                    r.push(CodeRange { level, lo, hi: lo + next(40) });
+                }
+                lists.push(merge_ranges(r));
+            }
+            let both = intersect_ranges(&lists[0], &lists[1]);
+            assert_eq!(both, merge_ranges(both.clone()), "{lists:?}");
+            for level in 0..3u8 {
+                for code in 0..260u32 {
+                    let c = Cell { level, code };
+                    let want = cell_in_ranges(c, &lists[0]) && cell_in_ranges(c, &lists[1]);
+                    assert_eq!(cell_in_ranges(c, &both), want, "{c:?} {lists:?}");
+                }
+            }
+        }
+        // a box over a country and a box beside it: what both hold lies in each
+        let a = loose_ranges(&BBox { south: 55.0, west: 11.0, north: 69.0, east: 24.2 }.rects()[0]);
+        let b = loose_ranges(&BBox { south: 55.0, west: 24.5, north: 69.0, east: 31.0 }.rects()[0]);
+        let (a, b) = (merge_ranges(a), merge_ranges(b));
+        let both = intersect_ranges(&a, &b);
+        assert!(!both.is_empty() && both.len() < a.len() + b.len());
+        for r in &both {
+            for code in [r.lo, r.hi, r.lo + (r.hi - r.lo) / 2] {
+                let c = Cell { level: r.level, code };
+                assert!(cell_in_ranges(c, &a) && cell_in_ranges(c, &b), "{c:?}");
+            }
+        }
+        assert_eq!(intersect_ranges(&a, &[]), Vec::new());
+        assert_eq!(intersect_ranges(&a, &a), a);
+    }
 
     #[test]
     fn quantization_roundtrip() {

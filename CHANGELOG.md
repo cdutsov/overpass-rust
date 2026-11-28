@@ -4,6 +4,26 @@ The changes in each release of overpass-rust, newest first. "Overpass API"
 here means the C++ server, version 0.7.62, whose answers overpass-rust
 reproduces.
 
+## 0.3.3 (2026-11-28)
+
+### Faster
+
+- A key filter without a value (`nwr["disused:railway"]`) or with a value
+  regex (`["name"~"Bahnhof"]`) in a box, polygon or area that holds under a
+  tenth of the elements reads the tag index of the key there, as long as
+  that takes fewer steps than reading the region; it read every element of
+  the region. A rare key in a box of 1000 km took 2 to 4.5 s on its first
+  run and read 1.2 to 2.3 GB from disk; it takes 0.2 to 0.5 s and reads
+  under 25 MB. With its data in memory it takes about an eighth of the
+  time. A common key (`building`, `name`) reads the region as before.
+- A statement with more than one box, polygon or area, such as a country
+  area with a global `[bbox:]`, reads the elements in the cells of all of
+  them; it read those of the one with the smallest region, so a country
+  area with a box that reaches into its neighbours read every element in
+  the box. Statements of this form take 60% of the time and half the CPU
+  time, and those with two neighbouring countries (`(area.a)(area.b)`) a
+  ninth of the time.
+
 ## 0.3.2 (2026-11-26)
 
 ### Fixed

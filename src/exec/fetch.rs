@@ -335,6 +335,44 @@ pub fn ranges_for_many(kind: Kind, rects: &[Rect]) -> Vec<CodeRange> {
     })
 }
 
+/// `ranges_for(kind, rects)` where the elements that pass a clause read with
+/// `ranges_for(kind, near)` lie, for a clause beside it
+/// (`query::narrow_ranges`): at each level only the parts of `rects` within
+/// two cells of `near`. The extent of a cell (`Cell::loose_rect`, two cells
+/// wide and high) that meets `near` lies there, so such a cell is in these
+/// ranges when its extent meets `rects`, as in `ranges_for(kind, rects)`;
+/// the cells further away hold nothing that passes the clause of `near`.
+/// For nodes the parts of `rects` within `near`, where a node that passes
+/// both lies. More than 4 rectangles in
+/// `near` count as their bounding box. The ranges of all of Russia took
+/// 26 ms (ways) to narrow those of a box along its north coast.
+pub fn ranges_near(kind: Kind, rects: &[Rect], near: &[Rect]) -> Vec<CodeRange> {
+    let near: Vec<Rect> = if near.len() <= 4 {
+        near.to_vec()
+    } else {
+        let mut b = Rect::EMPTY;
+        near.iter().for_each(|r| b.union(r));
+        vec![b]
+    };
+    let within = |m: u32| -> Vec<Rect> {
+        let windows: Vec<Rect> = near.iter().filter(|w| !w.is_empty()).map(|w| w.grow(m)).collect();
+        rects.iter().flat_map(|r| windows.iter().filter_map(move |w| r.clip(w))).collect()
+    };
+    match kind {
+        Kind::Node => ranges_for(kind, &within(0)),
+        _ => merge_ranges(
+            (0..=MAX_LEVEL)
+                .flat_map(|level| {
+                    let m = (2u64 << (32 - level as u32)).min(u32::MAX as u64) as u32;
+                    let part = within(m);
+                    let part = if part.len() > 32 { join_rows(tile_runs(&part)) } else { part };
+                    level_ranges_many(level, &part, true)
+                })
+                .collect(),
+        ),
+    }
+}
+
 /// Cell ranges where ways or relations whose great-circle edges may meet
 /// the rectangles are stored (`around`, implicit areas): as `ranges_for`,
 /// with the rectangles grown north and south at each level by the bulge of
@@ -1830,6 +1868,59 @@ mod tests {
             }
         }
         out
+    }
+
+    /// The ranges of an area near a clause hold the cell of every box (way,
+    /// relation) and point (node) that meets both: random boxes and points
+    /// against random areas near one box, two boxes on either side of the
+    /// antimeridian, and ten rectangles (taken as their bounding box).
+    #[test]
+    fn ranges_near_hold_what_meets_both() {
+        use crate::geo::{anchor_cell, cell_at, cell_in_ranges};
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut rnd = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) % n.max(1)
+        };
+        let spread = 400u64 << 16;
+        let (mut hits, mut smaller) = (0, 0);
+        for case in 0..30u64 {
+            // around the antimeridian (x near 0 and u32::MAX) or not
+            let (cy, cx) = if case % 3 == 1 { (0x6000_0000u64, 0u64) } else { (0x6000_0000, 0x7000_0000) };
+            let at = |dy: u64, dx: u64| ((cy + dy) as u32, (cx as u32).wrapping_add(dx as u32).wrapping_sub((spread / 2) as u32));
+            let mut rect = |size: u64| {
+                let (y0, x0) = at(rnd(spread), rnd(spread));
+                let (h, w) = (rnd(size + 1), rnd(size + 1));
+                Rect { y0, x0, y1: (y0 as u64 + h).min(u32::MAX as u64) as u32, x1: (x0 as u64 + w).min(u32::MAX as u64) as u32 }
+            };
+            let area: Vec<Rect> = (0..(40 + case * 10)).map(|k| rect([1 << 16, 10 << 16, 60 << 16][(k % 3) as usize])).collect();
+            let near: Vec<Rect> = match case % 3 {
+                0 => vec![rect(20 << 16)],
+                1 => vec![Rect { y0: 0x6000_0000, x0: u32::MAX - (30 << 16), y1: 0x6000_0000 + (100 << 16), x1: u32::MAX }, Rect { y0: 0x6000_0000, x0: 0, y1: 0x6000_0000 + (100 << 16), x1: 30 << 16 }],
+                _ => (0..10).map(|_| rect(30 << 16)).collect(),
+            };
+            let (ways, nodes) = (ranges_near(Kind::Way, &area, &near), ranges_near(Kind::Node, &area, &near));
+            if ways.len() < ranges_for(Kind::Way, &area).len() {
+                smaller += 1;
+            }
+            let meets = |set: &[Rect], b: &Rect| set.iter().any(|r| r.intersects(b));
+            for k in 0..4000u64 {
+                let b = rect([0, 1 << 12, 1 << 16, 5 << 16, 1 << 20, 1 << 24, 1 << 27][(k % 7) as usize]);
+                if meets(&near, &b) && meets(&area, &b) {
+                    hits += 1;
+                    assert!(cell_in_ranges(anchor_cell(&b), &ways), "case {case}: {b:?}");
+                }
+                let p = Rect::point(Pt { y: b.y0, x: b.x0 });
+                if meets(&near, &p) && meets(&area, &p) {
+                    assert!(cell_in_ranges(cell_at(MAX_LEVEL, Pt { y: p.y0, x: p.x0 }), &nodes), "case {case}: {p:?}");
+                }
+            }
+        }
+        assert!(hits > 5000, "{hits}");
+        // a box of 20 tiles in an area of 2^12 tiles reads a part of its ranges
+        assert!(smaller >= 10, "{smaller}");
     }
 
     /// Many rectangles give the cells that meet them, within the cell ranges

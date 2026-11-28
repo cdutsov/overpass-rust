@@ -6,12 +6,12 @@
 
 use std::borrow::Cow;
 
-use super::fetch::{Fetch, Source, arc_ranges, ranges_for, tile_runs};
+use super::fetch::{Fetch, Source, arc_ranges, ranges_for, ranges_near, tile_runs};
 use super::filter::TagFilter;
 use super::geom::{AroundSource, EGeom, PolyTest, Polygon, RectPos, rel_geoms, rel_geoms_near, way_geoms};
 use super::set::Set;
 use super::{Abort, Engine};
-use crate::geo::{BBox, Cell, CodeRange, Rect, cell_in_ranges, tile_of};
+use crate::geo::{BBox, Cell, CodeRange, Rect, cell_in_ranges, intersect_ranges, tile_of};
 use crate::model::*;
 use crate::ql::ast::*;
 use crate::store::Kind;
@@ -637,32 +637,32 @@ impl<'s, W: Write> Engine<'s, W> {
         first.rels.iter().filter(|r| rest.iter().all(|ids| ids.contains(&r.id)) && keep(r)).cloned().collect()
     }
 
-    /// The rectangles of the most restrictive single spatial clause, for
-    /// range selection, and whether its test follows great-circle edges
-    /// (`around`, implicit areas: `arc_ranges`).
-    fn spatial_rects<'a>(&self, plan: &Plan, arounds: &'a [(AroundSource, f64)], area_ctxs: &'a [std::rc::Rc<super::area::AreaCtx>]) -> Result<Option<(Cow<'a, [Rect]>, bool)>> {
+    /// The most restrictive single spatial clause, for range selection
+    /// (`Region`).
+    fn spatial_rects<'a>(&self, plan: &Plan, arounds: &'a [(AroundSource, f64)], area_ctxs: &'a [std::rc::Rc<super::area::AreaCtx>]) -> Result<Option<Region<'a>>> {
         // the cost of an around cover is kept with its source
         type Opt<'a> = (&'static str, Cow<'a, [Rect]>, bool, Option<&'a AroundSource>);
         let mut options: Vec<Opt<'a>> = plan.bboxes.iter().map(|b| ("bbox", Cow::Owned(b.rects()), false, None)).collect();
         options.extend(plan.polys.iter().map(|p| ("poly", Cow::Owned(p.bbox().rects()), false, None)));
         options.extend(arounds.iter().map(|(src, r)| ("around", src.bbox_rects(*r), true, Some(src))));
         options.extend(area_ctxs.iter().map(|c| ("area", Cow::Borrowed(&c.rects[..]), c.has_implicit(), None)));
-        let mut best: Option<(u64, &'static str, Cow<'a, [Rect]>, bool)> = None;
-        if options.len() == 1 {
-            best = options.pop().map(|(what, rects, arcs, _)| (0, what, rects, arcs));
-        }
-        for (what, rects, arcs, cost) in options {
+        let one = options.len() == 1;
+        let mut costs = Vec::with_capacity(options.len());
+        let mut best: Option<(u64, usize, &'static str, Cow<'a, [Rect]>, bool)> = None;
+        for (i, (what, rects, arcs, cost)) in options.into_iter().enumerate() {
             let n = match cost {
+                _ if one => 0,
                 Some(src) => *src.cost.get_or_init(|| around_cost(src, &rects)),
                 None => region_cost(&rects),
             };
-            if best.as_ref().is_none_or(|(b, _, _, _)| n < *b) {
-                best = Some((n, what, rects, arcs));
+            costs.push(n);
+            if best.as_ref().is_none_or(|b| n < b.0) {
+                best = Some((n, i, what, rects, arcs));
             }
         }
         #[cfg(test)]
-        tests::REGION.set(best.as_ref().map(|(_, what, _, _)| *what));
-        Ok(best.map(|(_, _, r, arcs)| (r, arcs)))
+        tests::REGION.set(best.as_ref().map(|b| b.2));
+        Ok(best.map(|(_, chosen, _, rects, arcs)| Region { rects, arcs, chosen, costs }))
     }
 
     fn query_type<T: QElem>(&mut self, plan: &Plan, (area_ctxs, arounds): (&[std::rc::Rc<super::area::AreaCtx>], &[(AroundSource, f64)])) -> Result<Vec<T>> {
@@ -674,9 +674,12 @@ impl<'s, W: Write> Engine<'s, W> {
                 let ranges: Option<Vec<CodeRange>> = match self.area_ranges(kind, plan, arounds, area_ctxs) {
                     Some(r) => Some(r),
                     None => {
-                        let rects = self.spatial_rects(plan, arounds, area_ctxs)?;
+                        let region = self.spatial_rects(plan, arounds, area_ctxs)?;
                         self.check()?;
-                        rects.as_ref().map(|(r, arcs)| if *arcs { arc_ranges(kind, r) } else { ranges_for(kind, r) })
+                        region.map(|g| {
+                            let r = if g.arcs { arc_ranges(kind, &g.rects) } else { ranges_for(kind, &g.rects) };
+                            narrow_ranges(kind, plan, arounds.len(), area_ctxs, &g, r)
+                        })
                     }
                 };
                 self.check()?;
@@ -687,21 +690,40 @@ impl<'s, W: Write> Engine<'s, W> {
                     // A key or value-regex filter over a large region (a
                     // country) reads its tag index instead of every chunk
                     // (which one: `index_candidates`).
-                    // In a smaller region, an anchored regex reads the
-                    // index entries of its prefixes in the region, unless
-                    // that takes more steps than the region has chunks.
+                    // In a smaller region, such a filter reads the index
+                    // entries of its key in the region, unless that takes
+                    // more steps (values, cells) than the region has
+                    // chunks: an anchored regex first (only the values
+                    // with its prefixes), then a key, then a value regex.
+                    // A rare key over a tenth of a continent read 1.3 GB of
+                    // node chunks from disk; a common key (`name`) gives up
+                    // after as many index steps and the region is decoded.
                     let indexed = plan.tags.iter().any(|t| matches!(t, TagFilter::HasKey(_) | TagFilter::Regex { neg: false, .. }));
-                    let anchored = plan.tags.iter().find(|t| anchored(t));
                     let pairs = if indexed {
                         let (region, total) = self.f.chunk_share(kind, r)?;
                         if total > 0 && region > (total as f64 * 0.1).ceil() as usize {
                             self.index_candidates(kind, plan, Some(r))?
-                        } else if let Some(a) = anchored {
+                        } else {
                             #[cfg(test)]
                             let region = tests::INDEX_STEPS.get().unwrap_or(region);
-                            self.f.tag_candidates_bounded(kind, a, Some(r), region)?.map(|p| (p, a))
-                        } else {
-                            None
+                            let probes = plan.tags.iter().filter(|t| anchored(t))
+                                .chain(plan.tags.iter().filter(|t| matches!(t, TagFilter::HasKey(_))))
+                                .chain(plan.tags.iter().filter(|t| matches!(t, TagFilter::Regex { neg: false, .. }) && !anchored(t)));
+                            let mut found = None;
+                            for t in probes {
+                                self.check()?;
+                                // An index step of a key cost about half a
+                                // chunk: `["addr:housenumber"]` over a tenth
+                                // of a continent gave up after 90 ms on a
+                                // scan of 180 ms. A rare key takes a small
+                                // part of these steps.
+                                let steps = if anchored(t) { region } else { region / KEY_STEPS_PART };
+                                if let Some(p) = self.f.tag_candidates_bounded(kind, t, Some(r), steps)? {
+                                    found = Some((p, t));
+                                    break;
+                                }
+                            }
+                            found
                         }
                     } else {
                         None
@@ -1806,6 +1828,95 @@ pub(super) fn anchored(t: &TagFilter) -> bool {
     matches!(t, TagFilter::Regex { neg: false, prefixes: Some(_), .. })
 }
 
+/// The part of the chunks of a small region that a key filter or an
+/// unanchored regex may take in index steps (`query_type`); an anchored
+/// regex reads only the values with its prefixes and may take as many as
+/// the region has chunks.
+const KEY_STEPS_PART: usize = 8;
+
+/// Closed ways (rectangles) of an `(area)` clause up to which its cell
+/// ranges are worked out to narrow the ranges of another clause
+/// (`narrow_ranges`); the ranges of DB areas are kept with them.
+const NARROW_IMPLICIT_RECTS: usize = 10_000;
+
+/// How many times the region cost of the chosen clause another clause may
+/// cost and still narrow its ranges (`narrow_ranges`). A much larger
+/// clause leaves out few of its cells, and its ranges (a large box, an
+/// area beside an `around` clause, read whole) cost more than they save:
+/// those of all of Russia take 26 ms (ways), for a box of a few streets
+/// inside it.
+const NARROW_COST_MAX: u64 = 8;
+
+/// The region of a statement (`spatial_rects`): the rectangles of the
+/// clause with the lowest cost (`region_cost`, `around_cost`), whether its
+/// test follows great-circle edges (`around`, implicit areas:
+/// `arc_ranges`), which clause it is in the order bbox, poly, around,
+/// area, and the cost of each clause in that order (0 for a single one).
+struct Region<'a> {
+    rects: Cow<'a, [Rect]>,
+    arcs: bool,
+    chosen: usize,
+    costs: Vec<u64>,
+}
+
+/// The ranges of the clause `spatial_rects` chose (`ranges`), without the
+/// cells that the ranges of another `bbox`, `poly` or `(area)` clause of
+/// the statement leave out. The ranges of a clause, as they are read when
+/// it is the only one, hold the cell of every element that passes it; an
+/// element of the answer passes every clause, so its cell lies in the
+/// ranges of each. A country area with a global `[bbox:]` beside it read
+/// every way in the box, also in the countries around it; the cells in
+/// both lie along the border. Only the clauses up to `NARROW_COST_MAX` times
+/// the cost of the chosen one take part, a DB area with the ranges of its
+/// part near the chosen clause (`ranges_near`). `around` clauses are left
+/// as they are: their ranges cost more.
+fn narrow_ranges(kind: Kind, plan: &Plan, n_arounds: usize, area_ctxs: &[std::rc::Rc<super::area::AreaCtx>], region: &Region, mut ranges: Vec<CodeRange>) -> Vec<CodeRange> {
+    #[cfg(test)]
+    if tests::NARROW_OFF.get() {
+        return ranges;
+    }
+    #[cfg(test)]
+    let given = ranges.clone();
+    let limit = region.costs[region.chosen].saturating_mul(NARROW_COST_MAX);
+    let take = |i: usize| {
+        let t = i != region.chosen && region.costs[i] <= limit;
+        #[cfg(test)]
+        tests::NARROW_CLAUSES.set(tests::NARROW_CLAUSES.get() + t as usize);
+        t
+    };
+    let (nb, np) = (plan.bboxes.len(), plan.polys.len());
+    for (i, b) in plan.bboxes.iter().enumerate() {
+        if take(i) {
+            ranges = intersect_ranges(&ranges, &ranges_for(kind, &b.rects()));
+        }
+    }
+    for (i, p) in plan.polys.iter().enumerate() {
+        if take(nb + i) {
+            ranges = intersect_ranges(&ranges, &ranges_for(kind, &p.bbox().rects()));
+        }
+    }
+    for (i, c) in area_ctxs.iter().enumerate() {
+        if !take(nb + np + n_arounds + i) {
+            continue;
+        }
+        // as `area_ranges` takes them for the clause alone
+        if c.has_implicit() {
+            if c.rects.len() <= NARROW_IMPLICIT_RECTS {
+                ranges = intersect_ranges(&ranges, &arc_ranges(kind, &c.rects));
+            }
+        } else if region.arcs {
+            ranges = intersect_ranges(&ranges, &c.cell_ranges(kind));
+        } else {
+            // the part of the area near the chosen clause: a small box in
+            // a country reads none of its other ranges
+            ranges = intersect_ranges(&ranges, &ranges_near(kind, &c.rects, &region.rects));
+        }
+    }
+    #[cfg(test)]
+    tests::NARROWED.set(ranges != given);
+    ranges
+}
+
 /// A spatial clause of a relation statement as `rel_spatial_by_members`
 /// tests it on the member nodes and ways.
 enum MemberTest<'a> {
@@ -2097,9 +2208,16 @@ mod tests {
         /// Whether the last element query with a region and without a
         /// `key=value` filter took its candidates from the tag index.
         pub(super) static INDEXED: Cell<bool> = const { Cell::new(false) };
-        /// Index steps an anchored regex may take in a small region, in
-        /// place of the chunk count of the region.
+        /// Index steps a key or regex filter may take in a small region,
+        /// in place of the chunk count of the region.
         pub(super) static INDEX_STEPS: Cell<Option<usize>> = const { Cell::new(None) };
+        /// Turns off `narrow_ranges`.
+        pub(super) static NARROW_OFF: Cell<bool> = const { Cell::new(false) };
+        /// Whether the last `narrow_ranges` with more than one clause left
+        /// out cells of the ranges it was given.
+        pub(super) static NARROWED: Cell<bool> = const { Cell::new(false) };
+        /// Clauses that narrowed the ranges of the chosen one, counted.
+        pub(super) static NARROW_CLAUSES: Cell<usize> = const { Cell::new(0) };
         /// The most filters that gave the candidates of an element query
         /// with a `key=value` filter since it was last reset
         /// (`indexed_candidates`).
@@ -3652,15 +3770,116 @@ mod tests {
         let none = output(&db, &format!("{c}node[\"place\"~\"^(city)$\"]{bbox};out ids;"));
         INDEX_STEPS.set(None);
         assert!(INDEXED.get() && none.is_empty(), "{none}");
-        // Not anchored, or key only: the region is decoded.
-        for q in [format!("node[\"place\"~\"town\"]{bbox};out ids;"), format!("node[\"place\"]{bbox};out ids;")] {
+        // Not anchored, or key only: the index as well, with the answers of
+        // decoding the region.
+        let others = [
+            format!("node[\"place\"~\"town\"]{bbox};out ids;"),
+            format!("node[\"place\"]{bbox};out ids;"),
+            format!("node[\"name\"][\"place\"]{bbox};out ids;"),
+            format!("node[\"place\"][\"name\"~\"lpha\"]{bbox};out ids;"),
+            format!("node[\"place\"][!\"note\"]{bbox};out ids;"),
+            format!("node[\"name\"~\"lpha\",i]{bbox};out ids;"),
+            format!("way[\"highway\"]{bbox};out ids;"),
+            format!("way[\"highway\"~\"ary\"]{bbox};out ids;"),
+            format!("way[\"name\"]{bbox};out ids;"),
+            "node[\"note\"](10.0,10.0,10.05,10.05);out ids;".to_string(),
+        ];
+        for q in &others {
+            let q = format!("{c}{q}");
             INDEX_STEPS.set(Some(usize::MAX));
-            INDEXED.set(true);
-            output(&db, &format!("{c}{q}"));
-            INDEX_STEPS.set(None);
+            INDEXED.set(false);
+            let indexed = output(&db, &q);
+            assert!(INDEXED.get(), "{q}");
+            INDEX_STEPS.set(Some(0));
+            let decoded = output(&db, &q);
             assert!(!INDEXED.get(), "{q}");
+            INDEX_STEPS.set(None);
+            assert_eq!(indexed, decoded, "{q}");
+            assert!(!decoded.is_empty(), "{q}");
         }
+        // Over all three kinds (no relation has a name: the index answers
+        // the relations without a step)
+        let q = format!("{c}nwr[\"name\"]{bbox};out ids;");
+        INDEX_STEPS.set(Some(usize::MAX));
+        let indexed = output(&db, &q);
+        INDEX_STEPS.set(Some(0));
+        let decoded = output(&db, &q);
+        INDEX_STEPS.set(None);
+        assert_eq!(indexed, decoded);
+        assert!(decoded.contains("way\t") && decoded.contains("node\t"), "{decoded}");
+        // A key with more values than the region has chunks (a name for
+        // each of 400 nodes): the region is decoded.
+        INDEXED.set(true);
+        let named = output(&db, &format!("{c}node[\"name\"]{bbox};out ids;"));
+        assert!(!INDEXED.get());
+        assert_eq!(named.lines().count(), 100, "{named}");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A statement with an area and a box, two boxes, or an area and a
+    /// polygon reads the cells in the ranges of each (`narrow_ranges`),
+    /// with the answers of reading those of one: also the ways and
+    /// relations that meet the two regions apart from each other.
+    #[test]
+    fn area_and_box_read_the_cells_in_both() {
+        let id = |i: usize, j: usize| i * 30 + j + 1;
+        // the west third of the grid: columns 0 to 9
+        let nds: String = [id(0, 0), id(0, 9), id(29, 9), id(29, 0), id(0, 0)].iter().map(|n| format!("<nd ref=\"{n}\"/>")).collect();
+        let mut ways = format!("<way id=\"5000\" {{m}}>{nds}</way>\n");
+        // a diagonal from the south-west corner to the north-east
+        ways += &format!("<way id=\"5001\" {{m}}><nd ref=\"{}\"/><nd ref=\"{}\"/><tag k=\"highway\" v=\"path\"/></way>\n", id(1, 1), id(25, 27));
+        let mut rels = relation(10, &[("way", 5000)], &[("type", "boundary"), ("boundary", "administrative"), ("admin_level", "8"), ("name", "West")]);
+        // a route with a node in the area and one east of it, and one east only
+        rels += &relation(20, &[("node", id(3, 2)), ("node", id(3, 25))], &[("type", "route"), ("name", "Both")]);
+        rels += &relation(21, &[("node", id(3, 25))], &[("type", "route"), ("name", "East")]);
+        let (db, dir) = osm_db("area-box", &grid_osm_with("", &ways, &rels));
+        crate::update::areas::make_areas(&db).unwrap();
+        let c = "[out:csv(::type,::id;false)];";
+        let east = "(48.82,2.35,48.878,2.378)";
+        let cases = [
+            format!("area[name=\"West\"]->.a;way(area.a){east};out ids;"),
+            format!("area[name=\"West\"]->.a;nwr(area.a){east};out ids;"),
+            format!("area[name=\"West\"]->.a;rel(area.a){east};out ids;"),
+            "[out:csv(::type,::id;false)][bbox:48.82,2.35,48.878,2.378];area[name=\"West\"]->.a;way(area.a);out ids;".to_string(),
+            format!("area[name=\"West\"]->.a;way(area.a)[highway](48.83,2.33,48.85,2.36);out ids;"),
+            format!("area[name=\"West\"]->.a;node(area.a)(48.83,2.33,48.85,2.36);out ids;"),
+            format!("area[name=\"West\"]->.a;way(area.a)(poly:\"48.82 2.35 48.878 2.35 48.878 2.378 48.82 2.378\");out ids;"),
+            format!("way(48.82,2.32,48.83,2.33)(48.86,2.37,48.878,2.378);out ids;"),
+            format!("nwr{east}(48.83,2.30,48.85,2.36);out ids;"),
+            format!("way[highway=residential](area:3600000010)->.a;node(area.a){east};out ids;way(area.a){east};out ids;"),
+            format!("node(around:400,48.85,2.36)(48.846,2.354,48.854,2.366);out ids;"),
+            // a box of one tile inside the area: the area costs more than
+            // NARROW_COST_MAX times the box and stays out
+            format!("area[name=\"West\"]->.a;nwr(area.a)(48.850,2.330,48.851,2.331);out ids;"),
+        ];
+        let (mut narrowed, mut clauses) = (Vec::new(), Vec::new());
+        let full = |q: &str| if q.starts_with('[') { q.to_string() } else { format!("{c}{q}") };
+        for q in &cases {
+            let q = full(q);
+            NARROW_OFF.set(true);
+            let wide = output(&db, &q);
+            NARROW_OFF.set(false);
+            NARROWED.set(false);
+            NARROW_CLAUSES.set(0);
+            let narrow = output(&db, &q);
+            narrowed.push(NARROWED.get());
+            clauses.push(NARROW_CLAUSES.get());
+            assert_eq!(narrow, wide, "{q}");
+        }
+        assert_eq!(&narrowed[..4], &[true, true, true, true]);
+        assert_eq!((clauses[0], clauses[10], clauses[11]), (1, 1, 0), "{clauses:?}");
+        // the rows cross the area and the box, the columns lie in one of them
+        let rows = output(&db, &full(&cases[0]));
+        let ids: Vec<&str> = rows.lines().collect();
+        assert!(ids.len() >= 28 && ids.iter().all(|l| l.starts_with("way\t10") || *l == "way\t5001"), "{rows}");
+        assert!(ids.contains(&"way\t5001"), "{rows}");
+        let rels_out = output(&db, &full(&cases[2]));
+        assert_eq!(rels_out.trim(), "relation\t20", "{rels_out}");
+        // the diagonal passes through two boxes apart from each other
+        let apart = output(&db, &full(&cases[7]));
+        assert_eq!(apart.trim(), "way\t5001", "{apart}");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// The bounded scan gives the candidates of the full scan, or None past
